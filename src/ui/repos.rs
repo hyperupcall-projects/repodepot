@@ -12,8 +12,10 @@ use crate::db::{Catalog, ForkDecision};
 use crate::git::import::ImportPreview;
 use crate::git::scan::{CloneInfo, MainRemote, Problem, ScanResult};
 use crate::git::status::Status;
+use crate::tags::{Rule, TagIndex};
 use crate::ui::import::ImportPage;
 use crate::ui::inbox::{self, ListKind, ListState};
+use crate::ui::tags::TagsAction;
 use crate::ui::thousands;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -52,6 +54,8 @@ pub enum ReposAction {
         paths: Vec<PathBuf>,
     },
     Import(Vec<ImportMove>),
+    /// Tag changes made from a clone's details.
+    Tags(TagsAction),
 }
 
 pub struct ReposContext<'a> {
@@ -59,6 +63,8 @@ pub struct ReposContext<'a> {
     /// Remote names from the settings.
     pub default_remote: &'a str,
     pub upstream_name: &'a str,
+    pub tags: &'a TagIndex,
+    pub rules: &'a [Rule],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -248,6 +254,8 @@ pub struct ReposPage {
     only_undecided: bool,
     upstream_name: String,
     import: ImportPage,
+    /// The "add tag" field in the details panel.
+    new_tag: String,
 }
 
 impl ReposPage {
@@ -273,6 +281,7 @@ impl ReposPage {
             only_undecided: false,
             upstream_name: "upstream".to_owned(),
             import: ImportPage::new(),
+            new_tag: String::new(),
         }
     }
 
@@ -384,7 +393,7 @@ impl ReposPage {
                 }
                 Some(Ok(scan)) => match self.view {
                     View::Problems => self.problems_view(ui, scan, &mut action),
-                    _ => self.clones_view(ui, scan, &mut action),
+                    _ => self.clones_view(ui, scan, (cx.tags, cx.rules), &mut action),
                 },
             },
         }
@@ -660,6 +669,7 @@ impl ReposPage {
         &mut self,
         ui: &mut egui::Ui,
         scan: &ScanResult,
+        (tags, rules): (&TagIndex, &[Rule]),
         action: &mut Option<ReposAction>,
     ) {
         if let Some(id) = self.selected
@@ -670,7 +680,11 @@ impl ReposPage {
                 .resizable(true)
                 .default_size(400.0)
                 .min_size(280.0)
-                .show(ui, |ui| close = details(ui, clone, action));
+                .show(ui, |ui| {
+                    close = details(ui, clone, action);
+                    ui.add_space(10.0);
+                    tags_section(ui, clone.id, tags, rules, &mut self.new_tag, action);
+                });
             if close {
                 self.selected = None;
             }
@@ -1045,6 +1059,86 @@ fn problems_cell(ui: &mut egui::Ui, clone: &CloneInfo) {
 }
 
 /// The side panel for the selected clone. Returns true when it should close.
+/// Tags of the selected clone: manual ones can be removed, automatic ones excepted.
+fn tags_section(
+    ui: &mut egui::Ui,
+    clone_id: i64,
+    index: &TagIndex,
+    rules: &[Rule],
+    new_tag: &mut String,
+    action: &mut Option<ReposAction>,
+) {
+    ui.strong("Tags");
+    let tagging = index.by_clone.get(&clone_id).cloned().unwrap_or_default();
+    if tagging.manual.is_empty() && tagging.auto.is_empty() {
+        ui.weak("None yet");
+    }
+    ui.horizontal_wrapped(|ui| {
+        for tag in &tagging.manual {
+            if ui
+                .add(egui::Button::new(format!("{tag} ×")).small())
+                .on_hover_text("Manual tag. Click to remove it.")
+                .clicked()
+            {
+                *action = Some(ReposAction::Tags(TagsAction::RemoveTag {
+                    clone_ids: vec![clone_id],
+                    tag: tag.clone(),
+                }));
+            }
+        }
+    });
+    for (tag, rule_ids) in &tagging.auto {
+        ui.horizontal(|ui| {
+            let from: Vec<String> = rule_ids
+                .iter()
+                .filter_map(|id| rules.iter().find(|r| r.id == *id))
+                .map(Rule::describe)
+                .collect();
+            ui.label(egui::RichText::new(tag).italics())
+                .on_hover_text(format!("Added by a rule:\n{}", from.join("\n")));
+            if tagging.manual.contains(tag) {
+                ui.weak("(also manual)");
+            }
+            if ui
+                .small_button("Add exception")
+                .on_hover_text("Stop the rule that adds this tag from applying to this clone")
+                .clicked()
+            {
+                // One action per frame: except the first rule; any others show up next.
+                if let Some(rule_id) = rule_ids.first() {
+                    *action = Some(ReposAction::Tags(TagsAction::SetRuleException {
+                        rule_id: *rule_id,
+                        clone_id,
+                        excepted: true,
+                    }));
+                }
+            }
+        });
+    }
+    ui.horizontal(|ui| {
+        let label = ui.label("Add tag");
+        let field = ui
+            .add(
+                egui::TextEdit::singleline(new_tag)
+                    .hint_text("work, lang:rust, …")
+                    .desired_width(160.0),
+            )
+            .labelled_by(label.id);
+        let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let valid = crate::tags::normalize_tag(new_tag);
+        let clicked = ui
+            .add_enabled(valid.is_ok(), egui::Button::new("Add"))
+            .on_disabled_hover_text(valid.as_ref().err().cloned().unwrap_or_default())
+            .clicked();
+        if (clicked || entered) && valid.is_ok() {
+            *action = Some(ReposAction::Tags(TagsAction::AddTag {
+                clone_ids: vec![clone_id],
+                tag: std::mem::take(new_tag),
+            }));
+        }
+    });
+}
+
 fn details(ui: &mut egui::Ui, clone: &CloneInfo, action: &mut Option<ReposAction>) -> bool {
     let mut close = false;
     ui.add_space(4.0);
@@ -1058,7 +1152,8 @@ fn details(ui: &mut egui::Ui, clone: &CloneInfo, action: &mut Option<ReposAction
     ui.separator();
 
     egui::ScrollArea::vertical()
-        .auto_shrink(false)
+        .id_salt(("details", clone.id))
+        .max_height(ui.available_height() * 0.6)
         .show(ui, |ui| {
             ui.strong("Remotes");
             if clone.remotes.is_empty() {
@@ -1573,10 +1668,13 @@ mod tests {
         builder.with_size([1280.0, 560.0]).build_ui_state(
             |ui, (page, actions): &mut State| {
                 egui::CentralPanel::default_margins().show(ui, |ui| {
+                    let tags = TagIndex::default();
                     let cx = ReposContext {
                         has_clone_root: true,
                         default_remote: "me",
                         upstream_name: "upstream",
+                        tags: &tags,
+                        rules: &[],
                     };
                     if let Some(action) = page.show(ui, cx) {
                         actions.push(action);
@@ -1661,6 +1759,85 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Like `harness`, but clone 1 has a manual tag and a rule tags facebook/ repos.
+    fn tagged_harness<'a>() -> Harness<'a, State> {
+        use std::collections::{BTreeSet, HashMap};
+
+        use crate::tags::{CloneFacts, RuleField};
+
+        let mut page = ReposPage::new();
+        page.scan_finished(Ok(synced_scan()));
+        Harness::builder()
+            .with_size([1280.0, 640.0])
+            .build_ui_state(
+                |ui, (page, actions): &mut State| {
+                    let facts: Vec<CloneFacts> = page
+                        .clones()
+                        .unwrap()
+                        .iter()
+                        .map(|c| CloneFacts::from_clone(c, None))
+                        .collect();
+                    let rules = vec![Rule {
+                        id: 10,
+                        pattern: "^facebook/".into(),
+                        tag_template: "upstream".into(),
+                        ..Rule::new(RuleField::FullName)
+                    }];
+                    let manual = HashMap::from([(1, BTreeSet::from(["work".to_owned()]))]);
+                    let tags = TagIndex::build(&facts, &manual, &rules);
+                    egui::CentralPanel::default_margins().show(ui, |ui| {
+                        let cx = ReposContext {
+                            has_clone_root: true,
+                            default_remote: "me",
+                            upstream_name: "upstream",
+                            tags: &tags,
+                            rules: &rules,
+                        };
+                        if let Some(action) = page.show(ui, cx) {
+                            actions.push(action);
+                        }
+                    });
+                },
+                (page, Vec::new()),
+            )
+    }
+
+    #[test]
+    fn details_panel_edits_tags() {
+        let mut h = tagged_harness();
+        h.run();
+        h.get_by_label("facebook/react").click();
+        h.run();
+        assert!(h.query_by_label("upstream").is_some(), "rule tag shown");
+        h.get_by_label("work ×").click();
+        h.run();
+        h.get_by_label("Add exception").click();
+        h.run();
+        h.state_mut().0.new_tag = "Later".into();
+        h.run();
+        h.get_by_label("Add").click();
+        h.run();
+        assert_eq!(
+            h.state().1,
+            vec![
+                ReposAction::Tags(TagsAction::RemoveTag {
+                    clone_ids: vec![1],
+                    tag: "work".into()
+                }),
+                ReposAction::Tags(TagsAction::SetRuleException {
+                    rule_id: 10,
+                    clone_id: 1,
+                    excepted: true
+                }),
+                ReposAction::Tags(TagsAction::AddTag {
+                    clone_ids: vec![1],
+                    tag: "Later".into()
+                }),
+            ]
+        );
+        assert!(h.state().0.new_tag.is_empty());
     }
 
     #[test]

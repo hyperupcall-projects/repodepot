@@ -19,11 +19,12 @@ pub use import::ImportMove;
 pub use repos::SyncReport;
 
 use crate::config::{Config, Paths};
-use crate::db::{Catalog, Db, ForkDecision, Snippet};
+use crate::db::{Catalog, Db, ForkDecision, Snippet, TagStore};
 use crate::git::import::ImportPreview;
 use crate::git::scan::{self, ScanResult, ScanSettings};
 use crate::github::{self, RateLimit, Viewer};
 use crate::jobs::{self, OnChange, Run, RunSpec, Target};
+use crate::tags::{self, Rule};
 use crate::token::{self, TokenSource};
 
 /// The most often the UI repaints for streaming output.
@@ -81,6 +82,27 @@ pub enum Command {
         paths: Vec<PathBuf>,
     },
     Import(Vec<ImportMove>),
+    /// Add a manual tag to clones. The name is normalized first.
+    AddTag {
+        clone_ids: Vec<i64>,
+        tag: String,
+    },
+    RemoveTag {
+        clone_ids: Vec<i64>,
+        tag: String,
+    },
+    /// Insert (id 0) or update a rule. It's checked first.
+    SaveRule(Rule),
+    DeleteRule(i64),
+    SetRuleEnabled {
+        rule_id: i64,
+        enabled: bool,
+    },
+    SetRuleException {
+        rule_id: i64,
+        clone_id: i64,
+        excepted: bool,
+    },
 }
 
 /// What a picked folder is for.
@@ -121,6 +143,10 @@ pub enum Event {
     },
     ImportSearching,
     ImportPreview(Result<ImportPreview, String>),
+    /// Manual tags, rules and repo facts, after any change.
+    Tags(TagStore),
+    /// Something the user asked for on the Tags tab failed.
+    TagActionFailed(String),
 }
 
 pub struct DbInfo {
@@ -278,8 +304,9 @@ async fn run(
             while scan_rx.recv().await.is_some() {
                 while scan_rx.try_recv().is_ok() {}
                 run_scan(&shared).await;
-                // Which repos count as cloned may have changed.
+                // Which repos count as cloned, and what's known about them, may have changed.
                 repos::refresh_catalog(&shared).await;
+                refresh_tags(&shared).await;
             }
         }
     });
@@ -309,7 +336,10 @@ async fn run(
     };
     tokio::spawn({
         let shared = shared.clone();
-        async move { repos::refresh_catalog(&shared).await }
+        async move {
+            repos::refresh_catalog(&shared).await;
+            refresh_tags(&shared).await;
+        }
     });
     if has_root {
         let _ = scan_tx.send(());
@@ -499,6 +529,33 @@ async fn run(
                     }
                 });
             }
+            Command::AddTag { clone_ids, tag } => match tags::normalize_tag(&tag) {
+                Ok(tag) => tag_write(&shared, move |db| db.add_tag(&clone_ids, &tag)),
+                Err(e) => shared.emitter.emit(Event::TagActionFailed(e)),
+            },
+            Command::RemoveTag { clone_ids, tag } => match tags::normalize_tag(&tag) {
+                Ok(tag) => tag_write(&shared, move |db| db.remove_tag(&clone_ids, &tag)),
+                Err(e) => shared.emitter.emit(Event::TagActionFailed(e)),
+            },
+            Command::SaveRule(rule) => match tags::compile(&rule) {
+                Ok(_) => tag_write(&shared, move |db| db.save_rule(&rule).map(|_| ())),
+                Err(e) => shared.emitter.emit(Event::TagActionFailed(e)),
+            },
+            Command::DeleteRule(rule_id) => {
+                tag_write(&shared, move |db| db.delete_rule(rule_id));
+            }
+            Command::SetRuleEnabled { rule_id, enabled } => {
+                tag_write(&shared, move |db| db.set_rule_enabled(rule_id, enabled));
+            }
+            Command::SetRuleException {
+                rule_id,
+                clone_id,
+                excepted,
+            } => {
+                tag_write(&shared, move |db| {
+                    db.set_rule_exception(rule_id, clone_id, excepted)
+                });
+            }
             Command::SetRemote {
                 path,
                 name,
@@ -520,6 +577,30 @@ async fn run(
             }
         }
     }
+}
+
+/// Sends the UI fresh tags, rules and repo facts.
+async fn refresh_tags(shared: &Shared) {
+    match with_db(shared, |db| db.tag_store()).await {
+        Ok(store) => shared.emitter.emit(Event::Tags(store)),
+        Err(e) => tracing::warn!("couldn't load tags: {e:#}"),
+    }
+}
+
+/// Runs a tag or rule change, then sends the new state (or the error).
+fn tag_write(
+    shared: &Arc<Shared>,
+    write: impl FnOnce(&mut Db) -> anyhow::Result<()> + Send + 'static,
+) {
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        match with_db(&shared, write).await {
+            Ok(()) => refresh_tags(&shared).await,
+            Err(e) => shared
+                .emitter
+                .emit(Event::TagActionFailed(format!("{e:#}"))),
+        }
+    });
 }
 
 /// Starts a run and hands it to the UI.
@@ -1080,6 +1161,95 @@ mod tests {
             .unwrap();
         assert_eq!(serde.id, serde_id, "the moved clone kept its database row");
         assert!(serde.problems.is_empty());
+
+        drop(backend);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Tag and rule commands reach the database and come back as fresh tags; bad input is refused.
+    #[test]
+    fn tag_commands_end_to_end() {
+        use crate::tags::RuleField;
+
+        let base = std::env::temp_dir().join(format!("depository-tags-e2e-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("code");
+        fs::create_dir_all(root.join("a/api")).unwrap();
+        git(&root.join("a/api"), &["init", "-q"]);
+        let paths = Paths {
+            config_file: base.join("config.toml"),
+            db_file: base.join("data/depository.db"),
+            workspaces_dir: base.join("data/workspaces"),
+        };
+        let config = Config {
+            clone_root: Some(root),
+            ..Default::default()
+        };
+        let backend = Backend::start(egui::Context::default(), paths, config);
+        let scan = wait_for(&backend, "the scan", |event| match event {
+            Event::Scan(Ok(scan)) => Some(scan),
+            _ => None,
+        });
+        let id = scan.clones[0].id;
+
+        backend.send(Command::AddTag {
+            clone_ids: vec![id],
+            tag: " Work Stuff ".into(),
+        });
+        let store = wait_for(&backend, "the tag", |event| match event {
+            Event::Tags(store) if !store.manual.is_empty() => Some(store),
+            _ => None,
+        });
+        assert!(store.manual[&id].contains("work-stuff"));
+
+        backend.send(Command::AddTag {
+            clone_ids: vec![id],
+            tag: "and".into(),
+        });
+        let error = wait_for(&backend, "the refusal", |event| match event {
+            Event::TagActionFailed(e) => Some(e),
+            _ => None,
+        });
+        assert!(error.contains("reserved"));
+
+        backend.send(Command::SaveRule(Rule {
+            pattern: "(".into(),
+            tag_template: "x".into(),
+            ..Rule::new(RuleField::Name)
+        }));
+        let error = wait_for(&backend, "the bad rule", |event| match event {
+            Event::TagActionFailed(e) => Some(e),
+            _ => None,
+        });
+        assert!(error.contains("regex"));
+
+        backend.send(Command::SaveRule(Rule {
+            pattern: "^a".into(),
+            tag_template: "starts-with-a".into(),
+            ..Rule::new(RuleField::Name)
+        }));
+        let store = wait_for(&backend, "the saved rule", |event| match event {
+            Event::Tags(store) if !store.rules.is_empty() => Some(store),
+            _ => None,
+        });
+        let rule_id = store.rules[0].id;
+        backend.send(Command::SetRuleException {
+            rule_id,
+            clone_id: id,
+            excepted: true,
+        });
+        let store = wait_for(&backend, "the exception", |event| match event {
+            Event::Tags(store)
+                if store
+                    .rules
+                    .first()
+                    .is_some_and(|r| !r.exceptions.is_empty()) =>
+            {
+                Some(store)
+            }
+            _ => None,
+        });
+        assert!(store.rules[0].exceptions.contains(&id));
 
         drop(backend);
         let _ = fs::remove_dir_all(&base);

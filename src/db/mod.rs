@@ -1,8 +1,10 @@
 //! The SQLite database in `~/.local/share/depository/depository.db`.
 
 pub mod github;
+mod tags;
 
 pub use github::{Catalog, FetchedRepo, ForkDecision, RepoMeta, RepoRow, RepoState, Source};
+pub use tags::{RepoFacts, TagStore};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;

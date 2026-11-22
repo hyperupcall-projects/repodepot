@@ -153,7 +153,7 @@ Only cloned repos can be tagged.
 
 ### 2.1 Manual tags
 
-Add and remove tags from the repo list or the repo's detail panel. Any name works, and `:` can be used for namespaces (`org:myorg`, `lang:rust`).
+Add and remove tags from the repo's detail panel, or for a whole working set from the Groups view. Any name works, and `:` can be used for namespaces (`org:myorg`, `lang:rust`). Names are lowercased and spaces become `-`; `and`, `or`, `not` and parentheses are kept for queries.
 
 ### 2.2 Rules (automatic tags)
 
@@ -186,7 +186,7 @@ A rule says: **if a field matches a pattern, add a tag**.
 ### 2.4 Groups view
 
 - **Sidebar**: every tag, with its count split into manual and automatic.
-- **Query bar** for combining tags: `rust AND work`, `rust OR go`, `work AND NOT archived`, with parentheses. Words in a query are tag names.
+- **Query bar** for combining tags: `rust AND work`, `rust OR go`, `work AND NOT archived`, with parentheses. Words in a query are tag names, side-by-side words mean AND, and `*` means every clone.
 - **Fuzzy name search** on top of the query, using `nucleo`.
 - **Working set**: starts as the query result.
   - Add any cloned repo with a fuzzy picker, or untick the ones you don't want.

@@ -11,6 +11,7 @@ use crate::db::Snippet;
 use crate::git::scan::CloneInfo;
 use crate::jobs::output::Stream;
 use crate::jobs::{Run, Summary, Target, TargetStatus};
+use crate::tags::TagIndex;
 
 #[derive(Debug)]
 pub enum RunnerAction {
@@ -25,6 +26,8 @@ pub struct RunnerContext<'a> {
     /// The latest scan's clones, if there is one.
     pub clones: Option<&'a [CloneInfo]>,
     pub config: &'a Config,
+    /// For each target's `DEPO_TAGS`.
+    pub tags: &'a TagIndex,
 }
 
 struct RunTab {
@@ -41,6 +44,8 @@ pub struct RunnerPage {
     snippets: Vec<Snippet>,
     tabs: Vec<RunTab>,
     active: usize,
+    /// A working set sent from the Tags tab: (label, clone IDs). Replaces the filter.
+    working_set: Option<(String, Vec<i64>)>,
 }
 
 impl RunnerPage {
@@ -52,7 +57,13 @@ impl RunnerPage {
             snippets: Vec::new(),
             tabs: Vec::new(),
             active: 0,
+            working_set: None,
         }
+    }
+
+    /// Runs the next command in exactly these clones.
+    pub fn set_working_set(&mut self, label: String, clone_ids: Vec<i64>) {
+        self.working_set = Some((label, clone_ids));
     }
 
     pub fn set_snippets(&mut self, snippets: Vec<Snippet>) {
@@ -93,10 +104,13 @@ impl RunnerPage {
             .clones
             .unwrap_or_default()
             .iter()
-            .filter(|c| {
-                needle.is_empty()
-                    || c.display_name().to_lowercase().contains(&needle)
-                    || c.rel_path.to_lowercase().contains(&needle)
+            .filter(|c| match &self.working_set {
+                Some((_, ids)) => ids.contains(&c.id),
+                None => {
+                    needle.is_empty()
+                        || c.display_name().to_lowercase().contains(&needle)
+                        || c.rel_path.to_lowercase().contains(&needle)
+                }
             })
             .collect();
 
@@ -133,19 +147,31 @@ impl RunnerPage {
         let mut parallel = self.parallel.unwrap_or(cx.config.runner.parallel);
         ui.horizontal(|ui| {
             let label = ui.label("Run in");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
-                    .hint_text("all clones (type to narrow)")
-                    .desired_width(220.0),
-            )
-            .labelled_by(label.id);
-            match cx.clones {
-                None => ui.weak("No scan yet"),
-                Some(all) if targets.len() == all.len() => {
-                    ui.weak(plural(targets.len(), "clone", "clones"))
+            if let Some((name, _)) = &self.working_set {
+                ui.strong(format!("working set \"{name}\""));
+                ui.weak(plural(targets.len(), "clone", "clones"));
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Stop using the working set; run in all clones instead")
+                    .clicked()
+                {
+                    self.working_set = None;
                 }
-                Some(all) => ui.weak(format!("{} of {}", targets.len(), all.len())),
-            };
+            } else {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text("all clones (type to narrow)")
+                        .desired_width(220.0),
+                )
+                .labelled_by(label.id);
+                match cx.clones {
+                    None => ui.weak("No scan yet"),
+                    Some(all) if targets.len() == all.len() => {
+                        ui.weak(plural(targets.len(), "clone", "clones"))
+                    }
+                    Some(all) => ui.weak(format!("{} of {}", targets.len(), all.len())),
+                };
+            }
             ui.separator();
             let label = ui.label("At once");
             if ui
@@ -171,7 +197,7 @@ impl RunnerPage {
                 .map(|clone| Target {
                     name: clone.display_name(),
                     path: clone.abs_path.clone(),
-                    tags: Vec::new(),
+                    tags: cx.tags.tags_of(clone.id).into_iter().collect(),
                     env: Vec::new(),
                 })
                 .collect(),
@@ -674,9 +700,20 @@ mod tests {
         builder.with_size([1280.0, 560.0]).build_ui_state(
             |ui, (page, clones, config, actions): &mut State| {
                 egui::CentralPanel::default_margins().show(ui, |ui| {
+                    // Clone 1 is tagged "rust".
+                    let facts: Vec<crate::tags::CloneFacts> = clones
+                        .iter()
+                        .map(|c| crate::tags::CloneFacts::from_clone(c, None))
+                        .collect();
+                    let manual = std::collections::HashMap::from([(
+                        1,
+                        std::collections::BTreeSet::from(["rust".to_owned()]),
+                    )]);
+                    let tags = TagIndex::build(&facts, &manual, &[]);
                     let cx = RunnerContext {
                         clones: Some(clones),
                         config,
+                        tags: &tags,
                     };
                     if let Some(action) = page.show(ui, cx) {
                         actions.push(action);
@@ -710,6 +747,32 @@ mod tests {
         assert_eq!(parallel, &8);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].name, "beta");
+    }
+
+    #[test]
+    fn working_set_replaces_the_filter_and_fills_tags() {
+        let (_folders, clones) = fake_clones("set", &["alpha", "beta", "gamma"]);
+        let mut page = RunnerPage::new();
+        page.command = "true".into();
+        page.set_working_set("rust".into(), vec![1, 3]);
+        let mut h = harness(
+            Harness::builder(),
+            (page, clones, Config::default(), Vec::new()),
+        );
+        h.run();
+        assert!(h.query_by_label("working set \"rust\"").is_some());
+        assert!(h.query_by_label("2 clones").is_some());
+        h.get_by_label("Run").click();
+        h.run();
+        let RunnerAction::Start { targets, .. } = &h.state().3[0];
+        let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "gamma"]);
+        assert_eq!(targets[0].tags, ["rust"]);
+        assert!(targets[1].tags.is_empty());
+
+        h.get_by_label("×").click();
+        h.run();
+        assert!(h.query_by_label("3 clones").is_some(), "back to all clones");
     }
 
     #[test]

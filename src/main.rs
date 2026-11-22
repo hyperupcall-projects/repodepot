@@ -7,6 +7,7 @@ mod git;
 mod github;
 mod jobs;
 mod layout;
+mod tags;
 mod token;
 mod ui;
 

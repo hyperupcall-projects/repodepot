@@ -4,10 +4,13 @@ use eframe::egui;
 
 use crate::backend::{AuthState, Backend, Command, DbInfo, Event, FolderPurpose};
 use crate::config::{Config, Paths};
+use crate::db::TagStore;
+use crate::tags::{CloneFacts, TagIndex};
 use crate::ui::repos::{ReposAction, ReposContext, ReposPage};
 use crate::ui::runner::{RunnerAction, RunnerContext, RunnerPage};
 use crate::ui::settings::{SettingsContext, SettingsPage};
-use crate::ui::{placeholder, thousands};
+use crate::ui::tags::{TagsAction, TagsContext, TagsPage};
+use crate::ui::thousands;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -39,6 +42,11 @@ pub struct App {
     repos: ReposPage,
     runner: RunnerPage,
     settings: SettingsPage,
+    tags: TagsPage,
+    tag_store: TagStore,
+    /// What rules see about each scanned clone.
+    facts: Vec<CloneFacts>,
+    tag_index: TagIndex,
     auth: AuthState,
     db: Option<Result<DbInfo, String>>,
 }
@@ -61,6 +69,10 @@ impl App {
             repos: ReposPage::new(),
             runner: RunnerPage::new(),
             settings: SettingsPage::new(&config),
+            tags: TagsPage::new(),
+            tag_store: TagStore::default(),
+            facts: Vec::new(),
+            tag_index: TagIndex::default(),
             paths,
             backend,
             tab,
@@ -71,6 +83,22 @@ impl App {
         }
     }
 
+    /// Recomputes every clone's tags after the clones, tags or rules change.
+    fn rebuild_tags(&mut self) {
+        let store = &self.tag_store;
+        self.facts = self
+            .repos
+            .clones()
+            .unwrap_or_default()
+            .iter()
+            .map(|clone| {
+                let repo = clone.repo_id.and_then(|id| store.repo_facts.get(&id));
+                CloneFacts::from_clone(clone, repo)
+            })
+            .collect();
+        self.tag_index = TagIndex::build(&self.facts, &store.manual, &store.rules);
+    }
+
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Db(result) => self.db = Some(result),
@@ -78,7 +106,15 @@ impl App {
             Event::AccountMessage(message) => self.settings.set_account_message(message),
             Event::ScanStarted => self.repos.scan_started(),
             Event::ScanProgress { done, total } => self.repos.scan_progress(done, total),
-            Event::Scan(result) => self.repos.scan_finished(result),
+            Event::Scan(result) => {
+                self.repos.scan_finished(result);
+                self.rebuild_tags();
+            }
+            Event::Tags(store) => {
+                self.tag_store = store;
+                self.rebuild_tags();
+            }
+            Event::TagActionFailed(message) => self.tags.action_failed(message),
             Event::RepoActionFailed(message) => self.repos.action_failed(message),
             Event::Snippets(snippets) => self.runner.set_snippets(snippets),
             Event::RunStarted(run) => self.runner.run_started(run),
@@ -140,6 +176,7 @@ impl App {
                 self.backend.send(Command::PreviewImport { folder, paths });
             }
             ReposAction::Import(moves) => self.backend.send(Command::Import(moves)),
+            ReposAction::Tags(action) => self.handle_tags_action(action),
             ReposAction::SetRemote {
                 path,
                 name,
@@ -152,6 +189,33 @@ impl App {
                 add,
             }),
         }
+    }
+
+    fn handle_tags_action(&mut self, action: TagsAction) {
+        let command = match action {
+            TagsAction::AddTag { clone_ids, tag } => Command::AddTag { clone_ids, tag },
+            TagsAction::RemoveTag { clone_ids, tag } => Command::RemoveTag { clone_ids, tag },
+            TagsAction::SaveRule(rule) => Command::SaveRule(rule),
+            TagsAction::DeleteRule(id) => Command::DeleteRule(id),
+            TagsAction::SetRuleEnabled { rule_id, enabled } => {
+                Command::SetRuleEnabled { rule_id, enabled }
+            }
+            TagsAction::SetRuleException {
+                rule_id,
+                clone_id,
+                excepted,
+            } => Command::SetRuleException {
+                rule_id,
+                clone_id,
+                excepted,
+            },
+            TagsAction::RunOn { label, clone_ids } => {
+                self.runner.set_working_set(label, clone_ids);
+                self.tab = Tab::Runner;
+                return;
+            }
+        };
+        self.backend.send(command);
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
@@ -235,16 +299,29 @@ impl eframe::App for App {
                     has_clone_root: self.config.clone_root.is_some(),
                     default_remote: &self.config.remotes.default_name,
                     upstream_name: &self.config.remotes.upstream_name,
+                    tags: &self.tag_index,
+                    rules: &self.tag_store.rules,
                 };
                 if let Some(action) = self.repos.show(ui, cx) {
                     self.handle_repos_action(action);
                 }
             }
-            Tab::Tags => placeholder(ui, "Tags", "Tags, rules and groups come in build step 6."),
+            Tab::Tags => {
+                let cx = TagsContext {
+                    clones: self.repos.clones().unwrap_or_default(),
+                    facts: &self.facts,
+                    index: &self.tag_index,
+                    rules: &self.tag_store.rules,
+                };
+                if let Some(action) = self.tags.show(ui, cx) {
+                    self.handle_tags_action(action);
+                }
+            }
             Tab::Runner => {
                 let cx = RunnerContext {
                     clones: self.repos.clones(),
                     config: &self.config,
+                    tags: &self.tag_index,
                 };
                 if let Some(RunnerAction::Start {
                     command,

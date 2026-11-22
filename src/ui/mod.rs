@@ -3,17 +3,7 @@ pub mod inbox;
 pub mod repos;
 pub mod runner;
 pub mod settings;
-
-use eframe::egui;
-
-/// A centered note for tabs that aren't built yet.
-pub fn placeholder(ui: &mut egui::Ui, title: &str, note: &str) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(ui.available_height() * 0.35);
-        ui.heading(title);
-        ui.weak(note);
-    });
-}
+pub mod tags;
 
 /// `12345` → `"12,345"`.
 pub fn thousands(n: u64) -> String {

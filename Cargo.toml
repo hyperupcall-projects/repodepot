@@ -11,6 +11,8 @@ egui = { version = "0.37.0", default-features = false, features = ["monochrome_e
 egui_extras = "0.37.0"
 keyring = "4.2.0"
 nix = { version = "0.32.0", features = ["process", "signal"] }
+nucleo-matcher = "0.3.1"
+regex = "1.13.2"
 reqwest = { version = "0.13.5", features = ["json"] }
 rfd = "0.18.0"
 rusqlite = { version = "0.41.0", features = ["bundled"] }
