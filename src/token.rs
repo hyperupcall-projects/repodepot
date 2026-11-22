@@ -74,7 +74,10 @@ pub fn find() -> Lookup {
         token,
         source: TokenSource::GhCli,
     });
-    Lookup { found, keyring_error }
+    Lookup {
+        found,
+        keyring_error,
+    }
 }
 
 fn gh_cli_token() -> Option<String> {

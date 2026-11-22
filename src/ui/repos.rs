@@ -1,10 +1,18 @@
-//! The Repositories tab: every clone with its status, plus a Problems view.
+//! The Repositories tab: clones with their status, the Inbox, Ignored and Forks lists from
+//! GitHub, and a Problems view.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
+use crate::backend::SyncReport;
+use crate::db::{Catalog, ForkDecision};
 use crate::git::scan::{CloneInfo, MainRemote, Problem, ScanResult};
 use crate::git::status::Status;
+use crate::ui::inbox::{self, ListKind, ListState};
+use crate::ui::thousands;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReposAction {
@@ -15,11 +23,40 @@ pub enum ReposAction {
     },
     ForgetClone(i64),
     OpenSettings,
+    OpenRunner,
+    Sync,
+    Clone(Vec<i64>),
+    SetIgnored {
+        repo_ids: Vec<i64>,
+        ignored: bool,
+    },
+    SetForkDecision {
+        fork_id: i64,
+        parent_id: i64,
+        decision: ForkDecision,
+    },
+    AddManual(String),
+    RemoveManualOwner(String),
+    SetRemote {
+        path: PathBuf,
+        name: String,
+        url: String,
+        add: bool,
+    },
+}
+
+pub struct ReposContext<'a> {
+    pub has_clone_root: bool,
+    /// Name for upstream remotes, from the settings.
+    pub upstream_name: &'a str,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Clones,
+    Inbox,
+    Ignored,
+    Forks,
     Problems,
 }
 
@@ -76,17 +113,25 @@ enum SortKey {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProblemKind {
     NoMainRemote,
+    Renamed,
+    MissingUpstream,
     NoRemotes,
     NotHosted,
     OtherHost,
     OutOfLayout,
+    NotOnGitHub,
+    NotListed,
     GitError,
 }
 
 impl ProblemKind {
-    const ALL: [ProblemKind; 6] = [
+    const ALL: [ProblemKind; 10] = [
         ProblemKind::NoMainRemote,
+        ProblemKind::Renamed,
+        ProblemKind::MissingUpstream,
         ProblemKind::OutOfLayout,
+        ProblemKind::NotOnGitHub,
+        ProblemKind::NotListed,
         ProblemKind::NoRemotes,
         ProblemKind::NotHosted,
         ProblemKind::OtherHost,
@@ -101,22 +146,45 @@ impl ProblemKind {
             Problem::OtherHost { .. } => ProblemKind::OtherHost,
             Problem::OutOfLayout { .. } => ProblemKind::OutOfLayout,
             Problem::GitError { .. } => ProblemKind::GitError,
+            Problem::NotListed => ProblemKind::NotListed,
+            Problem::NotOnGitHub => ProblemKind::NotOnGitHub,
+            Problem::Renamed { .. } => ProblemKind::Renamed,
+            Problem::MissingUpstream { .. } => ProblemKind::MissingUpstream,
         }
     }
 
     fn title(self) -> &'static str {
         match self {
             ProblemKind::NoMainRemote => "Main remote not chosen",
+            ProblemKind::Renamed => "Renamed or moved on GitHub",
+            ProblemKind::MissingUpstream => "Linked forks without an upstream remote",
             ProblemKind::NoRemotes => "No remotes",
             ProblemKind::NotHosted => "Main remote isn't a hosted repo",
             ProblemKind::OtherHost => "On another host",
             ProblemKind::OutOfLayout => "Outside the layout",
+            ProblemKind::NotOnGitHub => "Gone from GitHub",
+            ProblemKind::NotListed => "Not in any source",
             ProblemKind::GitError => "git couldn't read these",
         }
     }
 
     fn help(self) -> &'static str {
         match self {
+            ProblemKind::Renamed => {
+                "Their main remote still uses the old name. GitHub redirects it for now; point \
+                 the remote at the new name to be safe. Import will be able to move the folder."
+            }
+            ProblemKind::MissingUpstream => {
+                "You marked these forks as linked, but their clones have no remote for the parent."
+            }
+            ProblemKind::NotOnGitHub => {
+                "GitHub says these don't exist, or the token can't see them (deleted, made \
+                 private, or in an org that needs SSO approval for the token)."
+            }
+            ProblemKind::NotListed => {
+                "Clones of GitHub repos that none of your sources list. Add one by hand to keep \
+                 it in your lists, or leave it be."
+            }
             ProblemKind::NoMainRemote => {
                 "These have several remotes, and none has the default remote name or is called \
                  origin. Pick the remote that says which repo the folder is."
@@ -155,6 +223,18 @@ pub struct ReposPage {
     scanning: Option<(usize, usize)>,
     result: Option<Result<ScanResult, String>>,
     action_error: Option<String>,
+    notice: Option<String>,
+    /// `Some(latest progress message)` while a sync runs.
+    syncing: Option<String>,
+    sync_report: Option<SyncReport>,
+    catalog: Option<Catalog>,
+    inbox: ListState,
+    ignored: ListState,
+    /// Repo IDs with a clone run in progress.
+    cloning: HashSet<i64>,
+    add_text: String,
+    only_undecided: bool,
+    upstream_name: String,
 }
 
 impl ReposPage {
@@ -169,7 +249,49 @@ impl ReposPage {
             scanning: None,
             result: None,
             action_error: None,
+            notice: None,
+            syncing: None,
+            sync_report: None,
+            catalog: None,
+            inbox: ListState::new(),
+            ignored: ListState::new(),
+            cloning: HashSet::new(),
+            add_text: String::new(),
+            only_undecided: false,
+            upstream_name: "upstream".to_owned(),
         }
+    }
+
+    pub fn sync_started(&mut self) {
+        self.syncing = Some("Starting…".to_owned());
+    }
+
+    pub fn sync_progress(&mut self, message: String) {
+        self.syncing = Some(message);
+    }
+
+    pub fn sync_finished(&mut self, result: Result<SyncReport, String>) {
+        self.syncing = None;
+        match result {
+            Ok(report) => self.sync_report = Some(report),
+            Err(e) => self.action_error = Some(format!("Sync failed: {e}")),
+        }
+    }
+
+    pub fn set_catalog(&mut self, catalog: Catalog) {
+        self.inbox.retain(&catalog.inbox);
+        self.ignored.retain(&catalog.ignored);
+        self.catalog = Some(catalog);
+    }
+
+    pub fn clones_finished(&mut self, repo_ids: &[i64]) {
+        for id in repo_ids {
+            self.cloning.remove(id);
+        }
+    }
+
+    pub fn notice(&mut self, message: String) {
+        self.notice = Some(message);
     }
 
     pub fn scan_started(&mut self) {
@@ -202,12 +324,56 @@ impl ReposPage {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, has_clone_root: bool) -> Option<ReposAction> {
+    pub fn show(&mut self, ui: &mut egui::Ui, cx: ReposContext<'_>) -> Option<ReposAction> {
         let mut action = None;
-        // Taken out so the views can borrow it while changing the page's own state.
+        self.upstream_name = cx.upstream_name.to_owned();
+        // Taken out so the views can borrow them while changing the page's own state.
         let result = self.result.take();
+        let catalog = self.catalog.take();
 
-        self.toolbar(ui, result.as_ref(), &mut action);
+        self.toolbar(ui, result.as_ref(), catalog.as_ref(), &mut action);
+        self.messages(ui, &mut action);
+        ui.separator();
+
+        match self.view {
+            View::Inbox | View::Ignored | View::Forks => {
+                self.github_view(ui, catalog.as_ref(), &mut action);
+            }
+            View::Clones | View::Problems => match &result {
+                None if self.scanning.is_some() => {
+                    ui.weak("Scanning the clone root…");
+                }
+                None if !cx.has_clone_root => no_clone_root(ui, &mut action),
+                None => {
+                    ui.weak("Not scanned yet.");
+                }
+                Some(Err(error)) => {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                    if !cx.has_clone_root {
+                        no_clone_root(ui, &mut action);
+                    }
+                }
+                Some(Ok(scan)) => match self.view {
+                    View::Problems => self.problems_view(ui, scan, &mut action),
+                    _ => self.clones_view(ui, scan, &mut action),
+                },
+            },
+        }
+
+        self.result = result;
+        self.catalog = catalog;
+        if let Some(ReposAction::Clone(ids)) = &action {
+            self.cloning.extend(ids.iter().copied());
+            self.notice = Some(format!(
+                "Cloning {}. Progress is in the Runner tab.",
+                plural(ids.len() as u32, "repo", "repos")
+            ));
+        }
+        action
+    }
+
+    /// Errors, notices and the last sync's summary.
+    fn messages(&mut self, ui: &mut egui::Ui, action: &mut Option<ReposAction>) {
         if let Some(error) = &self.action_error {
             let mut dismiss = false;
             ui.horizontal(|ui| {
@@ -218,64 +384,190 @@ impl ReposPage {
                 self.action_error = None;
             }
         }
-        ui.separator();
-
-        match &result {
-            None if self.scanning.is_some() => {
-                ui.weak("Scanning the clone root…");
-            }
-            None if !has_clone_root => no_clone_root(ui, &mut action),
-            None => {
-                ui.weak("Not scanned yet.");
-            }
-            Some(Err(error)) => {
-                ui.colored_label(ui.visuals().error_fg_color, error);
-                if !has_clone_root {
-                    no_clone_root(ui, &mut action);
+        if let Some(notice) = &self.notice {
+            let mut dismiss = false;
+            ui.horizontal(|ui| {
+                ui.label(notice);
+                if notice.contains("Runner tab") && ui.small_button("Open Runner").clicked() {
+                    *action = Some(ReposAction::OpenRunner);
                 }
+                dismiss = ui.small_button("Dismiss").clicked();
+            });
+            if dismiss {
+                self.notice = None;
             }
-            Some(Ok(scan)) => match self.view {
-                View::Clones => self.clones_view(ui, scan, &mut action),
-                View::Problems => self.problems_view(ui, scan, &mut action),
-            },
         }
+        if let Some(report) = &self.sync_report {
+            let mut dismiss = false;
+            ui.horizontal(|ui| {
+                let counts: Vec<String> = report
+                    .counts
+                    .iter()
+                    .map(|(source, count)| {
+                        format!("{}: {}", source.label(), thousands(*count as u64))
+                    })
+                    .collect();
+                ui.label(format!(
+                    "Synced in {}: {} repos listed",
+                    short_duration(report.took),
+                    thousands(report.relevant as u64)
+                ))
+                .on_hover_text(counts.join("\n"));
+                if report.new_forks > 0 {
+                    ui.weak(format!(
+                        "· {} new to decide on in Forks",
+                        plural(report.new_forks as u32, "fork", "forks")
+                    ));
+                }
+                if !report.warnings.is_empty() {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!(
+                            "· ⚠ {}",
+                            plural(report.warnings.len() as u32, "warning", "warnings")
+                        ),
+                    )
+                    .on_hover_text(report.warnings.join("\n"));
+                }
+                dismiss = ui.small_button("Dismiss").clicked();
+            });
+            if dismiss {
+                self.sync_report = None;
+            }
+        }
+    }
 
-        self.result = result;
-        action
+    fn github_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: Option<&Catalog>,
+        action: &mut Option<ReposAction>,
+    ) {
+        let Some(catalog) = catalog else {
+            ui.weak("Loading…");
+            return;
+        };
+        if catalog.last_sync.is_none() && catalog.relevant == 0 {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.3);
+                ui.heading("Not synced yet");
+                ui.weak("Sync with GitHub to list your repos here.");
+                ui.add_space(6.0);
+                if ui
+                    .add_enabled(
+                        self.syncing.is_none(),
+                        egui::Button::new("Sync with GitHub"),
+                    )
+                    .clicked()
+                {
+                    *action = Some(ReposAction::Sync);
+                }
+            });
+            return;
+        }
+        match self.view {
+            View::Inbox => {
+                inbox::add_by_hand(ui, &mut self.add_text, &catalog.manual_owners, action);
+                ui.add_space(4.0);
+                inbox::repo_list(
+                    ui,
+                    ListKind::Inbox,
+                    &catalog.inbox,
+                    &mut self.inbox,
+                    &self.filter,
+                    &self.cloning,
+                    action,
+                );
+            }
+            View::Ignored => inbox::repo_list(
+                ui,
+                ListKind::Ignored,
+                &catalog.ignored,
+                &mut self.ignored,
+                &self.filter,
+                &self.cloning,
+                action,
+            ),
+            _ => inbox::forks_view(ui, catalog, &self.filter, &mut self.only_undecided, action),
+        }
     }
 
     fn toolbar(
         &mut self,
         ui: &mut egui::Ui,
         result: Option<&Result<ScanResult, String>>,
+        catalog: Option<&Catalog>,
         action: &mut Option<ReposAction>,
     ) {
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(self.scanning.is_none(), egui::Button::new("Rescan"))
-                .clicked()
-            {
-                *action = Some(ReposAction::Rescan);
+            let count = |n: usize| thousands(n as u64);
+            let clones = match result {
+                Some(Ok(scan)) => format!("Clones ({})", count(scan.clones.len())),
+                _ => "Clones".to_owned(),
+            };
+            ui.selectable_value(&mut self.view, View::Clones, clones);
+            if let Some(catalog) = catalog {
+                ui.selectable_value(
+                    &mut self.view,
+                    View::Inbox,
+                    format!("Inbox ({})", count(catalog.inbox.len())),
+                );
+                ui.selectable_value(
+                    &mut self.view,
+                    View::Ignored,
+                    format!("Ignored ({})", count(catalog.ignored.len())),
+                );
+                let undecided = catalog
+                    .forks
+                    .iter()
+                    .flat_map(|f| &f.forks)
+                    .filter(|f| f.decision == ForkDecision::Undecided)
+                    .count();
+                let forks = if undecided > 0 {
+                    format!("Forks ({} undecided)", count(undecided))
+                } else {
+                    "Forks".to_owned()
+                };
+                ui.selectable_value(&mut self.view, View::Forks, forks);
             }
-            ui.separator();
+            let problems = match result {
+                Some(Ok(scan)) => format!("Problems ({})", count(scan.problem_count())),
+                _ => "Problems".to_owned(),
+            };
+            ui.selectable_value(&mut self.view, View::Problems, problems);
 
-            if let Some(Ok(scan)) = result {
-                ui.selectable_value(
-                    &mut self.view,
-                    View::Clones,
-                    format!("Clones ({})", scan.clones.len()),
-                );
-                ui.selectable_value(
-                    &mut self.view,
-                    View::Problems,
-                    format!("Problems ({})", scan.problem_count()),
-                );
-                ui.separator();
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text("Filter by name or folder")
-                        .desired_width(200.0),
-                );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(self.scanning.is_none(), egui::Button::new("Rescan"))
+                    .on_hover_text("Look at the clone root again")
+                    .clicked()
+                {
+                    *action = Some(ReposAction::Rescan);
+                }
+                if ui
+                    .add_enabled(
+                        self.syncing.is_none(),
+                        egui::Button::new("Sync with GitHub"),
+                    )
+                    .on_hover_text("Fetch your repos from every source enabled in Settings")
+                    .clicked()
+                {
+                    *action = Some(ReposAction::Sync);
+                }
+            });
+        });
+
+        ui.horizontal(|ui| {
+            let hint = match self.view {
+                View::Clones | View::Problems => "Filter by name or folder",
+                _ => "Filter by name, description, language, topic or source",
+            };
+            ui.add(
+                egui::TextEdit::singleline(&mut self.filter)
+                    .hint_text(hint)
+                    .desired_width(390.0),
+            );
+            {
                 if self.view == View::Clones {
                     let label = ui.label("Show");
                     egui::ComboBox::from_id_salt("repos_show")
@@ -301,6 +593,16 @@ impl ReposPage {
                 } else if let Some(Ok(scan)) = result {
                     ui.weak(format!("Scanned in {}", short_duration(scan.took)))
                         .on_hover_text(format!("Clone root: {}", scan.root.display()));
+                }
+                ui.separator();
+                if let Some(message) = &self.syncing {
+                    ui.label(format!("Syncing: {message}"));
+                    ui.spinner();
+                } else if let Some(catalog) = catalog {
+                    match &catalog.last_sync {
+                        Some(when) => ui.weak(format!("Synced {when} UTC")),
+                        None => ui.weak("Never synced"),
+                    };
                 }
             });
         });
@@ -330,7 +632,9 @@ impl ReposPage {
         let mut rows: Vec<&CloneInfo> = scan
             .clones
             .iter()
-            .filter(|c| matches_text(&needle, &c.display_name(), &c.rel_path) && self.show.matches(c))
+            .filter(|c| {
+                matches_text(&needle, &c.display_name(), &c.rel_path) && self.show.matches(c)
+            })
             .collect();
         sort_rows(&mut rows, self.sort, self.descending);
 
@@ -358,9 +662,24 @@ impl ReposPage {
             .striped(true)
             .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::initial(220.0).at_least(110.0).clip(true).resizable(true))
-            .column(Column::initial(150.0).at_least(70.0).clip(true).resizable(true))
-            .column(Column::initial(120.0).at_least(60.0).clip(true).resizable(true))
+            .column(
+                Column::initial(220.0)
+                    .at_least(110.0)
+                    .clip(true)
+                    .resizable(true),
+            )
+            .column(
+                Column::initial(150.0)
+                    .at_least(70.0)
+                    .clip(true)
+                    .resizable(true),
+            )
+            .column(
+                Column::initial(120.0)
+                    .at_least(60.0)
+                    .clip(true)
+                    .resizable(true),
+            )
             .column(Column::initial(70.0).at_least(60.0))
             .column(Column::initial(70.0).at_least(50.0))
             .column(Column::initial(50.0).at_least(45.0))
@@ -408,8 +727,8 @@ impl ReposPage {
             (true, true) => " ⏷",
             (false, _) => "",
         };
-        let button = egui::Button::new(egui::RichText::new(format!("{label}{arrow}")).strong())
-            .frame(false);
+        let button =
+            egui::Button::new(egui::RichText::new(format!("{label}{arrow}")).strong()).frame(false);
         if ui.add(button).on_hover_text("Sort").clicked() {
             if self.sort == key {
                 self.descending = !self.descending;
@@ -482,7 +801,7 @@ impl ReposPage {
                                     self.view = View::Clones;
                                 }
                                 ui.weak(&clone.rel_path);
-                                problem_detail(ui, clone, problem, action);
+                                problem_detail(ui, clone, problem, &self.upstream_name, action);
                             });
                         }
                     });
@@ -625,8 +944,11 @@ fn stash_cell(ui: &mut egui::Ui, clone: &CloneInfo) {
     if let Ok(status) = &clone.status
         && status.stashes > 0
     {
-        ui.label(status.stashes.to_string())
-            .on_hover_text(plural(status.stashes, "stash", "stashes"));
+        ui.label(status.stashes.to_string()).on_hover_text(plural(
+            status.stashes,
+            "stash",
+            "stashes",
+        ));
     }
 }
 
@@ -639,7 +961,7 @@ fn problems_cell(ui: &mut egui::Ui, clone: &CloneInfo) {
     let informational = clone
         .problems
         .iter()
-        .all(|p| matches!(p, Problem::OtherHost { .. }));
+        .all(|p| matches!(p, Problem::OtherHost { .. } | Problem::NotListed));
     let response = if informational {
         ui.weak(short.join(", "))
     } else {
@@ -664,93 +986,97 @@ fn details(ui: &mut egui::Ui, clone: &CloneInfo, action: &mut Option<ReposAction
     ui.weak(clone.abs_path.display().to_string());
     ui.separator();
 
-    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-        ui.strong("Remotes");
-        if clone.remotes.is_empty() {
-            ui.weak("None");
-        } else {
-            let main_index = match clone.main {
-                MainRemote::Chosen { index, .. } => Some(index),
-                _ => None,
-            };
-            egui::Grid::new(("remotes", clone.id))
-                .num_columns(2)
-                .spacing([12.0, 4.0])
-                .show(ui, |ui| {
-                    for (index, remote) in clone.remotes.iter().enumerate() {
-                        if Some(index) == main_index {
-                            ui.strong(&remote.name).on_hover_text("Main remote");
-                        } else {
-                            ui.label(&remote.name);
-                        }
-                        ui.vertical(|ui| {
-                            ui.label(&remote.url);
-                            match &remote.parsed {
-                                Some(repo) => ui.weak(format!("{} · {}", repo.host, repo.full_name())),
-                                None => ui.weak("Not a hosted repo URL"),
-                            };
-                        });
-                        ui.end_row();
-                    }
-                });
-            if clone.remotes.len() > 1 {
-                ui.add_space(4.0);
-                main_remote_picker(ui, clone, action);
-            }
-        }
-
-        ui.add_space(10.0);
-        ui.strong("Status");
-        match &clone.status {
-            Err(error) => {
-                ui.colored_label(ui.visuals().error_fg_color, error);
-            }
-            Ok(status) => {
-                egui::Grid::new(("status", clone.id))
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            ui.strong("Remotes");
+            if clone.remotes.is_empty() {
+                ui.weak("None");
+            } else {
+                let main_index = match clone.main {
+                    MainRemote::Chosen { index, .. } => Some(index),
+                    _ => None,
+                };
+                egui::Grid::new(("remotes", clone.id))
                     .num_columns(2)
                     .spacing([12.0, 4.0])
                     .show(ui, |ui| {
-                        ui.label("Branch");
-                        ui.label(status.branch.as_deref().unwrap_or("(detached HEAD)"));
-                        ui.end_row();
-
-                        ui.label("Commit");
-                        ui.label(match &status.head {
-                            Some(head) => head.chars().take(12).collect(),
-                            None => "no commits yet".to_owned(),
-                        });
-                        ui.end_row();
-
-                        ui.label("Upstream");
-                        ui.label(match (&status.upstream, status.ahead_behind) {
-                            (None, _) => "none".to_owned(),
-                            (Some(up), None) => format!("{up} (gone)"),
-                            (Some(up), Some((0, 0))) => format!("{up}, in sync"),
-                            (Some(up), Some((a, b))) => format!("{up}, {a} ahead, {b} behind"),
-                        });
-                        ui.end_row();
-
-                        ui.label("Changes");
-                        ui.label(describe_changes(status));
-                        ui.end_row();
-
-                        ui.label("Stashes");
-                        ui.label(status.stashes.to_string());
-                        ui.end_row();
+                        for (index, remote) in clone.remotes.iter().enumerate() {
+                            if Some(index) == main_index {
+                                ui.strong(&remote.name).on_hover_text("Main remote");
+                            } else {
+                                ui.label(&remote.name);
+                            }
+                            ui.vertical(|ui| {
+                                ui.label(&remote.url);
+                                match &remote.parsed {
+                                    Some(repo) => {
+                                        ui.weak(format!("{} · {}", repo.host, repo.full_name()))
+                                    }
+                                    None => ui.weak("Not a hosted repo URL"),
+                                };
+                            });
+                            ui.end_row();
+                        }
                     });
-                ui.weak("Ahead/behind counts are as of the last fetch.");
+                if clone.remotes.len() > 1 {
+                    ui.add_space(4.0);
+                    main_remote_picker(ui, clone, action);
+                }
             }
-        }
 
-        ui.add_space(10.0);
-        ui.strong("Problems");
-        if clone.problems.is_empty() {
-            ui.weak("None");
-        }
-        for problem in &clone.problems {
-            ui.label(format!("• {}", describe_problem(problem)));
-        }
-    });
+            ui.add_space(10.0);
+            ui.strong("Status");
+            match &clone.status {
+                Err(error) => {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                Ok(status) => {
+                    egui::Grid::new(("status", clone.id))
+                        .num_columns(2)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label("Branch");
+                            ui.label(status.branch.as_deref().unwrap_or("(detached HEAD)"));
+                            ui.end_row();
+
+                            ui.label("Commit");
+                            ui.label(match &status.head {
+                                Some(head) => head.chars().take(12).collect(),
+                                None => "no commits yet".to_owned(),
+                            });
+                            ui.end_row();
+
+                            ui.label("Upstream");
+                            ui.label(match (&status.upstream, status.ahead_behind) {
+                                (None, _) => "none".to_owned(),
+                                (Some(up), None) => format!("{up} (gone)"),
+                                (Some(up), Some((0, 0))) => format!("{up}, in sync"),
+                                (Some(up), Some((a, b))) => format!("{up}, {a} ahead, {b} behind"),
+                            });
+                            ui.end_row();
+
+                            ui.label("Changes");
+                            ui.label(describe_changes(status));
+                            ui.end_row();
+
+                            ui.label("Stashes");
+                            ui.label(status.stashes.to_string());
+                            ui.end_row();
+                        });
+                    ui.weak("Ahead/behind counts are as of the last fetch.");
+                }
+            }
+
+            ui.add_space(10.0);
+            ui.strong("Problems");
+            if clone.problems.is_empty() {
+                ui.weak("None");
+            }
+            for problem in &clone.problems {
+                ui.label(format!("• {}", describe_problem(problem)));
+            }
+        });
     close
 }
 
@@ -827,9 +1153,52 @@ fn problem_detail(
     ui: &mut egui::Ui,
     clone: &CloneInfo,
     problem: &Problem,
+    upstream_name: &str,
     action: &mut Option<ReposAction>,
 ) {
     match problem {
+        Problem::NotListed => {
+            if let Some(repo) = clone.repo()
+                && ui
+                    .small_button("Add by hand")
+                    .on_hover_text("List it from now on, as if a source did")
+                    .clicked()
+            {
+                *action = Some(ReposAction::AddManual(repo.full_name()));
+            }
+        }
+        Problem::NotOnGitHub => {}
+        Problem::Renamed { name, url } => {
+            ui.weak(format!("· now {name}"));
+            if let Some(remote) = clone.main_remote()
+                && ui
+                    .small_button("Use the new URL")
+                    .on_hover_text(format!("git remote set-url {} {url}", remote.name))
+                    .clicked()
+            {
+                *action = Some(ReposAction::SetRemote {
+                    path: clone.abs_path.clone(),
+                    name: remote.name.clone(),
+                    url: url.clone(),
+                    add: false,
+                });
+            }
+        }
+        Problem::MissingUpstream { name, url } => {
+            ui.weak(format!("· parent is {name}"));
+            if ui
+                .small_button(format!("Add remote \"{upstream_name}\""))
+                .on_hover_text(format!("git remote add {upstream_name} {url}"))
+                .clicked()
+            {
+                *action = Some(ReposAction::SetRemote {
+                    path: clone.abs_path.clone(),
+                    name: upstream_name.to_owned(),
+                    url: url.clone(),
+                    add: true,
+                });
+            }
+        }
         Problem::NoMainRemote => main_remote_picker(ui, clone, action),
         Problem::NoRemotes => {}
         Problem::NotHosted { url } => {
@@ -855,6 +1224,10 @@ fn short_problem(problem: &Problem) -> String {
         Problem::OtherHost { host } => format!("on {host}"),
         Problem::OutOfLayout { .. } => "outside layout".to_owned(),
         Problem::GitError { .. } => "git error".to_owned(),
+        Problem::NotListed => "not listed".to_owned(),
+        Problem::NotOnGitHub => "gone from GitHub".to_owned(),
+        Problem::Renamed { .. } => "renamed".to_owned(),
+        Problem::MissingUpstream { .. } => "no upstream remote".to_owned(),
     }
 }
 
@@ -868,6 +1241,16 @@ fn describe_problem(problem: &Problem) -> String {
             format!("Not where the layout puts it (expected at {expected})")
         }
         Problem::GitError { message } => format!("git couldn't read it: {message}"),
+        Problem::NotListed => {
+            "None of your sources list this repo (as of the last sync)".to_owned()
+        }
+        Problem::NotOnGitHub => {
+            "GitHub says this repo doesn't exist, or the token can't see it".to_owned()
+        }
+        Problem::Renamed { name, .. } => format!("Renamed or moved on GitHub to {name}"),
+        Problem::MissingUpstream { name, .. } => {
+            format!("Linked fork, but there's no remote for its parent {name}")
+        }
     }
 }
 
@@ -919,6 +1302,8 @@ mod tests {
 
     use super::*;
     use crate::db::MissingClone;
+    use crate::db::github::{ForkEntry, ForkFamily};
+    use crate::db::{RepoRow, Source};
     use crate::git::remote_url;
     use crate::git::scan::{Location, Remote, choose_main_remote, find_problems};
 
@@ -935,6 +1320,7 @@ mod tests {
         let letter = rel_path.chars().next().unwrap();
         CloneInfo {
             id,
+            repo_id: None,
             rel_path: rel_path.into(),
             abs_path: PathBuf::from("/home/someone/code").join(rel_path),
             problems: find_problems(rel_path, Location::Letter(letter), &remotes, main),
@@ -1013,15 +1399,103 @@ mod tests {
         }
     }
 
+    /// The sample scan plus two problems only a sync can find.
+    fn synced_scan() -> ScanResult {
+        let mut scan = sample_scan();
+        scan.clones[0].problems.push(Problem::Renamed {
+            name: "meta/react".into(),
+            url: "git@github.com:meta/react.git".into(),
+        });
+        scan.clones[1].problems.push(Problem::MissingUpstream {
+            name: "facebook/react".into(),
+            url: "git@github.com:facebook/react.git".into(),
+        });
+        scan
+    }
+
+    fn repo_row(
+        id: i64,
+        full_name: &str,
+        language: &str,
+        pushed: &str,
+        sources: &[Source],
+    ) -> RepoRow {
+        let (owner, name) = full_name.split_once('/').unwrap();
+        RepoRow {
+            id,
+            owner: owner.into(),
+            name: name.into(),
+            description: Some(format!("The {name} project")),
+            language: Some(language.into()),
+            topics: Vec::new(),
+            is_fork: false,
+            is_archived: false,
+            is_private: false,
+            pushed_at: Some(format!("{pushed}T12:00:00Z")),
+            sources: sources.to_vec(),
+            fork_of: None,
+        }
+    }
+
+    fn sample_catalog() -> Catalog {
+        let mut website = repo_row(
+            12,
+            "myorg/website",
+            "TypeScript",
+            "2025-02-01",
+            &[Source::OrgMember, Source::Contributed],
+        );
+        website.is_archived = true;
+        let mut fork = repo_row(13, "me/react", "JavaScript", "2026-09-01", &[Source::Owned]);
+        fork.is_fork = true;
+        fork.fork_of = Some(("facebook/react".into(), ForkDecision::Undecided));
+        Catalog {
+            last_sync: Some("2026-11-21 18:00:00".into()),
+            relevant: 5,
+            inbox: vec![
+                repo_row(10, "me/dotfiles", "Shell", "2026-11-20", &[Source::Owned]),
+                repo_row(11, "myorg/api", "Rust", "2026-11-01", &[Source::OrgMember]),
+                website,
+                fork,
+            ],
+            ignored: vec![repo_row(
+                14,
+                "myorg/old-thing",
+                "Perl",
+                "2019-01-01",
+                &[Source::OrgMember],
+            )],
+            forks: vec![ForkFamily {
+                parent_id: 20,
+                parent_name: "facebook/react".into(),
+                parent_listed: true,
+                parent_cloned: false,
+                forks: vec![ForkEntry {
+                    fork_id: 13,
+                    name: "me/react".into(),
+                    decision: ForkDecision::Undecided,
+                    cloned: false,
+                    suggest_linked: true,
+                }],
+            }],
+            manual_owners: vec!["rust-lang".into()],
+        }
+    }
+
     type State = (ReposPage, Vec<ReposAction>);
 
     fn harness<'a>(builder: egui_kittest::HarnessBuilder<State>) -> Harness<'a, State> {
         let mut page = ReposPage::new();
-        page.scan_finished(Ok(sample_scan()));
+        page.scan_finished(Ok(synced_scan()));
+        page.set_catalog(sample_catalog());
         builder.with_size([1280.0, 560.0]).build_ui_state(
             |ui, (page, actions): &mut State| {
                 egui::CentralPanel::default_margins().show(ui, |ui| {
-                    if let Some(action) = page.show(ui, true) {
+                    let cx = ReposContext {
+                        has_clone_root: true,
+                        upstream_name: "upstream",
+                    };
+                    if let Some(action) = page.show(ui, cx) {
                         actions.push(action);
                     }
                 });
@@ -1057,11 +1531,13 @@ mod tests {
     fn problems_view_groups_and_acts() {
         let mut h = harness(Harness::builder());
         h.run();
-        h.get_by_label("Problems (5)").click();
+        h.get_by_label("Problems (7)").click();
         h.run();
         for title in [
             "Missing folders (1)",
             "Main remote not chosen (1)",
+            "Renamed or moved on GitHub (1)",
+            "Linked forks without an upstream remote (1)",
             "Outside the layout (1)",
             "No remotes (1)",
             "Not git repos (1)",
@@ -1076,6 +1552,10 @@ mod tests {
         h.run();
         h.get_by_label("bob").click();
         h.run();
+        h.get_by_label("Use the new URL").click();
+        h.run();
+        h.get_by_label("Add remote \"upstream\"").click();
+        h.run();
         assert_eq!(
             h.state().1,
             vec![
@@ -1084,7 +1564,112 @@ mod tests {
                     clone_id: 3,
                     remote: Some("bob".into())
                 },
+                ReposAction::SetRemote {
+                    path: "/home/someone/code/r/react".into(),
+                    name: "me".into(),
+                    url: "git@github.com:meta/react.git".into(),
+                    add: false,
+                },
+                ReposAction::SetRemote {
+                    path: "/home/someone/code/r/react~2".into(),
+                    name: "upstream".into(),
+                    url: "git@github.com:facebook/react.git".into(),
+                    add: true,
+                },
             ]
+        );
+    }
+
+    #[test]
+    fn inbox_selects_then_clones_or_ignores() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        h.get_by_label("Inbox (4)").click();
+        h.run();
+        h.get_by_label("me/dotfiles").click();
+        h.run();
+        h.get_by_label("myorg/api").click();
+        h.run();
+        assert!(h.query_by_label("2 selected").is_some());
+        h.get_by_label("Clone").click();
+        h.run_steps(3); // the cloning spinner never settles
+        let Some(ReposAction::Clone(ids)) = h.state_mut().1.pop() else {
+            panic!("expected a clone action");
+        };
+        assert_eq!(
+            ids.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([10, 11])
+        );
+        assert!(h.state().0.cloning.contains(&10));
+        assert!(h.query_by_label_contains("Cloning 2 repos").is_some());
+
+        h.get_by_label("myorg/website").click();
+        h.run_steps(3); // the cloning spinner never settles
+        h.get_by_label("Ignore").click();
+        h.run_steps(3); // the cloning spinner never settles
+        assert_eq!(
+            h.state().1.last(),
+            Some(&ReposAction::SetIgnored {
+                repo_ids: vec![12],
+                ignored: true
+            })
+        );
+        assert!(h.query_by_label("0 selected").is_some());
+    }
+
+    #[test]
+    fn inbox_filters_and_hides_archived() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.view = View::Inbox;
+        h.state_mut().0.filter = "rust".into();
+        h.run();
+        assert!(h.query_by_label("myorg/api").is_some());
+        assert!(h.query_by_label("me/dotfiles").is_none());
+
+        h.state_mut().0.filter.clear();
+        h.run();
+        assert!(h.query_by_label("myorg/website").is_some());
+        h.get_by_label("Hide archived").click();
+        h.run();
+        assert!(h.query_by_label("myorg/website").is_none());
+        assert!(h.query_by_label("Select all shown (3)").is_some());
+    }
+
+    #[test]
+    fn add_by_hand_and_remove_an_owner() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.view = View::Inbox;
+        h.state_mut().0.add_text = " rust-lang/rust ".into();
+        h.run();
+        h.get_by_label("Add").click();
+        h.run();
+        h.get_by_label("×").click();
+        h.run();
+        assert_eq!(
+            h.state().1,
+            vec![
+                ReposAction::AddManual("rust-lang/rust".into()),
+                ReposAction::RemoveManualOwner("rust-lang".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn fork_decisions() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        h.get_by_label("Forks (1 undecided)").click();
+        h.run();
+        assert!(h.query_by_label_contains("suggested: Linked").is_some());
+        h.get_by_label("Linked").click();
+        h.run();
+        assert_eq!(
+            h.state().1,
+            vec![ReposAction::SetForkDecision {
+                fork_id: 13,
+                parent_id: 20,
+                decision: ForkDecision::Linked
+            }]
         );
     }
 
@@ -1101,9 +1686,17 @@ mod tests {
         h.get_by_label("someone/react").click();
         h.run();
         h.render().unwrap().save(dir.join("clones.png")).unwrap();
-        h.get_by_label("Problems (5)").click();
+        h.get_by_label("Problems (7)").click();
         h.run();
         h.render().unwrap().save(dir.join("problems.png")).unwrap();
+        h.get_by_label("Inbox (4)").click();
+        h.run();
+        h.get_by_label("myorg/api").click();
+        h.run();
+        h.render().unwrap().save(dir.join("inbox.png")).unwrap();
+        h.get_by_label("Forks (1 undecided)").click();
+        h.run();
+        h.render().unwrap().save(dir.join("forks.png")).unwrap();
     }
 
     #[test]

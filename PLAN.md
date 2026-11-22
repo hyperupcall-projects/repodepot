@@ -254,7 +254,7 @@ The exact flags get checked against each tool during the build.
   - `DEPO_PATH`
   - `DEPO_TAGS` (comma-separated)
 - **Limits**: a cap on how many commands run at once (from settings, changeable per run) and an optional timeout.
-- **Cancel**: each process gets its own process group. Cancelling (one repo or all) sends SIGTERM to the group, then SIGKILL after a few seconds, so child processes die too.
+- **Cancel**: each process gets its own session (and so its own process group). Cancelling (one repo or all) sends SIGTERM to the group, then SIGKILL after a few seconds, so child processes die too. Having no terminal also means ssh asks for key passphrases through your desktop's askpass dialog instead of the terminal the app was started from.
 - **After a run** finishes, the status column refreshes for those clones.
 
 ### 3.3 Viewing results

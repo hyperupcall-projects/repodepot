@@ -209,7 +209,9 @@ pub fn validate_remote_name(name: &str) -> Result<(), String> {
         .chars()
         .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
     {
-        return Err(format!("can't contain '{bad}' (use letters, digits, '-', '_', '.')"));
+        return Err(format!(
+            "can't contain '{bad}' (use letters, digits, '-', '_', '.')"
+        ));
     }
     Ok(())
 }
@@ -282,7 +284,10 @@ mod tests {
 
     #[test]
     fn tilde_expands_to_home() {
-        let home = directories::BaseDirs::new().unwrap().home_dir().to_path_buf();
+        let home = directories::BaseDirs::new()
+            .unwrap()
+            .home_dir()
+            .to_path_buf();
         assert_eq!(expand_tilde("~"), home);
         assert_eq!(expand_tilde("~/code"), home.join("code"));
         assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));

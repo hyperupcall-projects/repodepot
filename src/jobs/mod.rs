@@ -32,10 +32,14 @@ pub struct Target {
     pub name: String,
     pub path: PathBuf,
     pub tags: Vec<String>,
+    /// Extra environment variables for this target only.
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RunSpec {
+    /// What the run is called in the UI, e.g. the command itself or "Clone 5 repos".
+    pub title: String,
     pub command: String,
     pub shell: String,
     pub targets: Vec<Target>,
@@ -121,6 +125,7 @@ impl Summary {
 
 pub struct Run {
     pub id: u64,
+    pub title: String,
     pub command: String,
     pub shell: String,
     pub targets: Vec<Target>,
@@ -199,6 +204,7 @@ pub fn start(id: u64, spec: RunSpec, on_change: OnChange) -> (Arc<Run>, JoinHand
                 })
             })
             .collect(),
+        title: spec.title,
         command: spec.command,
         shell: spec.shell,
         targets: spec.targets,
@@ -235,7 +241,9 @@ pub fn start(id: u64, spec: RunSpec, on_change: OnChange) -> (Arc<Run>, JoinHand
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 enum Stop {
@@ -275,10 +283,22 @@ async fn run_target(run: Arc<Run>, index: usize, limit: Arc<Semaphore>, on_chang
     let pid = child.id();
     let readers = [
         child.stdout.take().map(|out| {
-            tokio::spawn(pump(out, Stream::Stdout, run.clone(), index, on_change.clone()))
+            tokio::spawn(pump(
+                out,
+                Stream::Stdout,
+                run.clone(),
+                index,
+                on_change.clone(),
+            ))
         }),
         child.stderr.take().map(|err| {
-            tokio::spawn(pump(err, Stream::Stderr, run.clone(), index, on_change.clone()))
+            tokio::spawn(pump(
+                err,
+                Stream::Stderr,
+                run.clone(),
+                index,
+                on_change.clone(),
+            ))
         }),
     ];
 
@@ -321,7 +341,8 @@ async fn run_target(run: Arc<Run>, index: usize, limit: Arc<Semaphore>, on_chang
 }
 
 fn spawn(shell: &str, command: &str, target: &Target) -> std::io::Result<Child> {
-    Command::new(shell)
+    let mut command_builder = Command::new(shell);
+    command_builder
         .arg("-c")
         .arg(command)
         .current_dir(&target.path)
@@ -332,10 +353,19 @@ fn spawn(shell: &str, command: &str, target: &Target) -> std::io::Result<Child> 
         .env("DEPO_REPO", &target.name)
         .env("DEPO_PATH", &target.path)
         .env("DEPO_TAGS", target.tags.join(","))
-        // Its own process group, so cancelling reaches everything it started.
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
+        .envs(target.env.iter().map(|(k, v)| (k, v)))
+        .kill_on_drop(true);
+    // Its own session (and so its own process group): cancelling reaches everything it
+    // started, and nothing can read from the terminal the app was started in. Without a
+    // terminal, ssh asks for passphrases through SSH_ASKPASS instead.
+    // SAFETY: setsid is async-signal-safe and touches no memory of the parent.
+    unsafe {
+        command_builder.pre_exec(|| {
+            nix::unistd::setsid().map_err(std::io::Error::from)?;
+            Ok(())
+        });
+    }
+    command_builder.spawn()
 }
 
 /// SIGTERM to the whole process group, then SIGKILL if it hasn't exited in time.
@@ -345,7 +375,10 @@ async fn terminate(child: &mut Child, pid: Option<u32>) {
     };
     let group = Pid::from_raw(pid);
     let _ = killpg(group, Signal::SIGTERM);
-    if tokio::time::timeout(TERM_GRACE, child.wait()).await.is_err() {
+    if tokio::time::timeout(TERM_GRACE, child.wait())
+        .await
+        .is_err()
+    {
         let _ = killpg(group, Signal::SIGKILL);
         let _ = child.wait().await;
     }
@@ -422,8 +455,8 @@ mod tests {
 
     impl Folders {
         fn new(test: &str, names: &[&str]) -> Self {
-            let root = std::env::temp_dir()
-                .join(format!("depository-jobs-{test}-{}", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("depository-jobs-{test}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             let targets = names
                 .iter()
@@ -434,6 +467,7 @@ mod tests {
                         name: (*name).to_owned(),
                         path,
                         tags: vec!["work".into(), "rust".into()],
+                        env: vec![("DEPO_EXTRA".into(), format!("extra-{name}"))],
                     }
                 })
                 .collect();
@@ -449,6 +483,7 @@ mod tests {
 
     fn spec(command: &str, targets: &[Target]) -> RunSpec {
         RunSpec {
+            title: command.into(),
             command: command.into(),
             shell: "/bin/sh".into(),
             targets: targets.to_vec(),
@@ -494,8 +529,14 @@ mod tests {
         ))
         .await;
 
-        assert!(matches!(run.status(0), TargetStatus::Exited { code: 3, .. }));
-        assert!(matches!(run.status(1), TargetStatus::Exited { code: 0, .. }));
+        assert!(matches!(
+            run.status(0),
+            TargetStatus::Exited { code: 3, .. }
+        ));
+        assert!(matches!(
+            run.status(1),
+            TargetStatus::Exited { code: 0, .. }
+        ));
         let mut first = lines(&run, 0);
         first.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(
@@ -514,15 +555,30 @@ mod tests {
     async fn environment_and_working_directory() {
         let folders = Folders::new("env", &["me/thing"]);
         let run = finish(spec(
-            r#"echo "$DEPO_PATH|$DEPO_TAGS|$GIT_TERMINAL_PROMPT"; pwd -P; printf 'no newline'"#,
+            r#"echo "$DEPO_PATH|$DEPO_TAGS|$GIT_TERMINAL_PROMPT|$DEPO_EXTRA"; pwd -P; printf 'no newline'"#,
             &folders.targets,
         ))
         .await;
         let path = &folders.targets[0].path;
         let out: Vec<String> = lines(&run, 0).into_iter().map(|(_, l)| l).collect();
-        assert_eq!(out[0], format!("{}|work,rust|0", path.display()));
+        assert_eq!(
+            out[0],
+            format!("{}|work,rust|0|extra-me/thing", path.display())
+        );
         assert_eq!(Path::new(&out[1]), fs::canonicalize(path).unwrap());
         assert_eq!(out[2], "no newline");
+    }
+
+    #[tokio::test]
+    async fn commands_run_in_their_own_session() {
+        let folders = Folders::new("session", &["a"]);
+        // The session ID equals the process's own PID only for a session leader.
+        let run = finish(spec(
+            r#"[ "$(ps -o sid= -p $$ | tr -d ' ')" = "$$" ] && echo leader"#,
+            &folders.targets,
+        ))
+        .await;
+        assert_eq!(lines(&run, 0), [(Stream::Stdout, "leader".to_owned())]);
     }
 
     #[tokio::test]
@@ -531,7 +587,11 @@ mod tests {
         let mut one_at_a_time = spec("sleep 0.2", &folders.targets);
         one_at_a_time.parallel = 1;
         let run = finish(one_at_a_time).await;
-        assert!(run.elapsed() >= Duration::from_millis(580), "{:?}", run.elapsed());
+        assert!(
+            run.elapsed() >= Duration::from_millis(580),
+            "{:?}",
+            run.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -554,7 +614,11 @@ mod tests {
             Arc::new(|| {}),
         );
         wait_until("the background sleep to start", || pid_file.exists()).await;
-        let pid: u32 = fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        let pid: u32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
 
         run.cancel();
         tokio::time::timeout(Duration::from_secs(10), handle)
@@ -585,7 +649,10 @@ mod tests {
         .await;
         run.cancel();
         handle.await.unwrap();
-        assert!(matches!(run.status(0), TargetStatus::Cancelled { took: Some(_) }));
+        assert!(matches!(
+            run.status(0),
+            TargetStatus::Cancelled { took: Some(_) }
+        ));
         assert_eq!(run.status(1), TargetStatus::Cancelled { took: None });
         assert_eq!(run.summary().cancelled, 2);
     }
@@ -608,7 +675,10 @@ mod tests {
     #[tokio::test]
     async fn output_is_bounded() {
         let folders = Folders::new("bounded", &["a"]);
-        let mut many = spec("seq 1 100; head -c 10000 /dev/zero | tr '\\0' a", &folders.targets);
+        let mut many = spec(
+            "seq 1 100; head -c 10000 /dev/zero | tr '\\0' a",
+            &folders.targets,
+        );
         many.line_limit = 10;
         let run = finish(many).await;
         let slot = run.slot(0);
@@ -628,6 +698,10 @@ mod tests {
         let run = finish(bad).await;
         assert_eq!(run.status(0), TargetStatus::FailedToStart);
         assert!(run.status(0).failed());
-        assert!(lines(&run, 0)[0].1.starts_with("couldn't start /nonexistent/shell"));
+        assert!(
+            lines(&run, 0)[0]
+                .1
+                .starts_with("couldn't start /nonexistent/shell")
+        );
     }
 }

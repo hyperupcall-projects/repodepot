@@ -14,7 +14,7 @@ use tokio::task::{JoinSet, spawn_blocking};
 use super::remote_url::{self, RemoteUrl};
 use super::status::{self, Status};
 use crate::config::Config;
-use crate::db::{self, Db, MissingClone};
+use crate::db::{self, Db, MissingClone, RepoState};
 use crate::layout;
 
 /// How many repos are inspected at once.
@@ -54,7 +54,10 @@ pub enum Location {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MainRemote {
-    Chosen { index: usize, picked_by_hand: bool },
+    Chosen {
+        index: usize,
+        picked_by_hand: bool,
+    },
     NoRemotes,
     /// Several remotes, none matching the rule, and none picked.
     Undecided,
@@ -65,16 +68,40 @@ pub enum Problem {
     NoRemotes,
     NoMainRemote,
     /// The main remote is a local path or a URL that can't be read.
-    NotHosted { url: String },
-    OtherHost { host: String },
+    NotHosted {
+        url: String,
+    },
+    OtherHost {
+        host: String,
+    },
     /// Not at `<letter>/<repo name>`.
-    OutOfLayout { expected: String },
-    GitError { message: String },
+    OutOfLayout {
+        expected: String,
+    },
+    GitError {
+        message: String,
+    },
+    /// A GitHub repo no source lists (judged after a sync).
+    NotListed,
+    /// GitHub says the repo doesn't exist, or the token can't see it.
+    NotOnGitHub,
+    /// GitHub says the repo moved; `url` is its new SSH URL.
+    Renamed {
+        name: String,
+        url: String,
+    },
+    /// A linked fork's clone has no remote for the parent.
+    MissingUpstream {
+        name: String,
+        url: String,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub struct CloneInfo {
     pub id: i64,
+    /// The main remote's repo in the database.
+    pub repo_id: Option<i64>,
     /// Relative to the clone root, with `/` separators.
     pub rel_path: String,
     pub abs_path: PathBuf,
@@ -209,6 +236,38 @@ pub fn find_problems(
     problems
 }
 
+/// Problems only a sync can reveal, for a clone whose main remote is `state`'s repo.
+pub fn sync_problems(clone: &CloneInfo, state: &RepoState) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    if !clone.repo().is_some_and(RemoteUrl::is_github) {
+        return problems;
+    }
+    if let Some((name, url)) = &state.renamed_to {
+        problems.push(Problem::Renamed {
+            name: name.clone(),
+            url: url.clone(),
+        });
+    } else if state.not_found {
+        problems.push(Problem::NotOnGitHub);
+    } else if !state.listed {
+        problems.push(Problem::NotListed);
+    }
+    if let Some((name, url)) = &state.linked_upstream {
+        let has_upstream = clone.remotes.iter().any(|r| {
+            r.parsed
+                .as_ref()
+                .is_some_and(|p| p.is_github() && p.full_name().eq_ignore_ascii_case(name))
+        });
+        if !has_upstream {
+            problems.push(Problem::MissingUpstream {
+                name: name.clone(),
+                url: url.clone(),
+            });
+        }
+    }
+    problems
+}
+
 /// Scans the clone root and records the result in the database.
 pub async fn scan(
     settings: &ScanSettings,
@@ -274,6 +333,7 @@ pub async fn scan(
             };
             CloneInfo {
                 id: 0,
+                repo_id: None,
                 rel_path: found.rel_path,
                 abs_path: found.abs_path,
                 remotes,
@@ -304,14 +364,23 @@ pub async fn scan(
                 },
             })
             .collect();
-        let applied = lock(&db).apply_scan(&scanned);
+        let mut db = lock(&db);
+        let applied = db.apply_scan(&scanned)?;
+        let states = db.repo_states()?;
         drop(scanned);
-        applied.map(|applied| (clones, applied))
+        anyhow::Ok((clones, (applied, states)))
     })
     .await??;
+    let (applied, states) = applied;
     clones = clones_back;
-    for (clone, id) in clones.iter_mut().zip(applied.ids) {
+    for ((clone, id), repo_id) in clones.iter_mut().zip(applied.ids).zip(applied.repo_ids) {
         clone.id = id;
+        clone.repo_id = repo_id;
+        if let (Some(states), Some(repo_id)) = (&states, repo_id)
+            && let Some(state) = states.get(&repo_id)
+        {
+            clone.problems.extend(sync_problems(clone, state));
+        }
     }
 
     Ok(ScanResult {
@@ -390,8 +459,7 @@ fn walk(root: &Path) -> Result<Walked> {
 
 /// Folder names (following symlinks) and paths, sorted by name.
 fn subfolders(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
-    let entries =
-        fs::read_dir(dir).with_context(|| format!("couldn't read {}", dir.display()))?;
+    let entries = fs::read_dir(dir).with_context(|| format!("couldn't read {}", dir.display()))?;
     let mut folders = Vec::new();
     for entry in entries {
         let entry = entry.with_context(|| format!("couldn't read {}", dir.display()))?;
@@ -483,7 +551,10 @@ mod tests {
             choose_main_remote(&[upstream.clone(), origin.clone()], "me", None),
             chosen(1)
         );
-        assert_eq!(choose_main_remote(std::slice::from_ref(&fork), "me", None), chosen(0));
+        assert_eq!(
+            choose_main_remote(std::slice::from_ref(&fork), "me", None),
+            chosen(0)
+        );
         assert_eq!(
             choose_main_remote(&[fork.clone(), upstream.clone()], "me", None),
             MainRemote::Undecided
@@ -518,7 +589,10 @@ mod tests {
         let expected = vec![Problem::OutOfLayout {
             expected: "r/react".into(),
         }];
-        assert_eq!(find_problems("react", Location::Root, &remotes, main), expected);
+        assert_eq!(
+            find_problems("react", Location::Root, &remotes, main),
+            expected
+        );
         assert_eq!(
             find_problems("x/react", Location::Letter('x'), &remotes, main),
             expected
@@ -571,8 +645,80 @@ mod tests {
             remote("b", "git@github.com:y/thing.git"),
         ];
         assert_eq!(
-            find_problems("t/thing", Location::Letter('t'), &two, MainRemote::Undecided),
+            find_problems(
+                "t/thing",
+                Location::Letter('t'),
+                &two,
+                MainRemote::Undecided
+            ),
             vec![Problem::NoMainRemote]
+        );
+    }
+
+    #[test]
+    fn problems_from_the_last_sync() {
+        let remotes = vec![remote("me", "git@github.com:me/react.git")];
+        let clone = CloneInfo {
+            id: 1,
+            repo_id: Some(1),
+            rel_path: "r/react".into(),
+            abs_path: "/code/r/react".into(),
+            main: choose_main_remote(&remotes, "me", None),
+            remotes,
+            status: Ok(Status::default()),
+            problems: vec![],
+        };
+        let listed = RepoState {
+            listed: true,
+            ..Default::default()
+        };
+        assert!(sync_problems(&clone, &listed).is_empty());
+        assert_eq!(
+            sync_problems(&clone, &RepoState::default()),
+            [Problem::NotListed]
+        );
+        assert_eq!(
+            sync_problems(
+                &clone,
+                &RepoState {
+                    not_found: true,
+                    ..Default::default()
+                }
+            ),
+            [Problem::NotOnGitHub]
+        );
+        let up = (
+            "facebook/react".to_owned(),
+            "git@github.com:facebook/react.git".to_owned(),
+        );
+        assert_eq!(
+            sync_problems(
+                &clone,
+                &RepoState {
+                    listed: true,
+                    linked_upstream: Some(up.clone()),
+                    ..Default::default()
+                }
+            ),
+            [Problem::MissingUpstream {
+                name: up.0.clone(),
+                url: up.1.clone()
+            }]
+        );
+        let mut with_upstream = clone.clone();
+        with_upstream
+            .remotes
+            .push(remote("upstream", "https://github.com/Facebook/React"));
+        assert!(
+            sync_problems(
+                &with_upstream,
+                &RepoState {
+                    listed: true,
+                    linked_upstream: Some(up),
+                    ..Default::default()
+                }
+            )
+            .is_empty()
         );
     }
 
@@ -626,7 +772,10 @@ mod tests {
                 ("b", "git@github.com:y/thing.git"),
             ],
         );
-        make_repo("misplaced", &[("origin", "https://github.com/someone/misplaced")]);
+        make_repo(
+            "misplaced",
+            &[("origin", "https://github.com/someone/misplaced")],
+        );
         make_repo("_/.github", &[("me", "git@github.com:someone/.github.git")]);
         fs::create_dir_all(root.join("p/photos")).unwrap();
         fs::create_dir_all(root.join(".hidden")).unwrap();

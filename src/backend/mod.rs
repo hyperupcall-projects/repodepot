@@ -1,17 +1,23 @@
 //! Background work. The UI sends [`Command`]s; the backend answers with [`Event`]s and asks
 //! egui to repaint. Slow work (network, keyring, database, processes) never runs on the UI thread.
 
+mod repos;
+
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use anyhow::anyhow;
 use eframe::egui;
 use tokio::sync::mpsc;
-use tokio::task::spawn_blocking;
+use tokio::task::{JoinHandle, spawn_blocking};
+
+pub use repos::SyncReport;
 
 use crate::config::{Config, Paths};
-use crate::db::{Db, Snippet};
+use crate::db::{Catalog, Db, ForkDecision, Snippet};
 use crate::git::scan::{self, ScanResult, ScanSettings};
 use crate::github::{self, RateLimit, Viewer};
 use crate::jobs::{self, OnChange, Run, RunSpec, Target};
@@ -41,6 +47,29 @@ pub enum Command {
         targets: Vec<Target>,
         parallel: usize,
     },
+    /// Fetch the relevant repos from GitHub.
+    Sync,
+    /// Clone these repos (by database ID) into the layout.
+    Clone(Vec<i64>),
+    SetIgnored {
+        repo_ids: Vec<i64>,
+        ignored: bool,
+    },
+    SetForkDecision {
+        fork_id: i64,
+        parent_id: i64,
+        decision: ForkDecision,
+    },
+    /// `owner/name`, a GitHub URL, or a user/org login.
+    AddManual(String),
+    RemoveManualOwner(String),
+    /// `git remote add` (when `add`) or `git remote set-url` in a clone.
+    SetRemote {
+        path: PathBuf,
+        name: String,
+        url: String,
+        add: bool,
+    },
 }
 
 pub enum Event {
@@ -59,6 +88,15 @@ pub enum Event {
     Snippets(Vec<Snippet>),
     /// The UI reads the run's progress and output directly, and can cancel it.
     RunStarted(Arc<Run>),
+    SyncStarted,
+    SyncProgress(String),
+    SyncFinished(Result<SyncReport, String>),
+    /// Fresh Inbox, Ignored and Forks lists.
+    Catalog(Catalog),
+    /// A clone run for these repo IDs is over (whether or not it worked).
+    ClonesFinished(Vec<i64>),
+    /// Something the user asked for on the Repositories tab worked.
+    RepoNotice(String),
 }
 
 pub struct DbInfo {
@@ -167,6 +205,7 @@ struct Shared {
     http: Result<reqwest::Client, String>,
     db: Option<Arc<Mutex<Db>>>,
     config: Mutex<Config>,
+    last_run_id: AtomicU64,
 }
 
 enum AuthJob {
@@ -181,12 +220,15 @@ async fn run(
     paths: Paths,
     config: Config,
 ) {
-    let db = open_db(&paths, &emitter).await.map(|db| Arc::new(Mutex::new(db)));
+    let db = open_db(&paths, &emitter)
+        .await
+        .map(|db| Arc::new(Mutex::new(db)));
     let shared = Arc::new(Shared {
         http: github::http_client().map_err(|e| format!("{e:#}")),
         db,
         config: Mutex::new(config),
         emitter,
+        last_run_id: AtomicU64::new(0),
     });
 
     // Auth jobs run one at a time, in order.
@@ -212,16 +254,47 @@ async fn run(
             while scan_rx.recv().await.is_some() {
                 while scan_rx.try_recv().is_ok() {}
                 run_scan(&shared).await;
+                // Which repos count as cloned may have changed.
+                repos::refresh_catalog(&shared).await;
             }
         }
     });
 
-    if lock(&shared.config).clone_root.is_some() {
+    // Syncs work the same way, and end with a rescan.
+    let (sync_tx, mut sync_rx) = mpsc::unbounded_channel::<()>();
+    tokio::spawn({
+        let shared = shared.clone();
+        let scan_tx = scan_tx.clone();
+        async move {
+            while sync_rx.recv().await.is_some() {
+                while sync_rx.try_recv().is_ok() {}
+                shared.emitter.emit(Event::SyncStarted);
+                let result = repos::run_sync(&shared).await.map_err(|e| format!("{e:#}"));
+                if let Err(e) = &result {
+                    tracing::warn!("sync failed: {e}");
+                }
+                shared.emitter.emit(Event::SyncFinished(result));
+                let _ = scan_tx.send(());
+            }
+        }
+    });
+
+    let (has_root, sync_on_startup) = {
+        let config = lock(&shared.config);
+        (config.clone_root.is_some(), config.github.sync_on_startup)
+    };
+    tokio::spawn({
+        let shared = shared.clone();
+        async move { repos::refresh_catalog(&shared).await }
+    });
+    if has_root {
         let _ = scan_tx.send(());
+    }
+    if sync_on_startup {
+        let _ = sync_tx.send(());
     }
     tokio::spawn(load_snippets(shared.clone()));
 
-    let mut last_run_id = 0;
     while let Some(command) = commands.recv().await {
         match command {
             Command::CheckAuth => {
@@ -274,15 +347,8 @@ async fn run(
                 targets,
                 parallel,
             } => {
-                last_run_id += 1;
-                let id = last_run_id;
                 let spec = run_spec(&lock(&shared.config), command, targets, parallel);
-                let ctx = shared.emitter.ctx.clone();
-                let on_change: OnChange =
-                    Arc::new(move || ctx.request_repaint_after(OUTPUT_REPAINT_INTERVAL));
-                let (run, handle) = jobs::start(id, spec, on_change);
-                shared.emitter.emit(Event::RunStarted(run));
-
+                let (_, handle) = start_run(&shared, spec);
                 let scan_tx = scan_tx.clone();
                 tokio::spawn(async move {
                     let _ = handle.await;
@@ -290,8 +356,105 @@ async fn run(
                     let _ = scan_tx.send(());
                 });
             }
+            Command::Sync => {
+                let _ = sync_tx.send(());
+            }
+            Command::Clone(repo_ids) => {
+                let shared = shared.clone();
+                let scan_tx = scan_tx.clone();
+                tokio::spawn(async move {
+                    let ids = repo_ids.clone();
+                    if let Err(e) = repos::clone_repos(shared.clone(), repo_ids, scan_tx).await {
+                        shared
+                            .emitter
+                            .emit(Event::RepoActionFailed(format!("{e:#}")));
+                        shared.emitter.emit(Event::ClonesFinished(ids));
+                    }
+                });
+            }
+            Command::SetIgnored { repo_ids, ignored } => {
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    if write_db(&shared, move |db| db.set_ignored(&repo_ids, ignored)).await {
+                        repos::refresh_catalog(&shared).await;
+                    }
+                });
+            }
+            Command::SetForkDecision {
+                fork_id,
+                parent_id,
+                decision,
+            } => {
+                let shared = shared.clone();
+                let scan_tx = scan_tx.clone();
+                tokio::spawn(async move {
+                    let written = write_db(&shared, move |db| {
+                        db.set_fork_decision(fork_id, parent_id, decision)
+                    })
+                    .await;
+                    if written {
+                        // The Inbox changes, and so may the clones' problems.
+                        let _ = scan_tx.send(());
+                    }
+                });
+            }
+            Command::AddManual(text) => {
+                let shared = shared.clone();
+                let sync_tx = sync_tx.clone();
+                tokio::spawn(async move {
+                    match repos::add_manual(&shared, text).await {
+                        Ok((message, needs_sync)) => {
+                            shared.emitter.emit(Event::RepoNotice(message));
+                            repos::refresh_catalog(&shared).await;
+                            if needs_sync {
+                                let _ = sync_tx.send(());
+                            }
+                        }
+                        Err(e) => shared
+                            .emitter
+                            .emit(Event::RepoActionFailed(format!("{e:#}"))),
+                    }
+                });
+            }
+            Command::RemoveManualOwner(login) => {
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    if write_db(&shared, move |db| db.remove_manual_owner(&login)).await {
+                        repos::refresh_catalog(&shared).await;
+                    }
+                });
+            }
+            Command::SetRemote {
+                path,
+                name,
+                url,
+                add,
+            } => {
+                let shared = shared.clone();
+                let scan_tx = scan_tx.clone();
+                tokio::spawn(async move {
+                    match repos::set_remote(path, name, url, add).await {
+                        Ok(()) => {
+                            let _ = scan_tx.send(());
+                        }
+                        Err(e) => shared
+                            .emitter
+                            .emit(Event::RepoActionFailed(format!("{e:#}"))),
+                    }
+                });
+            }
         }
     }
+}
+
+/// Starts a run and hands it to the UI.
+fn start_run(shared: &Shared, spec: RunSpec) -> (Arc<Run>, JoinHandle<()>) {
+    let id = shared.last_run_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let ctx = shared.emitter.ctx.clone();
+    let on_change: OnChange = Arc::new(move || ctx.request_repaint_after(OUTPUT_REPAINT_INTERVAL));
+    let (run, handle) = jobs::start(id, spec, on_change);
+    shared.emitter.emit(Event::RunStarted(run.clone()));
+    (run, handle)
 }
 
 fn run_spec(config: &Config, command: String, targets: Vec<Target>, parallel: usize) -> RunSpec {
@@ -302,6 +465,7 @@ fn run_spec(config: &Config, command: String, targets: Vec<Target>, parallel: us
         .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "/bin/sh".to_owned());
     RunSpec {
+        title: command.clone(),
         command,
         shell,
         targets,
@@ -322,7 +486,9 @@ async fn load_snippets(shared: Arc<Shared>) {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn scan_inputs_differ(old: &Config, new: &Config) -> bool {
@@ -331,29 +497,29 @@ fn scan_inputs_differ(old: &Config, new: &Config) -> bool {
         || old.github.ssh_host_aliases != new.github.ssh_host_aliases
 }
 
-/// Runs a database write off the async threads. Reports failures to the UI.
+/// Runs database work off the async threads.
+async fn with_db<T: Send + 'static>(
+    shared: &Shared,
+    work: impl FnOnce(&mut Db) -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    let db = shared
+        .db
+        .clone()
+        .ok_or_else(|| anyhow!("The database isn't available."))?;
+    spawn_blocking(move || work(&mut lock(&db))).await?
+}
+
+/// Runs a database write and reports a failure to the UI. Returns whether it worked.
 async fn write_db(
     shared: &Shared,
     write: impl FnOnce(&mut Db) -> anyhow::Result<()> + Send + 'static,
 ) -> bool {
-    let Some(db) = shared.db.clone() else {
-        shared.emitter.emit(Event::RepoActionFailed(
-            "The database isn't available.".to_owned(),
-        ));
-        return false;
-    };
-    match spawn_blocking(move || write(&mut lock(&db))).await {
-        Ok(Ok(())) => true,
-        Ok(Err(e)) => {
-            shared
-                .emitter
-                .emit(Event::RepoActionFailed(format!("{e:#}")));
-            false
-        }
+    match with_db(shared, write).await {
+        Ok(()) => true,
         Err(e) => {
             shared
                 .emitter
-                .emit(Event::RepoActionFailed(format!("crashed: {e}")));
+                .emit(Event::RepoActionFailed(format!("{e:#}")));
             false
         }
     }
@@ -524,6 +690,157 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
     }
 
+    /// Clones three repos through the backend, using local folders in place of GitHub:
+    /// a linked fork (needs `~2` and an upstream remote), a plain repo, and one that fails.
+    #[test]
+    fn clone_into_the_layout_end_to_end() {
+        use std::collections::BTreeSet;
+
+        use crate::db::{FetchedRepo, RepoMeta, Source};
+
+        let base = std::env::temp_dir().join(format!("depository-clone-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let sources = base.join("sources");
+        let root = base.join("code");
+        let source = |name: &str| {
+            let dir = sources.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            git(&dir, &["init", "-q", "-b", "main"]);
+            fs::write(dir.join("README"), name).unwrap();
+            git(&dir, &["add", "README"]);
+            git(
+                &dir,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "first",
+                ],
+            );
+            dir.display().to_string()
+        };
+        let (fork_url, parent_url, tool_url) = (
+            source("me-react"),
+            source("facebook-react"),
+            source("me-tool"),
+        );
+        // Something already sits at r/react.
+        fs::create_dir_all(root.join("r/react")).unwrap();
+        git(&root.join("r/react"), &["init", "-q"]);
+
+        let paths = Paths {
+            config_file: base.join("config.toml"),
+            db_file: base.join("data/depository.db"),
+            workspaces_dir: base.join("data/workspaces"),
+        };
+        {
+            let meta = |node: &str, full: &str, url: &str| {
+                let (owner, name) = full.split_once('/').unwrap();
+                RepoMeta {
+                    node_id: node.into(),
+                    owner: owner.into(),
+                    name: name.into(),
+                    ssh_url: Some(url.into()),
+                    ..Default::default()
+                }
+            };
+            let owned = BTreeSet::from([Source::Owned]);
+            let mut db = Db::open(&paths.db_file).unwrap();
+            db.apply_sync(&[
+                FetchedRepo {
+                    meta: meta("F", "me/react", &fork_url),
+                    parent: Some(meta("P", "facebook/react", &parent_url)),
+                    sources: owned.clone(),
+                },
+                FetchedRepo {
+                    meta: meta("T", "me/tool", &tool_url),
+                    parent: None,
+                    sources: owned.clone(),
+                },
+                FetchedRepo {
+                    meta: meta(
+                        "B",
+                        "me/broken",
+                        &sources.join("missing").display().to_string(),
+                    ),
+                    parent: None,
+                    sources: owned,
+                },
+            ])
+            .unwrap();
+            let family = db.catalog().unwrap().forks[0].clone();
+            db.set_fork_decision(
+                family.forks[0].fork_id,
+                family.parent_id,
+                ForkDecision::Linked,
+            )
+            .unwrap();
+        }
+
+        let config = Config {
+            clone_root: Some(root.clone()),
+            runner: crate::config::Runner {
+                shell: Some("/bin/sh".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let backend = Backend::start(egui::Context::default(), paths, config);
+        let catalog = wait_for(&backend, "the inbox", |event| match event {
+            Event::Catalog(catalog) if catalog.inbox.len() == 3 => Some(catalog),
+            _ => None,
+        });
+        let ids: Vec<i64> = catalog.inbox.iter().map(|r| r.id).collect();
+
+        backend.send(Command::Clone(ids.clone()));
+        let run = wait_for(&backend, "the clone run", |event| match event {
+            Event::RunStarted(run) => Some(run),
+            _ => None,
+        });
+        assert_eq!(run.title, "Clone 3 repos");
+        let finished = wait_for(&backend, "the clones to finish", |event| match event {
+            Event::ClonesFinished(done) => Some(done),
+            _ => None,
+        });
+        assert_eq!(finished, ids);
+        let summary = run.summary();
+        assert_eq!((summary.succeeded, summary.failed), (2, 1));
+
+        let scan = wait_for(&backend, "the rescan", |event| match event {
+            Event::Scan(Ok(scan)) => Some(scan),
+            _ => None,
+        });
+        let paths: Vec<&str> = scan.clones.iter().map(|c| c.rel_path.as_str()).collect();
+        assert_eq!(paths, ["r/react", "r/react~2", "t/tool"]);
+        assert!(!root.join("b/broken").exists());
+        let fork = &scan.clones[1];
+        let remotes: Vec<(&str, &str)> = fork
+            .remotes
+            .iter()
+            .map(|r| (r.name.as_str(), r.url.as_str()))
+            .collect();
+        assert_eq!(
+            remotes,
+            [("me", fork_url.as_str()), ("upstream", parent_url.as_str())]
+        );
+
+        // The failed one is still waiting in the Inbox. (The other two can't be matched back
+        // to their GitHub rows here, since their remotes are local paths; the database tests
+        // cover that matching.)
+        let catalog = wait_for(&backend, "the inbox after cloning", |event| match event {
+            Event::Catalog(catalog) => Some(catalog),
+            _ => None,
+        });
+        assert!(catalog.inbox.iter().any(|r| r.full_name() == "me/broken"));
+
+        drop(backend);
+        let _ = fs::remove_dir_all(&base);
+    }
+
     /// Scans a real clone root through the backend, runs `git status --short` in every clone,
     /// then starts a slow command everywhere and cancels it.
     #[test]
@@ -566,6 +883,7 @@ mod tests {
                 name: c.display_name(),
                 path: c.abs_path.clone(),
                 tags: Vec::new(),
+                env: Vec::new(),
             })
             .collect();
 

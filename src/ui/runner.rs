@@ -160,7 +160,8 @@ impl RunnerPage {
                 0 => "No timeout".to_owned(),
                 secs => format!("Timeout {secs} s"),
             };
-            ui.weak(timeout).on_hover_text("Change the timeout in Settings");
+            ui.weak(timeout)
+                .on_hover_text("Change the timeout in Settings");
         });
 
         start.then(|| RunnerAction::Start {
@@ -171,6 +172,7 @@ impl RunnerPage {
                     name: clone.display_name(),
                     path: clone.abs_path.clone(),
                     tags: Vec::new(),
+                    env: Vec::new(),
                 })
                 .collect(),
             parallel: parallel as usize,
@@ -192,7 +194,7 @@ impl RunnerPage {
                 } else {
                     "✔"
                 };
-                let label = format!("{marker} {}", shorten(&one_line(&tab.run.command), 32));
+                let label = format!("{marker} {}", shorten(&one_line(&tab.run.title), 32));
                 if ui
                     .selectable_label(self.active == index, label)
                     .on_hover_text(&tab.run.command)
@@ -225,12 +227,13 @@ fn run_view(ui: &mut egui::Ui, tab: &mut RunTab) {
     let summary = run.summary();
 
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(shorten(&one_line(&run.command), 100))
-                .monospace()
-                .strong(),
-        )
-        .on_hover_text(&run.command);
+        let title = egui::RichText::new(shorten(&one_line(&run.title), 100)).strong();
+        let title = if run.title == run.command {
+            title.monospace()
+        } else {
+            title
+        };
+        ui.label(title).on_hover_text(&run.command);
         ui.weak(format!(
             "· {} · {} at once · {}",
             plural(run.targets.len(), "repo", "repos"),
@@ -401,7 +404,11 @@ fn single_output(ui: &mut egui::Ui, run: &Run, index: usize) {
 
     let (len, dropped, empty) = {
         let slot = run.slot(index);
-        (slot.output.len(), slot.output.dropped(), slot.output.is_empty())
+        (
+            slot.output.len(),
+            slot.output.dropped(),
+            slot.output.is_empty(),
+        )
     };
     let extra = usize::from(dropped > 0);
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
@@ -555,7 +562,11 @@ fn shorten(text: &str, max: usize) -> String {
 fn short_duration(duration: Duration) -> String {
     let secs = duration.as_secs_f32();
     if secs >= 60.0 {
-        format!("{}m {:02}s", duration.as_secs() / 60, duration.as_secs() % 60)
+        format!(
+            "{}m {:02}s",
+            duration.as_secs() / 60,
+            duration.as_secs() % 60
+        )
     } else if secs >= 1.0 {
         format!("{secs:.1} s")
     } else {
@@ -583,7 +594,10 @@ mod tests {
     fn shortening() {
         assert_eq!(shorten("git status", 32), "git status");
         assert_eq!(shorten("abcdefghij", 5), "abcd…");
-        assert_eq!(one_line("case x in\n  a) b ;;\nesac"), "case x in a) b ;; esac");
+        assert_eq!(
+            one_line("case x in\n  a) b ;;\nesac"),
+            "case x in a) b ;; esac"
+        );
         assert_eq!(short_duration(Duration::from_millis(40)), "40 ms");
         assert_eq!(short_duration(Duration::from_millis(2500)), "2.5 s");
         assert_eq!(short_duration(Duration::from_secs(125)), "2m 05s");
@@ -599,7 +613,8 @@ mod tests {
     }
 
     fn fake_clones(test: &str, names: &[&str]) -> (Folders, Vec<CloneInfo>) {
-        let root = std::env::temp_dir().join(format!("depository-runner-{test}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("depository-runner-{test}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let clones = names
             .iter()
@@ -610,6 +625,7 @@ mod tests {
                 fs::create_dir_all(&abs_path).unwrap();
                 CloneInfo {
                     id: i as i64 + 1,
+                    repo_id: None,
                     rel_path,
                     abs_path,
                     remotes: Vec::new(),
@@ -627,6 +643,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let spec = RunSpec {
+                title: command.into(),
                 command: command.into(),
                 shell: "/bin/sh".into(),
                 targets: clones
@@ -635,6 +652,7 @@ mod tests {
                         name: c.display_name(),
                         path: c.abs_path.clone(),
                         tags: Vec::new(),
+                        env: Vec::new(),
                     })
                     .collect(),
                 parallel: 4,
@@ -649,7 +667,10 @@ mod tests {
 
     type State = (RunnerPage, Vec<CloneInfo>, Config, Vec<RunnerAction>);
 
-    fn harness<'a>(builder: egui_kittest::HarnessBuilder<State>, state: State) -> Harness<'a, State> {
+    fn harness<'a>(
+        builder: egui_kittest::HarnessBuilder<State>,
+        state: State,
+    ) -> Harness<'a, State> {
         builder.with_size([1280.0, 560.0]).build_ui_state(
             |ui, (page, clones, config, actions): &mut State| {
                 egui::CentralPanel::default_margins().show(ui, |ui| {
@@ -672,7 +693,10 @@ mod tests {
         let mut page = RunnerPage::new();
         page.command = "git status --short".into();
         page.filter = "et".into(); // only "beta" matches
-        let mut h = harness(Harness::builder(), (page, clones, Config::default(), Vec::new()));
+        let mut h = harness(
+            Harness::builder(),
+            (page, clones, Config::default(), Vec::new()),
+        );
         h.run();
         assert!(h.query_by_label_contains("1 of 3").is_some());
         h.get_by_label("Run").click();
@@ -697,7 +721,10 @@ mod tests {
         );
         let mut page = RunnerPage::new();
         page.run_started(run);
-        let mut h = harness(Harness::builder(), (page, clones, Config::default(), Vec::new()));
+        let mut h = harness(
+            Harness::builder(),
+            (page, clones, Config::default(), Vec::new()),
+        );
         h.run();
         // Combined view shows both.
         assert!(h.query_by_label("hello from alpha").is_some());
@@ -743,9 +770,15 @@ mod tests {
             (page, clones, Config::default(), Vec::new()),
         );
         h.run();
-        h.render().unwrap().save(dir.join("runner-all.png")).unwrap();
+        h.render()
+            .unwrap()
+            .save(dir.join("runner-all.png"))
+            .unwrap();
         h.get_by_label("tokio").click();
         h.run();
-        h.render().unwrap().save(dir.join("runner-one.png")).unwrap();
+        h.render()
+            .unwrap()
+            .save(dir.join("runner-one.png"))
+            .unwrap();
     }
 }

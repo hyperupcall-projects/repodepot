@@ -41,7 +41,12 @@ fn main() -> anyhow::Result<()> {
         Box::new(move |cc| {
             let backend =
                 backend::Backend::start(cc.egui_ctx.clone(), paths.clone(), config.clone());
-            Ok(Box::new(app::App::new(paths, config, config_error, backend)))
+            Ok(Box::new(app::App::new(
+                paths,
+                config,
+                config_error,
+                backend,
+            )))
         }),
     )
     .map_err(|e| anyhow!("couldn't open the window: {e}"))

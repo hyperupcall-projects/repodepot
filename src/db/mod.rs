@@ -1,5 +1,9 @@
 //! The SQLite database in `~/.local/share/depository/depository.db`.
 
+pub mod github;
+
+pub use github::{Catalog, FetchedRepo, ForkDecision, RepoMeta, RepoRow, RepoState, Source};
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -15,6 +19,7 @@ use crate::git::remote_url::RemoteUrl;
 const MIGRATIONS: &[M<'static>] = &[
     M::up(include_str!("migrations/001_initial.sql")),
     M::up(include_str!("migrations/002_clone_scan.sql")),
+    M::up(include_str!("migrations/003_github_sync.sql")),
 ];
 
 pub fn migrations() -> Migrations<'static> {
@@ -60,6 +65,8 @@ pub struct Snippet {
 pub struct ScanApplied {
     /// Clone IDs, in the same order as the scanned clones.
     pub ids: Vec<i64>,
+    /// The main remote's repo ID for each clone, in the same order.
+    pub repo_ids: Vec<Option<i64>>,
     pub missing: Vec<MissingClone>,
 }
 
@@ -67,10 +74,11 @@ impl Db {
     /// Opens (creating if needed) the database and brings its schema up to date.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).with_context(|| format!("couldn't create {}", dir.display()))?;
+            fs::create_dir_all(dir)
+                .with_context(|| format!("couldn't create {}", dir.display()))?;
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("couldn't open {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("couldn't open {}", path.display()))?;
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
             .context("couldn't switch the database to WAL mode")?;
         Self::prepare(conn)
@@ -149,8 +157,10 @@ impl Db {
             stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .collect::<rusqlite::Result<_>>()?
         };
-        let id_by_path: HashMap<&str, i64> =
-            existing.iter().map(|(id, path, _)| (path.as_str(), *id)).collect();
+        let id_by_path: HashMap<&str, i64> = existing
+            .iter()
+            .map(|(id, path, _)| (path.as_str(), *id))
+            .collect();
         let found_paths: HashSet<&str> = scanned.iter().map(|c| c.path).collect();
         let mut vanished: Vec<(i64, Option<i64>)> = existing
             .iter()
@@ -210,7 +220,11 @@ impl Db {
         }
         let missing = missing_clones(&tx)?;
         tx.commit()?;
-        Ok(ScanApplied { ids, missing })
+        Ok(ScanApplied {
+            ids,
+            repo_ids: main_repo_ids,
+            missing,
+        })
     }
 
     /// Sets (or with `None`, clears) the main remote picked by hand.
@@ -395,7 +409,9 @@ mod tests {
     fn moved_folder_keeps_its_row_and_tags() {
         let mut db = Db::open_in_memory().unwrap();
         let react = repo("facebook", "react");
-        let first = db.apply_scan(&[clone("x/react-old", Some(&react))]).unwrap();
+        let first = db
+            .apply_scan(&[clone("x/react-old", Some(&react))])
+            .unwrap();
         db.conn
             .execute("INSERT INTO tags (id, name) VALUES (1, 'work')", [])
             .unwrap();
@@ -416,10 +432,14 @@ mod tests {
     fn ambiguous_moves_are_not_guessed() {
         let mut db = Db::open_in_memory().unwrap();
         let react = repo("facebook", "react");
-        db.apply_scan(&[clone("x/react-old", Some(&react))]).unwrap();
+        db.apply_scan(&[clone("x/react-old", Some(&react))])
+            .unwrap();
         // Two new folders for the same repo: can't tell which one is the moved one.
         let applied = db
-            .apply_scan(&[clone("r/react", Some(&react)), clone("r/react~2", Some(&react))])
+            .apply_scan(&[
+                clone("r/react", Some(&react)),
+                clone("r/react~2", Some(&react)),
+            ])
             .unwrap();
         assert_eq!(applied.missing.len(), 1);
         assert_eq!(count(&db, "SELECT count(*) FROM clones"), 3);
@@ -431,7 +451,10 @@ mod tests {
         let ids = db.apply_scan(&[clone("l/local", None)]).unwrap().ids;
         db.set_main_remote(ids[0], Some("fork")).unwrap();
         assert_eq!(
-            db.main_remote_picks().unwrap().get("l/local").map(String::as_str),
+            db.main_remote_picks()
+                .unwrap()
+                .get("l/local")
+                .map(String::as_str),
             Some("fork")
         );
         db.set_main_remote(ids[0], None).unwrap();

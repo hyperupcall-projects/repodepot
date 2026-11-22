@@ -1,3 +1,4 @@
+pub mod inbox;
 pub mod repos;
 pub mod runner;
 pub mod settings;

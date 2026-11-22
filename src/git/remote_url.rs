@@ -29,7 +29,10 @@ pub fn parse(url: &str, github_aliases: &[String]) -> Option<RemoteUrl> {
     let host = normalize_host(host, github_aliases);
 
     let path = path.trim_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path).trim_end_matches('/');
+    let path = path
+        .strip_suffix(".git")
+        .unwrap_or(path)
+        .trim_end_matches('/');
     let (owner, name) = path.rsplit_once('/')?;
     if owner.is_empty() || name.is_empty() || (host == GITHUB && owner.contains('/')) {
         return None;
@@ -70,8 +73,10 @@ fn split_host_and_path(url: &str) -> Option<(&str, &str)> {
 
 fn normalize_host(host: &str, github_aliases: &[String]) -> String {
     let lower = host.to_ascii_lowercase();
-    let is_github = matches!(lower.as_str(), "github.com" | "www.github.com" | "ssh.github.com")
-        || github_aliases.iter().any(|a| a.eq_ignore_ascii_case(host));
+    let is_github = matches!(
+        lower.as_str(),
+        "github.com" | "www.github.com" | "ssh.github.com"
+    ) || github_aliases.iter().any(|a| a.eq_ignore_ascii_case(host));
     if is_github { GITHUB.to_owned() } else { lower }
 }
 
@@ -93,25 +98,67 @@ mod tests {
 
     #[test]
     fn github_forms() {
-        assert_eq!(p("git@github.com:facebook/react.git"), gh("facebook", "react"));
+        assert_eq!(
+            p("git@github.com:facebook/react.git"),
+            gh("facebook", "react")
+        );
         assert_eq!(p("git@github.com:facebook/react"), gh("facebook", "react"));
-        assert_eq!(p("git@github.com:/facebook/react.git/"), gh("facebook", "react"));
-        assert_eq!(p("https://github.com/facebook/react"), gh("facebook", "react"));
-        assert_eq!(p("https://github.com/facebook/react.git"), gh("facebook", "react"));
-        assert_eq!(p("https://github.com/facebook/react/"), gh("facebook", "react"));
-        assert_eq!(p("http://www.github.com/facebook/react"), gh("facebook", "react"));
-        assert_eq!(p("https://user:token@github.com/facebook/react.git"), gh("facebook", "react"));
-        assert_eq!(p("ssh://git@github.com/facebook/react.git"), gh("facebook", "react"));
-        assert_eq!(p("ssh://git@ssh.github.com:443/facebook/react.git"), gh("facebook", "react"));
-        assert_eq!(p("git+ssh://git@github.com/facebook/react"), gh("facebook", "react"));
-        assert_eq!(p("git://github.com/facebook/react.git"), gh("facebook", "react"));
-        assert_eq!(p("  GIT@GitHub.com:Facebook/React.git\n"), gh("Facebook", "React"));
+        assert_eq!(
+            p("git@github.com:/facebook/react.git/"),
+            gh("facebook", "react")
+        );
+        assert_eq!(
+            p("https://github.com/facebook/react"),
+            gh("facebook", "react")
+        );
+        assert_eq!(
+            p("https://github.com/facebook/react.git"),
+            gh("facebook", "react")
+        );
+        assert_eq!(
+            p("https://github.com/facebook/react/"),
+            gh("facebook", "react")
+        );
+        assert_eq!(
+            p("http://www.github.com/facebook/react"),
+            gh("facebook", "react")
+        );
+        assert_eq!(
+            p("https://user:token@github.com/facebook/react.git"),
+            gh("facebook", "react")
+        );
+        assert_eq!(
+            p("ssh://git@github.com/facebook/react.git"),
+            gh("facebook", "react")
+        );
+        assert_eq!(
+            p("ssh://git@ssh.github.com:443/facebook/react.git"),
+            gh("facebook", "react")
+        );
+        assert_eq!(
+            p("git+ssh://git@github.com/facebook/react"),
+            gh("facebook", "react")
+        );
+        assert_eq!(
+            p("git://github.com/facebook/react.git"),
+            gh("facebook", "react")
+        );
+        assert_eq!(
+            p("  GIT@GitHub.com:Facebook/React.git\n"),
+            gh("Facebook", "React")
+        );
     }
 
     #[test]
     fn dotted_names_keep_their_dots() {
-        assert_eq!(p("git@github.com:someone/.github.git"), gh("someone", ".github"));
-        assert_eq!(p("git@github.com:someone/site.io"), gh("someone", "site.io"));
+        assert_eq!(
+            p("git@github.com:someone/.github.git"),
+            gh("someone", ".github")
+        );
+        assert_eq!(
+            p("git@github.com:someone/site.io"),
+            gh("someone", "site.io")
+        );
     }
 
     #[test]

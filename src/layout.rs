@@ -29,6 +29,31 @@ pub fn expected_path(name: &str) -> String {
     format!("{}/{}", letter_for(name), name)
 }
 
+/// Picks the folder for a new clone: `r/react`, or `r/react~2`, `r/react~3`, … when taken.
+/// `taken` is asked with candidate paths and should compare without regard to case.
+pub fn assign_path(name: &str, mut taken: impl FnMut(&str) -> bool) -> String {
+    let letter = letter_for(name);
+    let first = format!("{letter}/{name}");
+    if !taken(&first) {
+        return first;
+    }
+    (2..)
+        .map(|n| format!("{letter}/{name}~{n}"))
+        .find(|candidate| !taken(candidate))
+        .expect("some suffix is free")
+}
+
+/// Whether `<root>/<rel>` exists, ignoring case in the last component.
+pub fn exists_ignoring_case(root: &std::path::Path, rel: &str) -> bool {
+    let (dir, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+    let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))
+}
+
 /// Whether a folder directly under the clone root is a letter folder (one ASCII letter, digit or `_`).
 pub fn is_letter_folder(name: &str) -> bool {
     let mut chars = name.chars();
@@ -68,6 +93,33 @@ mod tests {
     fn expected_paths() {
         assert_eq!(expected_path("react"), "r/react");
         assert_eq!(expected_path(".github"), "_/.github");
+    }
+
+    #[test]
+    fn path_assignment() {
+        let taken = |list: &'static [&'static str]| {
+            move |candidate: &str| list.iter().any(|t| t.eq_ignore_ascii_case(candidate))
+        };
+        assert_eq!(assign_path("react", taken(&[])), "r/react");
+        assert_eq!(assign_path("React", taken(&["r/react"])), "r/React~2");
+        assert_eq!(
+            assign_path("react", taken(&["r/react", "r/react~2", "r/react~3"])),
+            "r/react~4"
+        );
+        // A real repo called react2 can't collide with a suffix.
+        assert_eq!(assign_path("react2", taken(&["r/react"])), "r/react2");
+        assert_eq!(assign_path(".github", taken(&[])), "_/.github");
+    }
+
+    #[test]
+    fn existence_ignores_case() {
+        let root = std::env::temp_dir().join(format!("depository-layout-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("r/React")).unwrap();
+        assert!(exists_ignoring_case(&root, "r/react"));
+        assert!(exists_ignoring_case(&root, "r/REACT"));
+        assert!(!exists_ignoring_case(&root, "r/react~2"));
+        assert!(!exists_ignoring_case(&root, "x/react"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

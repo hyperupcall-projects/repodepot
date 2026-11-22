@@ -366,7 +366,9 @@ impl SettingsPage {
                         .desired_width(360.0)
                         .hint_text("github-work, github-personal"),
                 );
-                ui.weak("Hosts from ~/.ssh/config that point at github.com. Comma or space separated.");
+                ui.weak(
+                    "Hosts from ~/.ssh/config that point at github.com. Comma or space separated.",
+                );
             });
             ui.end_row();
         });
@@ -374,7 +376,10 @@ impl SettingsPage {
         subheading(ui, "GitHub sync");
         section_grid(ui, "sync", |ui| {
             ui.label("On startup");
-            ui.checkbox(&mut self.draft.github.sync_on_startup, "Sync with GitHub when the app opens");
+            ui.checkbox(
+                &mut self.draft.github.sync_on_startup,
+                "Sync with GitHub when the app opens",
+            );
             ui.end_row();
 
             ui.label("Sources");

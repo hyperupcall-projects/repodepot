@@ -1,5 +1,7 @@
 //! GitHub API access (GraphQL).
 
+pub mod sync;
+
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -48,6 +50,24 @@ pub async fn graphql<T: DeserializeOwned>(
     query: &str,
     variables: serde_json::Value,
 ) -> Result<T> {
+    let (data, warnings) = graphql_with_warnings(http, token, query, variables).await?;
+    if !warnings.is_empty() {
+        tracing::warn!(
+            "GitHub returned partial data with errors: {}",
+            warnings.join("; ")
+        );
+    }
+    Ok(data)
+}
+
+/// Like [`graphql`], but also returns the errors GitHub sent alongside partial data
+/// (e.g. orgs whose SAML single sign-on the token isn't authorized for).
+pub async fn graphql_with_warnings<T: DeserializeOwned>(
+    http: &reqwest::Client,
+    token: &str,
+    query: &str,
+    variables: serde_json::Value,
+) -> Result<(T, Vec<String>)> {
     let response = http
         .post(GRAPHQL_URL)
         .bearer_auth(token)
@@ -69,20 +89,12 @@ pub async fn graphql<T: DeserializeOwned>(
         .json()
         .await
         .context("GitHub sent a response this app doesn't understand")?;
-    let messages = body
-        .errors
-        .iter()
-        .map(|e| e.message.as_str())
-        .collect::<Vec<_>>()
-        .join("; ");
+    let messages: Vec<String> = body.errors.into_iter().map(|e| e.message).collect();
     match body.data {
-        Some(data) => {
-            if !messages.is_empty() {
-                tracing::warn!("GitHub returned partial data with errors: {messages}");
-            }
-            Ok(data)
+        Some(data) => Ok((data, messages)),
+        None if !messages.is_empty() => {
+            Err(anyhow!("GitHub returned an error: {}", messages.join("; ")))
         }
-        None if !messages.is_empty() => Err(anyhow!("GitHub returned an error: {messages}")),
         None => Err(anyhow!("GitHub returned no data")),
     }
 }

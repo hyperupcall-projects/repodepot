@@ -4,7 +4,7 @@ use eframe::egui;
 
 use crate::backend::{AuthState, Backend, Command, DbInfo, Event};
 use crate::config::{Config, Paths};
-use crate::ui::repos::{ReposAction, ReposPage};
+use crate::ui::repos::{ReposAction, ReposContext, ReposPage};
 use crate::ui::runner::{RunnerAction, RunnerContext, RunnerPage};
 use crate::ui::settings::{SettingsContext, SettingsPage};
 use crate::ui::{placeholder, thousands};
@@ -82,6 +82,12 @@ impl App {
             Event::RepoActionFailed(message) => self.repos.action_failed(message),
             Event::Snippets(snippets) => self.runner.set_snippets(snippets),
             Event::RunStarted(run) => self.runner.run_started(run),
+            Event::SyncStarted => self.repos.sync_started(),
+            Event::SyncProgress(message) => self.repos.sync_progress(message),
+            Event::SyncFinished(result) => self.repos.sync_finished(result),
+            Event::Catalog(catalog) => self.repos.set_catalog(catalog),
+            Event::ClonesFinished(repo_ids) => self.repos.clones_finished(&repo_ids),
+            Event::RepoNotice(message) => self.repos.notice(message),
         }
     }
 
@@ -95,6 +101,36 @@ impl App {
                 self.backend.send(Command::ForgetClone(clone_id));
             }
             ReposAction::OpenSettings => self.tab = Tab::Settings,
+            ReposAction::OpenRunner => self.tab = Tab::Runner,
+            ReposAction::Sync => self.backend.send(Command::Sync),
+            ReposAction::Clone(repo_ids) => self.backend.send(Command::Clone(repo_ids)),
+            ReposAction::SetIgnored { repo_ids, ignored } => {
+                self.backend.send(Command::SetIgnored { repo_ids, ignored })
+            }
+            ReposAction::SetForkDecision {
+                fork_id,
+                parent_id,
+                decision,
+            } => self.backend.send(Command::SetForkDecision {
+                fork_id,
+                parent_id,
+                decision,
+            }),
+            ReposAction::AddManual(text) => self.backend.send(Command::AddManual(text)),
+            ReposAction::RemoveManualOwner(login) => {
+                self.backend.send(Command::RemoveManualOwner(login));
+            }
+            ReposAction::SetRemote {
+                path,
+                name,
+                url,
+                add,
+            } => self.backend.send(Command::SetRemote {
+                path,
+                name,
+                url,
+                add,
+            }),
         }
     }
 
@@ -127,8 +163,9 @@ impl App {
                 }
             }
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                match &self.db {
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| match &self.db {
                     None => {
                         ui.weak("Opening database…");
                     }
@@ -140,8 +177,8 @@ impl App {
                         ui.colored_label(ui.visuals().error_fg_color, "Database error")
                             .on_hover_text(e);
                     }
-                }
-            });
+                },
+            );
         });
     }
 }
@@ -174,8 +211,11 @@ impl eframe::App for App {
 
         egui::CentralPanel::default_margins().show(ui, |ui| match self.tab {
             Tab::Repositories => {
-                let has_root = self.config.clone_root.is_some();
-                if let Some(action) = self.repos.show(ui, has_root) {
+                let cx = ReposContext {
+                    has_clone_root: self.config.clone_root.is_some(),
+                    upstream_name: &self.config.remotes.upstream_name,
+                };
+                if let Some(action) = self.repos.show(ui, cx) {
                     self.handle_repos_action(action);
                 }
             }
