@@ -2,8 +2,9 @@
 
 use eframe::egui;
 
-use crate::backend::{AuthState, Backend, DbInfo, Event};
+use crate::backend::{AuthState, Backend, Command, DbInfo, Event};
 use crate::config::{Config, Paths};
+use crate::ui::repos::{ReposAction, ReposPage};
 use crate::ui::settings::{SettingsContext, SettingsPage};
 use crate::ui::{placeholder, thousands};
 
@@ -34,6 +35,7 @@ pub struct App {
     tab: Tab,
     config: Config,
     config_error: Option<String>,
+    repos: ReposPage,
     settings: SettingsPage,
     auth: AuthState,
     db: Option<Result<DbInfo, String>>,
@@ -53,6 +55,7 @@ impl App {
             Tab::Repositories
         };
         Self {
+            repos: ReposPage::new(),
             settings: SettingsPage::new(&config),
             paths,
             backend,
@@ -69,6 +72,23 @@ impl App {
             Event::Db(result) => self.db = Some(result),
             Event::Auth(state) => self.auth = state,
             Event::AccountMessage(message) => self.settings.set_account_message(message),
+            Event::ScanStarted => self.repos.scan_started(),
+            Event::ScanProgress { done, total } => self.repos.scan_progress(done, total),
+            Event::Scan(result) => self.repos.scan_finished(result),
+            Event::RepoActionFailed(message) => self.repos.action_failed(message),
+        }
+    }
+
+    fn handle_repos_action(&mut self, action: ReposAction) {
+        match action {
+            ReposAction::Rescan => self.backend.send(Command::Scan),
+            ReposAction::SetMainRemote { clone_id, remote } => self
+                .backend
+                .send(Command::SetMainRemote { clone_id, remote }),
+            ReposAction::ForgetClone(clone_id) => {
+                self.backend.send(Command::ForgetClone(clone_id));
+            }
+            ReposAction::OpenSettings => self.tab = Tab::Settings,
         }
     }
 
@@ -141,28 +161,35 @@ impl eframe::App for App {
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
 
         egui::CentralPanel::default_margins().show(ui, |ui| match self.tab {
-            Tab::Repositories => placeholder(
-                ui,
-                "Repositories",
-                "The local scan comes in build step 2, and GitHub sync and cloning in step 4.",
-            ),
+            Tab::Repositories => {
+                let has_root = self.config.clone_root.is_some();
+                if let Some(action) = self.repos.show(ui, has_root) {
+                    self.handle_repos_action(action);
+                }
+            }
             Tab::Tags => placeholder(ui, "Tags", "Tags, rules and groups come in build step 6."),
             Tab::Runner => placeholder(
                 ui,
                 "Runner",
                 "Running commands across repos comes in build steps 3 and 8.",
             ),
-            Tab::Settings => self.settings.show(
-                ui,
-                SettingsContext {
-                    config: &mut self.config,
-                    config_error: &mut self.config_error,
-                    paths: &self.paths,
-                    auth: &self.auth,
-                    db: self.db.as_ref(),
-                    backend: &self.backend,
-                },
-            ),
+            Tab::Settings => {
+                let saved = self.settings.show(
+                    ui,
+                    SettingsContext {
+                        config: &mut self.config,
+                        config_error: &mut self.config_error,
+                        paths: &self.paths,
+                        auth: &self.auth,
+                        db: self.db.as_ref(),
+                        backend: &self.backend,
+                    },
+                );
+                if saved {
+                    self.backend
+                        .send(Command::ConfigChanged(self.config.clone()));
+                }
+            }
         });
     }
 }

@@ -1,3 +1,4 @@
+pub mod repos;
 pub mod settings;
 
 use eframe::egui;

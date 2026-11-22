@@ -107,9 +107,10 @@ A repo counts as cloned if it is the main remote of a clone, or if it is the par
 
 The app scans the clone root (two levels deep) on startup and when you ask. The folders on disk decide what is cloned. The database keeps your choices: ignores, tags, rules, assigned paths and fork decisions.
 
-- **Reading remotes**: use `git remote` and then `git remote get-url <name>` for each, so `insteadOf` rewrites apply.
+- **Reading remotes**: one `git remote -v` per clone, which already applies `insteadOf` rewrites.
+- **Moved or deleted folders**: a folder that disappears is marked missing instead of being removed from the database, so its tags survive. If a new folder appears whose main remote matches exactly one missing entry, it's treated as that entry moving. Missing entries are listed in the Problems view with a **Forget** button.
 - **URL forms** understood: `git@host:o/r(.git)`, `ssh://git@host/o/r`, `https://host/o/r(.git)`, plus the SSH host aliases from settings.
-- **Main remote** of a clone: the remote with the default remote name, else `origin`, else its only remote. If none of those apply, you pick one.
+- **Main remote** of a clone: the remote with the default remote name, else `origin`, else its only remote. If none of those apply, you pick one (and you can override the choice for any clone with several remotes).
 - **Status column** (no network access): branch, uncommitted changes, ahead/behind (as of the last fetch), detached HEAD, no upstream branch.
   - It comes from one `git status --porcelain=v2 --branch` per clone.
   - It refreshes after every scan and after every run.

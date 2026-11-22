@@ -3,7 +3,9 @@ mod backend;
 mod check;
 mod config;
 mod db;
+mod git;
 mod github;
+mod layout;
 mod token;
 mod ui;
 
@@ -36,7 +38,8 @@ fn main() -> anyhow::Result<()> {
         "depository",
         options,
         Box::new(move |cc| {
-            let backend = backend::Backend::start(cc.egui_ctx.clone(), paths.clone());
+            let backend =
+                backend::Backend::start(cc.egui_ctx.clone(), paths.clone(), config.clone());
             Ok(Box::new(app::App::new(paths, config, config_error, backend)))
         }),
     )

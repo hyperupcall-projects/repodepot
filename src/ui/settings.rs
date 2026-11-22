@@ -111,7 +111,9 @@ impl SettingsPage {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, cx: SettingsContext<'_>) {
+    /// Returns true on the frame the settings were saved.
+    pub fn show(&mut self, ui: &mut egui::Ui, cx: SettingsContext<'_>) -> bool {
+        let mut saved = false;
         let built = self.build();
         let dirty = match &built {
             Ok(config) => config != cx.config,
@@ -133,6 +135,7 @@ impl SettingsPage {
                             *cx.config_error = None;
                             self.reset(new);
                             self.save_message = Some(Ok("Settings saved.".to_owned()));
+                            saved = true;
                         }
                         Err(e) => self.save_message = Some(Err(format!("{e:#}"))),
                     }
@@ -202,6 +205,7 @@ impl SettingsPage {
                 });
                 ui.add_space(12.0);
             });
+        saved
     }
 
     fn account_section(&mut self, ui: &mut egui::Ui, auth: &AuthState, backend: &Backend) {

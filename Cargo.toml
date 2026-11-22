@@ -7,6 +7,8 @@ edition = "2024"
 anyhow = "1.0.104"
 directories = "6.0.0"
 eframe = "0.37.0"
+egui = { version = "0.37.0", default-features = false, features = ["monochrome_emoji_fonts"] }
+egui_extras = "0.37.0"
 keyring = "4.2.0"
 reqwest = { version = "0.13.5", features = ["json"] }
 rusqlite = { version = "0.41.0", features = ["bundled"] }
@@ -17,3 +19,7 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "
 toml = "1.2.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
