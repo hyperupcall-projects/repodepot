@@ -194,8 +194,9 @@ pub(super) async fn clone_repos(
         parallel: config.runner.parallel.max(1) as usize,
         timeout: None,
         line_limit: config.runner.line_limit as usize,
+        colors: false,
     };
-    let (run, handle) = start_run(&shared, spec);
+    let (run, handle) = start_run(&shared, spec, None);
     let _ = handle.await;
 
     // Each destination was free when it was picked, so anything there after a failure is

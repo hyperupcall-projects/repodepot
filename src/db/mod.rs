@@ -64,6 +64,17 @@ pub struct Snippet {
     pub command: String,
 }
 
+/// A command run from the Runner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub command: String,
+    /// UTC `YYYY-MM-DD HH:MM:SS`.
+    pub started_at: String,
+    pub repo_count: usize,
+    pub ok_count: usize,
+    pub failed_count: usize,
+}
+
 pub struct ScanApplied {
     /// Clone IDs, in the same order as the scanned clones.
     pub ids: Vec<i64>,
@@ -115,6 +126,70 @@ impl Db {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 command: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn save_snippet(&mut self, name: &str, command: &str) -> Result<()> {
+        anyhow::ensure!(!name.trim().is_empty(), "a snippet needs a name");
+        anyhow::ensure!(!command.trim().is_empty(), "a snippet needs a command");
+        self.conn.execute(
+            "INSERT INTO snippets (name, command) VALUES (?1, ?2)",
+            params![name.trim(), command.trim()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_snippet(&mut self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM snippets WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Records a finished command. Only the newest 500 are kept.
+    pub fn add_history(
+        &mut self,
+        command: &str,
+        took: Duration,
+        repos: usize,
+        ok: usize,
+        failed: usize,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO run_history (command, started_at, repo_count, ok_count, failed_count)
+             VALUES (?1, datetime('now', ?2), ?3, ?4, ?5)",
+            params![
+                command,
+                format!("-{} seconds", took.as_secs()),
+                repos as i64,
+                ok as i64,
+                failed as i64
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM run_history WHERE id NOT IN
+               (SELECT id FROM run_history ORDER BY id DESC LIMIT 500)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The newest `limit` commands, newest first.
+    pub fn history(&self, limit: usize) -> Result<Vec<HistoryEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT command, started_at, repo_count, ok_count, failed_count
+             FROM run_history ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            Ok(HistoryEntry {
+                command: r.get(0)?,
+                started_at: r.get(1)?,
+                repo_count: r.get::<_, i64>(2)? as usize,
+                ok_count: r.get::<_, i64>(3)? as usize,
+                failed_count: r.get::<_, i64>(4)? as usize,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -341,6 +416,37 @@ mod tests {
         let snippets = db.snippets().unwrap();
         assert_eq!(snippets.len(), 4);
         assert_eq!(snippets[2].command, "git status --short");
+    }
+
+    #[test]
+    fn snippets_and_history() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.save_snippet(" Build ", " cargo build ").unwrap();
+        assert!(db.save_snippet("", "x").is_err());
+        let snippets = db.snippets().unwrap();
+        assert_eq!(snippets.len(), 5);
+        assert_eq!(
+            (snippets[4].name.as_str(), snippets[4].command.as_str()),
+            ("Build", "cargo build")
+        );
+        db.delete_snippet(snippets[4].id).unwrap();
+        assert_eq!(db.snippets().unwrap().len(), 4);
+
+        for i in 0..3 {
+            db.add_history(&format!("cmd {i}"), Duration::from_secs(2), 5, 4, 1)
+                .unwrap();
+        }
+        let history = db.history(2).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].command, "cmd 2");
+        assert_eq!(
+            (
+                history[0].repo_count,
+                history[0].ok_count,
+                history[0].failed_count
+            ),
+            (5, 4, 1)
+        );
     }
 
     #[test]

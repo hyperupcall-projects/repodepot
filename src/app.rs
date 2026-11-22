@@ -126,7 +126,8 @@ impl App {
             },
             Event::RepoActionFailed(message) => self.repos.action_failed(message),
             Event::Snippets(snippets) => self.runner.set_snippets(snippets),
-            Event::RunStarted(run) => self.runner.run_started(run),
+            Event::RunStarted { run, request } => self.runner.run_started(run, request),
+            Event::History(history) => self.runner.set_history(history),
             Event::SyncStarted => self.repos.sync_started(),
             Event::SyncProgress(message) => self.repos.sync_progress(message),
             Event::SyncFinished(result) => self.repos.sync_finished(result),
@@ -370,17 +371,28 @@ impl eframe::App for App {
                     config: &self.config,
                     tags: &self.tag_index,
                 };
-                if let Some(RunnerAction::Start {
-                    command,
-                    targets,
-                    parallel,
-                }) = self.runner.show(ui, cx)
-                {
-                    self.backend.send(Command::StartRun {
+                let command = match self.runner.show(ui, cx) {
+                    Some(RunnerAction::Start {
+                        request,
                         command,
                         targets,
                         parallel,
-                    });
+                        colors,
+                    }) => Some(Command::StartRun {
+                        request,
+                        command,
+                        targets,
+                        parallel,
+                        colors,
+                    }),
+                    Some(RunnerAction::SaveSnippet { name, command }) => {
+                        Some(Command::SaveSnippet { name, command })
+                    }
+                    Some(RunnerAction::DeleteSnippet(id)) => Some(Command::DeleteSnippet(id)),
+                    None => None,
+                };
+                if let Some(command) = command {
+                    self.backend.send(command);
                 }
             }
             Tab::Settings => {

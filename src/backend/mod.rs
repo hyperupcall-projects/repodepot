@@ -21,7 +21,7 @@ pub use open::{LaunchRequest, LauncherInfo, Origin};
 pub use repos::SyncReport;
 
 use crate::config::{Config, Paths};
-use crate::db::{Catalog, Db, ForkDecision, Snippet, TagStore};
+use crate::db::{Catalog, Db, ForkDecision, HistoryEntry, Snippet, TagStore};
 use crate::git::import::ImportPreview;
 use crate::git::scan::{self, ScanResult, ScanSettings};
 use crate::github::{self, RateLimit, Viewer};
@@ -49,10 +49,18 @@ pub enum Command {
     ForgetClone(i64),
     /// Run a shell command in each target. Shell, timeout and line limit come from the settings.
     StartRun {
+        /// Echoed back in [`Event::RunStarted`], so the UI knows where the run belongs.
+        request: u64,
         command: String,
         targets: Vec<Target>,
         parallel: usize,
+        colors: bool,
     },
+    SaveSnippet {
+        name: String,
+        command: String,
+    },
+    DeleteSnippet(i64),
     /// Fetch the relevant repos from GitHub.
     Sync,
     /// Clone these repos (by database ID) into the layout.
@@ -131,7 +139,13 @@ pub enum Event {
     RepoActionFailed(String),
     Snippets(Vec<Snippet>),
     /// The UI reads the run's progress and output directly, and can cancel it.
-    RunStarted(Arc<Run>),
+    /// `request` is the UI's ID for runs it asked for; `None` for clones and imports.
+    RunStarted {
+        run: Arc<Run>,
+        request: Option<u64>,
+    },
+    /// Recent commands, newest first.
+    History(Vec<HistoryEntry>),
     SyncStarted,
     SyncProgress(String),
     SyncFinished(Result<SyncReport, String>),
@@ -432,17 +446,40 @@ async fn run(
                 });
             }
             Command::StartRun {
+                request,
                 command,
                 targets,
                 parallel,
+                colors,
             } => {
-                let spec = run_spec(&lock(&shared.config), command, targets, parallel);
-                let (_, handle) = start_run(&shared, spec);
+                let spec = run_spec(&lock(&shared.config), command, targets, parallel, colors);
+                let (run, handle) = start_run(&shared, spec, Some(request));
                 let scan_tx = scan_tx.clone();
+                let shared = shared.clone();
                 tokio::spawn(async move {
                     let _ = handle.await;
                     // The command may have changed branches, files or commits.
                     let _ = scan_tx.send(());
+                    record_history(&shared, &run).await;
+                });
+            }
+            Command::SaveSnippet { name, command } => {
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    let saved = with_db(&shared, move |db| db.save_snippet(&name, &command)).await;
+                    match saved {
+                        Ok(()) => load_snippets(shared).await,
+                        Err(e) => tracing::warn!("couldn't save the snippet: {e:#}"),
+                    }
+                });
+            }
+            Command::DeleteSnippet(id) => {
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    match with_db(&shared, move |db| db.delete_snippet(id)).await {
+                        Ok(()) => load_snippets(shared).await,
+                        Err(e) => tracing::warn!("couldn't delete the snippet: {e:#}"),
+                    }
                 });
             }
             Command::Sync => {
@@ -638,17 +675,41 @@ fn tag_write(
     });
 }
 
+/// Saves a finished command to the history and sends the UI the new list.
+async fn record_history(shared: &Shared, run: &Run) {
+    let summary = run.summary();
+    let (command, took, repos) = (run.command.clone(), run.elapsed(), run.targets.len());
+    let recorded = with_db(shared, move |db| {
+        db.add_history(&command, took, repos, summary.succeeded, summary.failed)?;
+        db.history(50)
+    })
+    .await;
+    match recorded {
+        Ok(history) => shared.emitter.emit(Event::History(history)),
+        Err(e) => tracing::warn!("couldn't record the command: {e:#}"),
+    }
+}
+
 /// Starts a run and hands it to the UI.
-fn start_run(shared: &Shared, spec: RunSpec) -> (Arc<Run>, JoinHandle<()>) {
+fn start_run(shared: &Shared, spec: RunSpec, request: Option<u64>) -> (Arc<Run>, JoinHandle<()>) {
     let id = shared.last_run_id.fetch_add(1, Ordering::Relaxed) + 1;
     let ctx = shared.emitter.ctx.clone();
     let on_change: OnChange = Arc::new(move || ctx.request_repaint_after(OUTPUT_REPAINT_INTERVAL));
     let (run, handle) = jobs::start(id, spec, on_change);
-    shared.emitter.emit(Event::RunStarted(run.clone()));
+    shared.emitter.emit(Event::RunStarted {
+        run: run.clone(),
+        request,
+    });
     (run, handle)
 }
 
-fn run_spec(config: &Config, command: String, targets: Vec<Target>, parallel: usize) -> RunSpec {
+fn run_spec(
+    config: &Config,
+    command: String,
+    targets: Vec<Target>,
+    parallel: usize,
+    colors: bool,
+) -> RunSpec {
     let shell = config
         .runner
         .shell
@@ -664,15 +725,17 @@ fn run_spec(config: &Config, command: String, targets: Vec<Target>, parallel: us
         timeout: (config.runner.timeout_secs > 0)
             .then(|| Duration::from_secs(config.runner.timeout_secs)),
         line_limit: config.runner.line_limit as usize,
+        colors,
     }
 }
 
 async fn load_snippets(shared: Arc<Shared>) {
-    let Some(db) = shared.db.clone() else { return };
-    match spawn_blocking(move || lock(&db).snippets()).await {
-        Ok(Ok(snippets)) => shared.emitter.emit(Event::Snippets(snippets)),
-        Ok(Err(e)) => tracing::warn!("couldn't load snippets: {e:#}"),
-        Err(e) => tracing::warn!("loading snippets crashed: {e}"),
+    match with_db(&shared, |db| Ok((db.snippets()?, db.history(50)?))).await {
+        Ok((snippets, history)) => {
+            shared.emitter.emit(Event::Snippets(snippets));
+            shared.emitter.emit(Event::History(history));
+        }
+        Err(e) => tracing::warn!("couldn't load snippets: {e:#}"),
     }
 }
 
@@ -989,7 +1052,7 @@ mod tests {
 
         backend.send(Command::Clone(ids.clone()));
         let run = wait_for(&backend, "the clone run", |event| match event {
-            Event::RunStarted(run) => Some(run),
+            Event::RunStarted { run, .. } => Some(run),
             _ => None,
         });
         assert_eq!(run.title, "Clone 3 repos");
@@ -1134,7 +1197,7 @@ mod tests {
             .collect();
         backend.send(Command::Import(moves));
         let run = wait_for(&backend, "the move run", |event| match event {
-            Event::RunStarted(run) => Some(run),
+            Event::RunStarted { run, .. } => Some(run),
             _ => None,
         });
         assert_eq!(run.title, "Move 3 repos into place");
@@ -1449,12 +1512,14 @@ mod tests {
             .collect();
 
         backend.send(Command::StartRun {
+            request: 1,
             command: "git status --short".into(),
             targets: targets.clone(),
             parallel: 2,
+            colors: false,
         });
         let run = wait_for(&backend, "the run to start", |event| match event {
-            Event::RunStarted(run) => Some(run),
+            Event::RunStarted { run, .. } => Some(run),
             _ => None,
         });
         assert_eq!(run.shell, "/bin/sh");
@@ -1467,18 +1532,28 @@ mod tests {
         assert_eq!(outputs[0], ["?? depository-untracked-9d1e"]);
         assert!(outputs[1].is_empty());
         assert_eq!(outputs[2], ["?? depository-untracked-9d1e"]);
-        // Finishing a run refreshes the status column.
-        wait_for(&backend, "the rescan after the run", |event| {
-            matches!(event, Event::Scan(_)).then_some(())
+        // Finishing a run refreshes the status column and records the command (in either order).
+        let (mut rescanned, mut recorded) = (false, None);
+        let history = wait_for(&backend, "the rescan and the history", |event| {
+            match event {
+                Event::Scan(_) => rescanned = true,
+                Event::History(list) if !list.is_empty() => recorded = Some(list),
+                _ => {}
+            }
+            if rescanned { recorded.clone() } else { None }
         });
+        assert_eq!(history[0].command, "git status --short");
+        assert_eq!((history[0].repo_count, history[0].ok_count), (3, 3));
 
         backend.send(Command::StartRun {
+            request: 2,
             command: "sleep 30".into(),
             targets,
             parallel: 8,
+            colors: false,
         });
         let slow = wait_for(&backend, "the slow run to start", |event| match event {
-            Event::RunStarted(run) => Some(run),
+            Event::RunStarted { run, .. } => Some(run),
             _ => None,
         });
         wait_until("all three to be running", || slow.summary().running == 3);

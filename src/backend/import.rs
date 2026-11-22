@@ -131,8 +131,9 @@ pub(super) async fn run_import(
         parallel: 2,
         timeout: None,
         line_limit: config.runner.line_limit as usize,
+        colors: false,
     };
-    let (_, handle) = start_run(&shared, spec);
+    let (_, handle) = start_run(&shared, spec, None);
     let _ = handle.await;
     let _ = scan_tx.send(());
     Ok(())

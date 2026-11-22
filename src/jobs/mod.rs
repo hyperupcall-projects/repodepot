@@ -19,14 +19,14 @@ use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use output::{MAX_LINE_BYTES, OutputBuffer, Stream, clean_line};
+use output::{MAX_LINE_BYTES, OutputBuffer, Stream, parse_line, plain};
 
 /// How long a process group gets to exit after SIGTERM before SIGKILL.
 const TERM_GRACE: Duration = Duration::from_secs(3);
 /// How long to keep reading after the shell exits; background children may hold the pipes open.
 const DRAIN_GRACE: Duration = Duration::from_millis(500);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     /// `owner/name`, or the folder name.
     pub name: String,
@@ -48,6 +48,8 @@ pub struct RunSpec {
     pub timeout: Option<Duration>,
     /// Lines kept per target.
     pub line_limit: usize,
+    /// Ask tools to keep their colors even though they aren't writing to a terminal.
+    pub colors: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +120,7 @@ pub struct Summary {
 }
 
 impl Summary {
+    #[cfg(test)]
     pub fn is_finished(&self) -> bool {
         self.queued == 0 && self.running == 0
     }
@@ -131,6 +134,7 @@ pub struct Run {
     pub targets: Vec<Target>,
     pub parallel: usize,
     pub timeout: Option<Duration>,
+    pub colors: bool,
     pub started: Instant,
     finished: Mutex<Option<Instant>>,
     cancel: CancellationToken,
@@ -153,6 +157,11 @@ impl Run {
         self.cancel.cancel();
     }
 
+    /// Forgets a target's output so far (new output still arrives).
+    pub fn clear_output(&self, index: usize) {
+        self.slot(index).output.clear();
+    }
+
     pub fn cancel_target(&self, index: usize) {
         self.target_cancels[index].cancel();
     }
@@ -171,6 +180,7 @@ impl Run {
         summary
     }
 
+    #[cfg(test)]
     pub fn is_finished(&self) -> bool {
         lock(&self.finished).is_some()
     }
@@ -210,6 +220,7 @@ pub fn start(id: u64, spec: RunSpec, on_change: OnChange) -> (Arc<Run>, JoinHand
         targets: spec.targets,
         parallel: spec.parallel.max(1),
         timeout: spec.timeout,
+        colors: spec.colors,
         started: Instant::now(),
         finished: Mutex::new(None),
         cancel,
@@ -268,12 +279,14 @@ async fn run_target(run: Arc<Run>, index: usize, limit: Arc<Semaphore>, on_chang
     run.slot(index).status = TargetStatus::Running { since };
     on_change();
 
-    let mut child = match spawn(&run.shell, &run.command, &run.targets[index]) {
+    let mut child = match spawn(&run.shell, &run.command, &run.targets[index], run.colors) {
         Ok(child) => child,
         Err(e) => {
             let mut slot = run.slot(index);
-            slot.output
-                .push(Stream::Stderr, format!("couldn't start {}: {e}", run.shell));
+            slot.output.push(
+                Stream::Stderr,
+                plain(format!("couldn't start {}: {e}", run.shell)),
+            );
             slot.status = TargetStatus::FailedToStart;
             drop(slot);
             on_change();
@@ -328,9 +341,10 @@ async fn run_target(run: Arc<Run>, index: usize, limit: Arc<Semaphore>, on_chang
     let status = match ended {
         Ok(Ok(status)) => exit_status(status, took),
         Ok(Err(e)) => {
-            run.slot(index)
-                .output
-                .push(Stream::Stderr, format!("lost track of the process: {e}"));
+            run.slot(index).output.push(
+                Stream::Stderr,
+                plain(format!("lost track of the process: {e}")),
+            );
             TargetStatus::FailedToStart
         }
         Err(Stop::Cancelled) => TargetStatus::Cancelled { took: Some(took) },
@@ -340,7 +354,7 @@ async fn run_target(run: Arc<Run>, index: usize, limit: Arc<Semaphore>, on_chang
     on_change();
 }
 
-fn spawn(shell: &str, command: &str, target: &Target) -> std::io::Result<Child> {
+fn spawn(shell: &str, command: &str, target: &Target, colors: bool) -> std::io::Result<Child> {
     let mut command_builder = Command::new(shell);
     command_builder
         .arg("-c")
@@ -355,6 +369,17 @@ fn spawn(shell: &str, command: &str, target: &Target) -> std::io::Result<Child> 
         .env("DEPO_TAGS", target.tags.join(","))
         .envs(target.env.iter().map(|(k, v)| (k, v)))
         .kill_on_drop(true);
+    if colors {
+        command_builder.envs([
+            ("CLICOLOR_FORCE", "1"),
+            ("FORCE_COLOR", "1"),
+            ("CARGO_TERM_COLOR", "always"),
+            // git ignores CLICOLOR_FORCE; this sets color.ui=always for this command only.
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "color.ui"),
+            ("GIT_CONFIG_VALUE_0", "always"),
+        ]);
+    }
     // Its own session (and so its own process group): cancelling reaches everything it
     // started, and nothing can read from the terminal the app was started in. Without a
     // terminal, ssh asks for passphrases through SSH_ASKPASS instead.
@@ -420,12 +445,12 @@ async fn pump(
         let mut lines = Vec::new();
         for &byte in &chunk[..read] {
             if byte == b'\n' {
-                lines.push(clean_line(&pending));
+                lines.push(parse_line(&pending));
                 pending.clear();
             } else {
                 pending.push(byte);
                 if pending.len() >= MAX_LINE_BYTES {
-                    lines.push(clean_line(&pending));
+                    lines.push(parse_line(&pending));
                     pending.clear();
                 }
             }
@@ -440,7 +465,7 @@ async fn pump(
         }
     }
     if !pending.is_empty() {
-        run.slot(index).output.push(stream, clean_line(&pending));
+        run.slot(index).output.push(stream, parse_line(&pending));
         on_change();
     }
 }
@@ -495,6 +520,7 @@ mod tests {
             parallel: 4,
             timeout: None,
             line_limit: 1000,
+            colors: false,
         }
     }
 
@@ -584,6 +610,25 @@ mod tests {
         ))
         .await;
         assert_eq!(lines(&run, 0), [(Stream::Stdout, "leader".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn colors_can_be_requested() {
+        let folders = Folders::new("colors", &["a"]);
+        let mut colored = spec(
+            r#"printf '%s %s\n' "$CLICOLOR_FORCE" "$GIT_CONFIG_VALUE_0"; printf '\033[31mred\033[0m\n'"#,
+            &folders.targets,
+        );
+        colored.colors = true;
+        let run = finish(colored).await;
+        let slot = run.slot(0);
+        let lines: Vec<&output::Line> = slot.output.iter().collect();
+        assert_eq!(lines[0].text, "1 always");
+        assert_eq!(lines[1].text, "red");
+        assert_eq!(lines[1].spans[0].style.fg, Some(output::Color::Ansi(1)));
+        drop(slot);
+        run.clear_output(0);
+        assert!(run.slot(0).output.is_empty());
     }
 
     #[tokio::test]
