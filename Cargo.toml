@@ -12,6 +12,7 @@ egui_extras = "0.37.0"
 keyring = "4.2.0"
 nix = { version = "0.32.0", features = ["process", "signal"] }
 reqwest = { version = "0.13.5", features = ["json"] }
+rfd = "0.18.0"
 rusqlite = { version = "0.41.0", features = ["bundled"] }
 rusqlite_migration = "2.7.0"
 serde = { version = "1.0.229", features = ["derive"] }

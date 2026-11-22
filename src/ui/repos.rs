@@ -7,10 +7,12 @@ use std::path::PathBuf;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::backend::SyncReport;
+use crate::backend::{ImportMove, SyncReport};
 use crate::db::{Catalog, ForkDecision};
+use crate::git::import::ImportPreview;
 use crate::git::scan::{CloneInfo, MainRemote, Problem, ScanResult};
 use crate::git::status::Status;
+use crate::ui::import::ImportPage;
 use crate::ui::inbox::{self, ListKind, ListState};
 use crate::ui::thousands;
 
@@ -43,11 +45,19 @@ pub enum ReposAction {
         url: String,
         add: bool,
     },
+    PickImportFolder,
+    /// Plan an import: search `folder`, or take `paths` as the repos to move.
+    PreviewImport {
+        folder: Option<PathBuf>,
+        paths: Vec<PathBuf>,
+    },
+    Import(Vec<ImportMove>),
 }
 
 pub struct ReposContext<'a> {
     pub has_clone_root: bool,
-    /// Name for upstream remotes, from the settings.
+    /// Remote names from the settings.
+    pub default_remote: &'a str,
     pub upstream_name: &'a str,
 }
 
@@ -58,6 +68,7 @@ enum View {
     Ignored,
     Forks,
     Problems,
+    Import,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -172,7 +183,8 @@ impl ProblemKind {
         match self {
             ProblemKind::Renamed => {
                 "Their main remote still uses the old name. GitHub redirects it for now; point \
-                 the remote at the new name to be safe. Import will be able to move the folder."
+                 the remote at the new name to be safe, then move the folder from \
+                 Outside the layout."
             }
             ProblemKind::MissingUpstream => {
                 "You marked these forks as linked, but their clones have no remote for the parent."
@@ -199,7 +211,7 @@ impl ProblemKind {
                 "The main remote isn't on GitHub. These still count as clones and can be tagged."
             }
             ProblemKind::OutOfLayout => {
-                "Not at <letter>/<repo name>. Import will be able to move them into place."
+                "Not at <letter>/<repo name>. Moving them goes through Import, which shows where each one will go first."
             }
             ProblemKind::GitError => "git failed when reading these folders.",
         }
@@ -210,7 +222,7 @@ const MISSING_HELP: &str = "An earlier scan found these, but their folder is gon
     within the clone root is matched back to its old entry by its main remote. Forget removes the \
     entry and its tags.";
 const STRAYS_HELP: &str = "Folders under the clone root that aren't git repos. Only \
-    <letter>/<name> is searched, so Import will be able to look inside these for repos.";
+    <letter>/<name> is scanned, so repos deeper inside these aren't seen; Import can find them.";
 
 pub struct ReposPage {
     view: View,
@@ -235,6 +247,7 @@ pub struct ReposPage {
     add_text: String,
     only_undecided: bool,
     upstream_name: String,
+    import: ImportPage,
 }
 
 impl ReposPage {
@@ -259,6 +272,7 @@ impl ReposPage {
             add_text: String::new(),
             only_undecided: false,
             upstream_name: "upstream".to_owned(),
+            import: ImportPage::new(),
         }
     }
 
@@ -288,6 +302,20 @@ impl ReposPage {
         for id in repo_ids {
             self.cloning.remove(id);
         }
+    }
+
+    pub fn import_searching(&mut self) {
+        self.import.searching();
+    }
+
+    pub fn import_preview(&mut self, preview: Result<ImportPreview, String>) {
+        self.import.set_preview(preview);
+    }
+
+    /// A folder was picked for Import: show it there (the app starts the search).
+    pub fn import_folder_picked(&mut self, path: &std::path::Path) {
+        self.import.set_folder(path);
+        self.view = View::Import;
     }
 
     pub fn notice(&mut self, message: String) {
@@ -336,6 +364,7 @@ impl ReposPage {
         ui.separator();
 
         match self.view {
+            View::Import => self.import.show(ui, cx.default_remote, &mut action),
             View::Inbox | View::Ignored | View::Forks => {
                 self.github_view(ui, catalog.as_ref(), &mut action);
             }
@@ -362,6 +391,22 @@ impl ReposPage {
 
         self.result = result;
         self.catalog = catalog;
+        match &action {
+            Some(ReposAction::PreviewImport { folder, .. }) => {
+                self.view = View::Import;
+                if let Some(folder) = folder {
+                    self.import.set_folder(folder);
+                }
+            }
+            Some(ReposAction::Import(moves)) => {
+                self.import.moves_started();
+                self.notice = Some(format!(
+                    "Moving {} into place. Progress is in the Runner tab.",
+                    plural(moves.len() as u32, "repo", "repos")
+                ));
+            }
+            _ => {}
+        }
         if let Some(ReposAction::Clone(ids)) = &action {
             self.cloning.extend(ids.iter().copied());
             self.notice = Some(format!(
@@ -535,6 +580,7 @@ impl ReposPage {
                 _ => "Problems".to_owned(),
             };
             ui.selectable_value(&mut self.view, View::Problems, problems);
+            ui.selectable_value(&mut self.view, View::Import, "Import");
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -562,11 +608,13 @@ impl ReposPage {
                 View::Clones | View::Problems => "Filter by name or folder",
                 _ => "Filter by name, description, language, topic or source",
             };
-            ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
-                    .hint_text(hint)
-                    .desired_width(390.0),
-            );
+            if self.view != View::Import {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text(hint)
+                        .desired_width(390.0),
+                );
+            }
             {
                 if self.view == View::Clones {
                     let label = ui.label("Show");
@@ -790,6 +838,17 @@ impl ReposPage {
                         })
                         .collect();
                     problem_section(ui, kind.title(), kind.help(), entries.len(), |ui| {
+                        if kind == ProblemKind::OutOfLayout
+                            && entries.len() > 1
+                            && ui
+                                .button(format!("Move all {} into place…", entries.len()))
+                                .clicked()
+                        {
+                            *action = Some(ReposAction::PreviewImport {
+                                folder: None,
+                                paths: entries.iter().map(|(c, _)| c.abs_path.clone()).collect(),
+                            });
+                        }
                         for (clone, problem) in entries {
                             ui.horizontal(|ui| {
                                 if ui
@@ -814,7 +873,19 @@ impl ReposPage {
                     .collect();
                 problem_section(ui, "Not git repos", STRAYS_HELP, strays.len(), |ui| {
                     for stray in strays {
-                        ui.label(stray);
+                        ui.horizontal(|ui| {
+                            ui.label(stray);
+                            if ui
+                                .small_button("Look for repos inside")
+                                .on_hover_text("Open it in Import")
+                                .clicked()
+                            {
+                                *action = Some(ReposAction::PreviewImport {
+                                    folder: Some(scan.root.join(stray)),
+                                    paths: Vec::new(),
+                                });
+                            }
+                        });
                     }
                 });
             });
@@ -1209,6 +1280,16 @@ fn problem_detail(
         }
         Problem::OutOfLayout { expected } => {
             ui.weak(format!("· expected at {expected}"));
+            if ui
+                .small_button("Move into place…")
+                .on_hover_text("Preview the move in Import")
+                .clicked()
+            {
+                *action = Some(ReposAction::PreviewImport {
+                    folder: None,
+                    paths: vec![clone.abs_path.clone()],
+                });
+            }
         }
         Problem::GitError { message } => {
             ui.colored_label(ui.visuals().error_fg_color, message);
@@ -1304,6 +1385,7 @@ mod tests {
     use crate::db::MissingClone;
     use crate::db::github::{ForkEntry, ForkFamily};
     use crate::db::{RepoRow, Source};
+    use crate::git::import::ImportItem;
     use crate::git::remote_url;
     use crate::git::scan::{Location, Remote, choose_main_remote, find_problems};
 
@@ -1493,6 +1575,7 @@ mod tests {
                 egui::CentralPanel::default_margins().show(ui, |ui| {
                     let cx = ReposContext {
                         has_clone_root: true,
+                        default_remote: "me",
                         upstream_name: "upstream",
                     };
                     if let Some(action) = page.show(ui, cx) {
@@ -1654,6 +1737,116 @@ mod tests {
         );
     }
 
+    fn sample_import() -> ImportPreview {
+        let item =
+            |source: &str, name: &str, destination: &str, rename: bool, note: &str| ImportItem {
+                source: PathBuf::from("/home/someone/old").join(source),
+                name: name.into(),
+                destination: destination.into(),
+                can_rename_origin: rename,
+                notes: vec![note.into()],
+            };
+        ImportPreview {
+            searched: Some("/home/someone/old".into()),
+            items: vec![
+                item(
+                    "react",
+                    "facebook/react",
+                    "r/react~2",
+                    true,
+                    "You already have a clone of it at r/react",
+                ),
+                item("notes", "notes", "n/notes", false, "No remotes"),
+                item("lab/tool", "group/tool", "t/tool", true, "On gitlab.com"),
+            ],
+            in_place: 2,
+            skipped: vec![("/home/someone/old/wt".into(), "a linked worktree".into())],
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn import_moves_the_selected_repos() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.view = View::Import;
+        h.state_mut().0.import_preview(Ok(sample_import()));
+        h.run();
+        assert!(h.query_by_label("3 selected").is_some());
+        assert!(h.query_by_label("· 2 already in place").is_some());
+        h.get_by_label("n/notes").click();
+        h.run();
+        h.get_by_label("Move 2 into place").click();
+        h.run();
+        let moves = |source: &str, destination: &str| ImportMove {
+            source: PathBuf::from("/home/someone/old").join(source),
+            destination: destination.into(),
+            rename_origin: true,
+        };
+        assert_eq!(
+            h.state().1,
+            vec![ReposAction::Import(vec![
+                moves("react", "r/react~2"),
+                moves("lab/tool", "t/tool")
+            ])]
+        );
+        assert!(
+            h.query_by_label_contains("Moving 2 repos into place")
+                .is_some()
+        );
+        assert!(
+            h.query_by_label("Move 2 into place").is_none(),
+            "the preview is cleared"
+        );
+    }
+
+    #[test]
+    fn unticking_rename_keeps_origin() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.view = View::Import;
+        h.state_mut().0.import_preview(Ok(sample_import()));
+        h.run();
+        h.get_by_label("Rename the remote \"origin\" to \"me\"")
+            .click();
+        h.run();
+        h.get_by_label("Move 3 into place").click();
+        h.run();
+        let Some(ReposAction::Import(moves)) = h.state().1.first() else {
+            panic!("expected an import");
+        };
+        assert!(moves.iter().all(|m| !m.rename_origin));
+    }
+
+    #[test]
+    fn problems_link_to_import() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        h.get_by_label("Problems (7)").click();
+        h.run();
+        h.get_by_label("Move into place…").click();
+        h.run();
+        assert!(h.state().0.view == View::Import);
+        h.get_by_label("Problems (7)").click();
+        h.run();
+        h.get_by_label("Look for repos inside").scroll_to_me();
+        h.run();
+        h.get_by_label("Look for repos inside").click();
+        h.run();
+        assert_eq!(
+            h.state().1,
+            vec![
+                ReposAction::PreviewImport {
+                    folder: None,
+                    paths: vec!["/home/someone/code/x/serde".into()],
+                },
+                ReposAction::PreviewImport {
+                    folder: Some("/home/someone/code/p/photos".into()),
+                    paths: vec![],
+                },
+            ]
+        );
+        assert_eq!(h.state().0.import.folder, "/home/someone/code/p/photos");
+    }
+
     #[test]
     fn fork_decisions() {
         let mut h = harness(Harness::builder());
@@ -1697,6 +1890,11 @@ mod tests {
         h.get_by_label("Forks (1 undecided)").click();
         h.run();
         h.render().unwrap().save(dir.join("forks.png")).unwrap();
+        h.state_mut().0.import.folder = "/home/someone/old".into();
+        h.state_mut().0.import_preview(Ok(sample_import()));
+        h.get_by_label("Import").click();
+        h.run();
+        h.render().unwrap().save(dir.join("import.png")).unwrap();
     }
 
     #[test]

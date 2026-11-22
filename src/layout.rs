@@ -29,6 +29,18 @@ pub fn expected_path(name: &str) -> String {
     format!("{}/{}", letter_for(name), name)
 }
 
+/// Whether a clone at `rel` (relative to the clone root) is where the layout puts `name`:
+/// `<letter>/<name>`, optionally with a `~N` suffix, ignoring case in the name.
+pub fn is_in_place(rel: &str, name: &str) -> bool {
+    let Some((letter, folder)) = rel.split_once('/') else {
+        return false;
+    };
+    let (base, _) = split_suffix(folder);
+    !folder.contains('/')
+        && letter == letter_for(name).to_string()
+        && base.eq_ignore_ascii_case(name)
+}
+
 /// Picks the folder for a new clone: `r/react`, or `r/react~2`, `r/react~3`, … when taken.
 /// `taken` is asked with candidate paths and should compare without regard to case.
 pub fn assign_path(name: &str, mut taken: impl FnMut(&str) -> bool) -> String {
@@ -93,6 +105,19 @@ mod tests {
     fn expected_paths() {
         assert_eq!(expected_path("react"), "r/react");
         assert_eq!(expected_path(".github"), "_/.github");
+    }
+
+    #[test]
+    fn in_place() {
+        assert!(is_in_place("r/react", "react"));
+        assert!(is_in_place("r/react~2", "react"));
+        assert!(is_in_place("r/React", "react"));
+        assert!(is_in_place("_/.github", ".github"));
+        assert!(!is_in_place("react", "react"));
+        assert!(!is_in_place("R/react", "react"));
+        assert!(!is_in_place("x/react", "react"));
+        assert!(!is_in_place("r/react-old", "react"));
+        assert!(!is_in_place("r/sub/react", "react"));
     }
 
     #[test]

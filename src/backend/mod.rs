@@ -1,6 +1,7 @@
 //! Background work. The UI sends [`Command`]s; the backend answers with [`Event`]s and asks
 //! egui to repaint. Slow work (network, keyring, database, processes) never runs on the UI thread.
 
+mod import;
 mod repos;
 
 use std::path::PathBuf;
@@ -14,10 +15,12 @@ use eframe::egui;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, spawn_blocking};
 
+pub use import::ImportMove;
 pub use repos::SyncReport;
 
 use crate::config::{Config, Paths};
 use crate::db::{Catalog, Db, ForkDecision, Snippet};
+use crate::git::import::ImportPreview;
 use crate::git::scan::{self, ScanResult, ScanSettings};
 use crate::github::{self, RateLimit, Viewer};
 use crate::jobs::{self, OnChange, Run, RunSpec, Target};
@@ -70,6 +73,21 @@ pub enum Command {
         url: String,
         add: bool,
     },
+    /// Show the desktop's folder chooser.
+    PickFolder(FolderPurpose),
+    /// Plan an import: search `folder` for repos, or take `paths` as the repos.
+    PreviewImport {
+        folder: Option<PathBuf>,
+        paths: Vec<PathBuf>,
+    },
+    Import(Vec<ImportMove>),
+}
+
+/// What a picked folder is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderPurpose {
+    Import,
+    CloneRoot,
 }
 
 pub enum Event {
@@ -97,6 +115,12 @@ pub enum Event {
     ClonesFinished(Vec<i64>),
     /// Something the user asked for on the Repositories tab worked.
     RepoNotice(String),
+    FolderPicked {
+        purpose: FolderPurpose,
+        path: PathBuf,
+    },
+    ImportSearching,
+    ImportPreview(Result<ImportPreview, String>),
 }
 
 pub struct DbInfo {
@@ -421,6 +445,57 @@ async fn run(
                 tokio::spawn(async move {
                     if write_db(&shared, move |db| db.remove_manual_owner(&login)).await {
                         repos::refresh_catalog(&shared).await;
+                    }
+                });
+            }
+            Command::PickFolder(purpose) => {
+                let shared = shared.clone();
+                let start = match purpose {
+                    FolderPurpose::CloneRoot => lock(&shared.config).clone_root.clone(),
+                    FolderPurpose::Import => None,
+                }
+                .filter(|p| p.is_dir())
+                .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()));
+                tokio::spawn(async move {
+                    let title = match purpose {
+                        FolderPurpose::Import => "Folder to import repos from",
+                        FolderPurpose::CloneRoot => "Clone root",
+                    };
+                    let picked = spawn_blocking(move || {
+                        let mut dialog = rfd::FileDialog::new().set_title(title);
+                        if let Some(start) = start {
+                            dialog = dialog.set_directory(start);
+                        }
+                        dialog.pick_folder()
+                    })
+                    .await;
+                    match picked {
+                        Ok(Some(path)) => {
+                            shared.emitter.emit(Event::FolderPicked { purpose, path })
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!("the folder chooser crashed: {e}"),
+                    }
+                });
+            }
+            Command::PreviewImport { folder, paths } => {
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    shared.emitter.emit(Event::ImportSearching);
+                    let result = import::preview(&shared, folder, paths)
+                        .await
+                        .map_err(|e| format!("{e:#}"));
+                    shared.emitter.emit(Event::ImportPreview(result));
+                });
+            }
+            Command::Import(moves) => {
+                let shared = shared.clone();
+                let scan_tx = scan_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = import::run_import(shared.clone(), moves, scan_tx).await {
+                        shared
+                            .emitter
+                            .emit(Event::RepoActionFailed(format!("{e:#}")));
                     }
                 });
             }
@@ -836,6 +911,175 @@ mod tests {
             _ => None,
         });
         assert!(catalog.inbox.iter().any(|r| r.full_name() == "me/broken"));
+
+        drop(backend);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Imports repos from outside the clone root (renaming origin, repairing a worktree), then
+    /// fixes a misplaced clone inside it, checking the clone keeps its database row.
+    #[test]
+    fn import_end_to_end() {
+        let base =
+            std::env::temp_dir().join(format!("depository-import-e2e-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("code");
+        let old = base.join("old");
+        let commit = |dir: &Path| {
+            fs::write(dir.join("README"), "x").unwrap();
+            git(dir, &["add", "README"]);
+            git(
+                dir,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "x",
+                ],
+            );
+        };
+        let repo = |dir: &Path, remotes: &[(&str, &str)]| {
+            fs::create_dir_all(dir).unwrap();
+            git(dir, &["init", "-q", "-b", "main"]);
+            for (name, url) in remotes {
+                git(dir, &["remote", "add", name, url]);
+            }
+        };
+        repo(
+            &old.join("react"),
+            &[("origin", "https://github.com/facebook/react")],
+        );
+        repo(&old.join("notes"), &[]);
+        repo(
+            &old.join("withtree"),
+            &[("origin", "git@github.com:me/withtree.git")],
+        );
+        commit(&old.join("withtree"));
+        git(
+            &old.join("withtree"),
+            &["worktree", "add", "-q", "../withtree-wt", "-b", "feature"],
+        );
+        repo(
+            &root.join("x/serde"),
+            &[("me", "git@github.com:serde-rs/serde.git")],
+        );
+
+        let paths = Paths {
+            config_file: base.join("config.toml"),
+            db_file: base.join("data/depository.db"),
+            workspaces_dir: base.join("data/workspaces"),
+        };
+        let config = Config {
+            clone_root: Some(root.clone()),
+            ..Default::default()
+        };
+        let backend = Backend::start(egui::Context::default(), paths, config);
+        let first = wait_for(&backend, "the first scan", |event| match event {
+            Event::Scan(Ok(scan)) => Some(scan),
+            _ => None,
+        });
+        let serde_id = first.clones[0].id;
+
+        // Import from outside.
+        backend.send(Command::PreviewImport {
+            folder: Some(old.clone()),
+            paths: vec![],
+        });
+        let preview = wait_for(&backend, "the preview", |event| match event {
+            Event::ImportPreview(result) => Some(result.expect("preview failed")),
+            _ => None,
+        });
+        let planned: Vec<(&str, &str)> = preview
+            .items
+            .iter()
+            .map(|i| (i.name.as_str(), i.destination.as_str()))
+            .collect();
+        assert_eq!(
+            planned,
+            [
+                ("notes", "n/notes"),
+                ("facebook/react", "r/react"),
+                ("me/withtree", "w/withtree")
+            ]
+        );
+        assert_eq!(preview.skipped.len(), 1, "the linked worktree is skipped");
+        let moves: Vec<ImportMove> = preview
+            .items
+            .iter()
+            .map(|i| ImportMove {
+                source: i.source.clone(),
+                destination: i.destination.clone(),
+                rename_origin: i.can_rename_origin,
+            })
+            .collect();
+        backend.send(Command::Import(moves));
+        let run = wait_for(&backend, "the move run", |event| match event {
+            Event::RunStarted(run) => Some(run),
+            _ => None,
+        });
+        assert_eq!(run.title, "Move 3 repos into place");
+        wait_until("the moves to finish", || run.is_finished());
+        assert_eq!(
+            run.summary().succeeded,
+            3,
+            "{:?}",
+            (0..3)
+                .map(|i| run
+                    .slot(i)
+                    .output
+                    .iter()
+                    .map(|l| l.text.clone())
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+        let scan = wait_for(&backend, "the rescan", |event| match event {
+            Event::Scan(Ok(scan)) => Some(scan),
+            _ => None,
+        });
+        let in_root: Vec<&str> = scan.clones.iter().map(|c| c.rel_path.as_str()).collect();
+        assert_eq!(in_root, ["n/notes", "r/react", "w/withtree", "x/serde"]);
+        assert!(!old.join("react").exists() && !old.join("notes").exists());
+        let react = scan
+            .clones
+            .iter()
+            .find(|c| c.rel_path == "r/react")
+            .unwrap();
+        assert_eq!(react.remotes[0].name, "me", "origin was renamed");
+        // The worktree outside still works: it was repaired to point at the new location.
+        git(&old.join("withtree-wt"), &["status", "--short"]);
+
+        // Fix the misplaced clone inside the root.
+        backend.send(Command::PreviewImport {
+            folder: None,
+            paths: vec![root.join("x/serde")],
+        });
+        let preview = wait_for(&backend, "the second preview", |event| match event {
+            Event::ImportPreview(result) => Some(result.expect("preview failed")),
+            _ => None,
+        });
+        assert_eq!(preview.items[0].destination, "s/serde");
+        backend.send(Command::Import(vec![ImportMove {
+            source: root.join("x/serde"),
+            destination: "s/serde".into(),
+            rename_origin: false,
+        }]));
+        let scan = wait_for(&backend, "the rescan after fixing", |event| match event {
+            Event::Scan(Ok(scan)) if scan.clones.iter().any(|c| c.rel_path == "s/serde") => {
+                Some(scan)
+            }
+            _ => None,
+        });
+        let serde = scan
+            .clones
+            .iter()
+            .find(|c| c.rel_path == "s/serde")
+            .unwrap();
+        assert_eq!(serde.id, serde_id, "the moved clone kept its database row");
+        assert!(serde.problems.is_empty());
 
         drop(backend);
         let _ = fs::remove_dir_all(&base);

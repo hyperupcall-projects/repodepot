@@ -497,7 +497,7 @@ async fn inspect(path: &Path, github_aliases: &[String]) -> Inspected {
 }
 
 /// Reads `git remote -v` (which already applies `insteadOf` rewrites). Uses fetch URLs.
-fn parse_remotes(output: &str, github_aliases: &[String]) -> Vec<Remote> {
+pub fn parse_remotes(output: &str, github_aliases: &[String]) -> Vec<Remote> {
     let mut remotes: Vec<Remote> = Vec::new();
     let mut seen: HashMap<String, ()> = HashMap::new();
     for line in output.lines() {

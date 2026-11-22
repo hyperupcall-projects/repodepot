@@ -136,7 +136,8 @@ Relevant repos that aren't cloned are the Inbox (1.3).
    - its current path → its new path in the layout
    - any warnings
 3. A checkbox, on by default, renames `origin` to the default remote name.
-4. On confirm, each repo is moved with `rename`. Across filesystems the app falls back to `mv`. Repos that have linked worktrees get `git worktree repair` afterwards.
+4. On confirm, the moves run in the Runner, two at a time, using `mv`: it renames on the same disk and copies then deletes across disks, and never overwrites anything. Repos that have linked worktrees get `git worktree repair` afterwards. A move that fails or is cancelled is left as it is for you to look at; nothing is deleted automatically.
+5. The Problems view links here: "Move into place…" for clones outside the layout, and "Look for repos inside" for folders that aren't repos.
 
 Breaking absolute paths inside a repo (Python venvs and similar) is accepted.
 

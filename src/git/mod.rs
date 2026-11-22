@@ -1,5 +1,6 @@
 //! Running `git` and reading what it says.
 
+pub mod import;
 pub mod remote_url;
 pub mod scan;
 pub mod status;

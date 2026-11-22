@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::backend::{AuthState, Backend, Command, DbInfo, Event};
+use crate::backend::{AuthState, Backend, Command, DbInfo, Event, FolderPurpose};
 use crate::config::{Config, Paths};
 use crate::ui::repos::{ReposAction, ReposContext, ReposPage};
 use crate::ui::runner::{RunnerAction, RunnerContext, RunnerPage};
@@ -88,6 +88,18 @@ impl App {
             Event::Catalog(catalog) => self.repos.set_catalog(catalog),
             Event::ClonesFinished(repo_ids) => self.repos.clones_finished(&repo_ids),
             Event::RepoNotice(message) => self.repos.notice(message),
+            Event::FolderPicked { purpose, path } => match purpose {
+                FolderPurpose::Import => {
+                    self.repos.import_folder_picked(&path);
+                    self.backend.send(Command::PreviewImport {
+                        folder: Some(path),
+                        paths: Vec::new(),
+                    });
+                }
+                FolderPurpose::CloneRoot => self.settings.set_clone_root(&path),
+            },
+            Event::ImportSearching => self.repos.import_searching(),
+            Event::ImportPreview(result) => self.repos.import_preview(result),
         }
     }
 
@@ -120,6 +132,14 @@ impl App {
             ReposAction::RemoveManualOwner(login) => {
                 self.backend.send(Command::RemoveManualOwner(login));
             }
+            ReposAction::PickImportFolder => {
+                self.backend
+                    .send(Command::PickFolder(FolderPurpose::Import));
+            }
+            ReposAction::PreviewImport { folder, paths } => {
+                self.backend.send(Command::PreviewImport { folder, paths });
+            }
+            ReposAction::Import(moves) => self.backend.send(Command::Import(moves)),
             ReposAction::SetRemote {
                 path,
                 name,
@@ -213,6 +233,7 @@ impl eframe::App for App {
             Tab::Repositories => {
                 let cx = ReposContext {
                     has_clone_root: self.config.clone_root.is_some(),
+                    default_remote: &self.config.remotes.default_name,
                     upstream_name: &self.config.remotes.upstream_name,
                 };
                 if let Some(action) = self.repos.show(ui, cx) {

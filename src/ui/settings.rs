@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::backend::{AuthState, Backend, Command, DbInfo};
+use crate::backend::{AuthState, Backend, Command, DbInfo, FolderPurpose};
 use crate::config::{self, Config, Paths};
 use crate::token::TokenSource;
 use crate::ui::thousands;
@@ -55,6 +55,12 @@ impl SettingsPage {
             .unwrap_or_default();
         self.aliases = config.github.ssh_host_aliases.join(", ");
         self.shell = config.runner.shell.clone().unwrap_or_default();
+    }
+
+    /// A folder was picked for the clone root. It still needs saving.
+    pub fn set_clone_root(&mut self, path: &std::path::Path) {
+        self.clone_root = path.display().to_string();
+        self.create_folder_error = None;
     }
 
     pub fn set_account_message(&mut self, message: Result<String, String>) {
@@ -178,7 +184,7 @@ impl SettingsPage {
                 if let Some(error) = cx.config_error.as_deref() {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
-                self.preferences(ui);
+                self.preferences(ui, cx.backend);
 
                 ui.add_space(20.0);
                 ui.heading("Storage");
@@ -309,18 +315,26 @@ impl SettingsPage {
         }
     }
 
-    fn preferences(&mut self, ui: &mut egui::Ui) {
+    fn preferences(&mut self, ui: &mut egui::Ui, backend: &Backend) {
         subheading(ui, "Folders");
         section_grid(ui, "folders", |ui| {
-            ui.label("Clone root");
+            let label = ui.label("Clone root");
             ui.vertical(|ui| {
                 let edited = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.clone_root)
-                            .desired_width(360.0)
-                            .hint_text("~/code"),
-                    )
-                    .changed();
+                    .horizontal(|ui| {
+                        let field = ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.clone_root)
+                                    .desired_width(360.0)
+                                    .hint_text("~/code"),
+                            )
+                            .labelled_by(label.id);
+                        if ui.button("Browse…").clicked() {
+                            backend.send(Command::PickFolder(FolderPurpose::CloneRoot));
+                        }
+                        field.changed()
+                    })
+                    .inner;
                 if edited {
                     self.create_folder_error = None;
                 }

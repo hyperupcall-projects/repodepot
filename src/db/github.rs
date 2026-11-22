@@ -442,6 +442,21 @@ impl Db {
         Ok(())
     }
 
+    /// Paths of present clones, by the lowercase `host/owner/name` of their main repo.
+    pub fn clones_by_repo(&self) -> Result<HashMap<String, Vec<String>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT lower(r.host || '/' || r.owner || '/' || r.name), c.path
+             FROM clones c JOIN repos r ON r.id = c.repo_id
+             WHERE c.missing_since IS NULL",
+        )?;
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for row in stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))? {
+            let (key, path) = row?;
+            map.entry(key).or_default().push(path);
+        }
+        Ok(map)
+    }
+
     /// Every clone path in the database, including missing ones.
     pub fn clone_paths(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT path FROM clones")?;
