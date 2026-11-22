@@ -5,6 +5,7 @@ use eframe::egui;
 use crate::backend::{AuthState, Backend, Command, DbInfo, Event};
 use crate::config::{Config, Paths};
 use crate::ui::repos::{ReposAction, ReposPage};
+use crate::ui::runner::{RunnerAction, RunnerContext, RunnerPage};
 use crate::ui::settings::{SettingsContext, SettingsPage};
 use crate::ui::{placeholder, thousands};
 
@@ -36,6 +37,7 @@ pub struct App {
     config: Config,
     config_error: Option<String>,
     repos: ReposPage,
+    runner: RunnerPage,
     settings: SettingsPage,
     auth: AuthState,
     db: Option<Result<DbInfo, String>>,
@@ -48,6 +50,7 @@ impl App {
         config_error: Option<String>,
         backend: Backend,
     ) -> Self {
+        backend.send(Command::CheckAuth);
         // Nothing works without a clone root, so start on Settings until there is one.
         let tab = if config.clone_root.is_none() || config_error.is_some() {
             Tab::Settings
@@ -56,6 +59,7 @@ impl App {
         };
         Self {
             repos: ReposPage::new(),
+            runner: RunnerPage::new(),
             settings: SettingsPage::new(&config),
             paths,
             backend,
@@ -76,6 +80,8 @@ impl App {
             Event::ScanProgress { done, total } => self.repos.scan_progress(done, total),
             Event::Scan(result) => self.repos.scan_finished(result),
             Event::RepoActionFailed(message) => self.repos.action_failed(message),
+            Event::Snippets(snippets) => self.runner.set_snippets(snippets),
+            Event::RunStarted(run) => self.runner.run_started(run),
         }
     }
 
@@ -153,7 +159,13 @@ impl eframe::App for App {
                 ui.strong("depository");
                 ui.separator();
                 for tab in Tab::ALL {
-                    ui.selectable_value(&mut self.tab, tab, tab.label());
+                    let running = self.runner.running_count();
+                    let label = if tab == Tab::Runner && running > 0 {
+                        format!("{} ({running} running)", tab.label())
+                    } else {
+                        tab.label().to_owned()
+                    };
+                    ui.selectable_value(&mut self.tab, tab, label);
                 }
             });
         });
@@ -168,11 +180,24 @@ impl eframe::App for App {
                 }
             }
             Tab::Tags => placeholder(ui, "Tags", "Tags, rules and groups come in build step 6."),
-            Tab::Runner => placeholder(
-                ui,
-                "Runner",
-                "Running commands across repos comes in build steps 3 and 8.",
-            ),
+            Tab::Runner => {
+                let cx = RunnerContext {
+                    clones: self.repos.clones(),
+                    config: &self.config,
+                };
+                if let Some(RunnerAction::Start {
+                    command,
+                    targets,
+                    parallel,
+                }) = self.runner.show(ui, cx)
+                {
+                    self.backend.send(Command::StartRun {
+                        command,
+                        targets,
+                        parallel,
+                    });
+                }
+            }
             Tab::Settings => {
                 let saved = self.settings.show(
                     ui,

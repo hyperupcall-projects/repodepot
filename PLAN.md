@@ -296,7 +296,7 @@ The exact flags get checked against each tool during the build.
 
 ### One job engine
 
-Clones, status scans and your own commands all go through the same engine. It runs a process in N folders with a limit on how many run at once, live output, status, timeout and cancel. That way Part 1 gets the runner's output view at no extra cost.
+Clones and your own commands go through the same engine. It runs a process in N folders with a limit on how many run at once, live output, status, timeout and cancel. That way Part 1 gets the runner's output view at no extra cost. Status scans don't use it: they make quick, parsed git calls whose output nobody needs to read.
 
 ### Git
 

@@ -5,6 +5,7 @@ mod config;
 mod db;
 mod git;
 mod github;
+mod jobs;
 mod layout;
 mod token;
 mod ui;

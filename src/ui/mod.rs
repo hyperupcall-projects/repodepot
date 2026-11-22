@@ -1,4 +1,5 @@
 pub mod repos;
+pub mod runner;
 pub mod settings;
 
 use eframe::egui;

@@ -50,6 +50,13 @@ pub struct MissingClone {
     pub since: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snippet {
+    pub id: i64,
+    pub name: String,
+    pub command: String,
+}
+
 pub struct ScanApplied {
     /// Clone IDs, in the same order as the scanned clones.
     pub ids: Vec<i64>,
@@ -87,6 +94,20 @@ impl Db {
         Ok(self
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))?)
+    }
+
+    pub fn snippets(&self) -> Result<Vec<Snippet>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, command FROM snippets ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Snippet {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                command: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Main remotes picked by hand, keyed by clone path.
@@ -301,7 +322,9 @@ mod tests {
     fn fresh_database_gets_latest_schema() {
         let db = Db::open_in_memory().unwrap();
         assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as i64);
-        assert_eq!(count(&db, "SELECT count(*) FROM snippets"), 4);
+        let snippets = db.snippets().unwrap();
+        assert_eq!(snippets.len(), 4);
+        assert_eq!(snippets[2].command, "git status --short");
     }
 
     #[test]

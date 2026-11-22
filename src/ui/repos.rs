@@ -194,6 +194,14 @@ impl ReposPage {
         self.action_error = Some(message);
     }
 
+    /// The clones from the latest successful scan.
+    pub fn clones(&self) -> Option<&[CloneInfo]> {
+        match &self.result {
+            Some(Ok(scan)) => Some(&scan.clones),
+            _ => None,
+        }
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, has_clone_root: bool) -> Option<ReposAction> {
         let mut action = None;
         // Taken out so the views can borrow it while changing the page's own state.

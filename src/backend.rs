@@ -4,16 +4,21 @@
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use eframe::egui;
 use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
 
 use crate::config::{Config, Paths};
-use crate::db::Db;
+use crate::db::{Db, Snippet};
 use crate::git::scan::{self, ScanResult, ScanSettings};
 use crate::github::{self, RateLimit, Viewer};
+use crate::jobs::{self, OnChange, Run, RunSpec, Target};
 use crate::token::{self, TokenSource};
+
+/// The most often the UI repaints for streaming output.
+const OUTPUT_REPAINT_INTERVAL: Duration = Duration::from_millis(50);
 
 pub enum Command {
     CheckAuth,
@@ -30,6 +35,12 @@ pub enum Command {
     },
     /// Forget a clone whose folder is gone.
     ForgetClone(i64),
+    /// Run a shell command in each target. Shell, timeout and line limit come from the settings.
+    StartRun {
+        command: String,
+        targets: Vec<Target>,
+        parallel: usize,
+    },
 }
 
 pub enum Event {
@@ -45,6 +56,9 @@ pub enum Event {
     Scan(Result<ScanResult, String>),
     /// Something the user asked for on the Repositories tab failed.
     RepoActionFailed(String),
+    Snippets(Vec<Snippet>),
+    /// The UI reads the run's progress and output directly, and can cancel it.
+    RunStarted(Arc<Run>),
 }
 
 pub struct DbInfo {
@@ -202,11 +216,12 @@ async fn run(
         }
     });
 
-    let _ = auth_tx.send(AuthJob::Check);
     if lock(&shared.config).clone_root.is_some() {
         let _ = scan_tx.send(());
     }
+    tokio::spawn(load_snippets(shared.clone()));
 
+    let mut last_run_id = 0;
     while let Some(command) = commands.recv().await {
         match command {
             Command::CheckAuth => {
@@ -254,7 +269,55 @@ async fn run(
                     }
                 });
             }
+            Command::StartRun {
+                command,
+                targets,
+                parallel,
+            } => {
+                last_run_id += 1;
+                let id = last_run_id;
+                let spec = run_spec(&lock(&shared.config), command, targets, parallel);
+                let ctx = shared.emitter.ctx.clone();
+                let on_change: OnChange =
+                    Arc::new(move || ctx.request_repaint_after(OUTPUT_REPAINT_INTERVAL));
+                let (run, handle) = jobs::start(id, spec, on_change);
+                shared.emitter.emit(Event::RunStarted(run));
+
+                let scan_tx = scan_tx.clone();
+                tokio::spawn(async move {
+                    let _ = handle.await;
+                    // The command may have changed branches, files or commits.
+                    let _ = scan_tx.send(());
+                });
+            }
         }
+    }
+}
+
+fn run_spec(config: &Config, command: String, targets: Vec<Target>, parallel: usize) -> RunSpec {
+    let shell = config
+        .runner
+        .shell
+        .clone()
+        .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "/bin/sh".to_owned());
+    RunSpec {
+        command,
+        shell,
+        targets,
+        parallel: parallel.max(1),
+        timeout: (config.runner.timeout_secs > 0)
+            .then(|| Duration::from_secs(config.runner.timeout_secs)),
+        line_limit: config.runner.line_limit as usize,
+    }
+}
+
+async fn load_snippets(shared: Arc<Shared>) {
+    let Some(db) = shared.db.clone() else { return };
+    match spawn_blocking(move || lock(&db).snippets()).await {
+        Ok(Ok(snippets)) => shared.emitter.emit(Event::Snippets(snippets)),
+        Ok(Err(e)) => tracing::warn!("couldn't load snippets: {e:#}"),
+        Err(e) => tracing::warn!("loading snippets crashed: {e}"),
     }
 }
 
@@ -415,4 +478,138 @@ async fn forget_token(shared: &Shared) {
     };
     shared.emitter.emit(Event::AccountMessage(message));
     check_auth(shared).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::jobs::TargetStatus;
+
+    fn wait_for<T>(backend: &Backend, what: &str, mut pick: impl FnMut(Event) -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            match backend.try_recv() {
+                Some(event) => {
+                    if let Some(found) = pick(event) {
+                        return found;
+                    }
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    /// Scans a real clone root through the backend, runs `git status --short` in every clone,
+    /// then starts a slow command everywhere and cancels it.
+    #[test]
+    fn scan_run_and_cancel_end_to_end() {
+        let base = std::env::temp_dir().join(format!("depository-backend-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("code");
+        for (rel, dirty) in [("a/alpha", true), ("b/beta", false), ("g/gamma", true)] {
+            let dir = root.join(rel);
+            fs::create_dir_all(&dir).unwrap();
+            git(&dir, &["init", "-q", "-b", "main"]);
+            if dirty {
+                fs::write(dir.join("depository-untracked-9d1e"), "x").unwrap();
+            }
+        }
+        let paths = Paths {
+            config_file: base.join("config.toml"),
+            db_file: base.join("data/depository.db"),
+            workspaces_dir: base.join("data/workspaces"),
+        };
+        let config = Config {
+            clone_root: Some(root.clone()),
+            runner: crate::config::Runner {
+                shell: Some("/bin/sh".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let backend = Backend::start(egui::Context::default(), paths, config);
+        let scan = wait_for(&backend, "the startup scan", |event| match event {
+            Event::Scan(result) => Some(result.expect("scan failed")),
+            _ => None,
+        });
+        assert_eq!(scan.clones.len(), 3);
+        let targets: Vec<Target> = scan
+            .clones
+            .iter()
+            .map(|c| Target {
+                name: c.display_name(),
+                path: c.abs_path.clone(),
+                tags: Vec::new(),
+            })
+            .collect();
+
+        backend.send(Command::StartRun {
+            command: "git status --short".into(),
+            targets: targets.clone(),
+            parallel: 2,
+        });
+        let run = wait_for(&backend, "the run to start", |event| match event {
+            Event::RunStarted(run) => Some(run),
+            _ => None,
+        });
+        assert_eq!(run.shell, "/bin/sh");
+        wait_until("the run to finish", || run.is_finished());
+        let summary = run.summary();
+        assert_eq!((summary.succeeded, summary.failed), (3, 0));
+        let outputs: Vec<Vec<String>> = (0..3)
+            .map(|i| run.slot(i).output.iter().map(|l| l.text.clone()).collect())
+            .collect();
+        assert_eq!(outputs[0], ["?? depository-untracked-9d1e"]);
+        assert!(outputs[1].is_empty());
+        assert_eq!(outputs[2], ["?? depository-untracked-9d1e"]);
+        // Finishing a run refreshes the status column.
+        wait_for(&backend, "the rescan after the run", |event| {
+            matches!(event, Event::Scan(_)).then_some(())
+        });
+
+        backend.send(Command::StartRun {
+            command: "sleep 30".into(),
+            targets,
+            parallel: 8,
+        });
+        let slow = wait_for(&backend, "the slow run to start", |event| match event {
+            Event::RunStarted(run) => Some(run),
+            _ => None,
+        });
+        wait_until("all three to be running", || slow.summary().running == 3);
+        let cancelled_at = Instant::now();
+        slow.cancel();
+        wait_until("the slow run to stop", || slow.is_finished());
+        assert!(cancelled_at.elapsed() < Duration::from_secs(5));
+        assert!((0..3).all(|i| matches!(slow.status(i), TargetStatus::Cancelled { .. })));
+
+        drop(backend);
+        let _ = fs::remove_dir_all(&base);
+    }
 }
