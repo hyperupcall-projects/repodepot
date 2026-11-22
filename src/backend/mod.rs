@@ -278,6 +278,8 @@ struct Shared {
     emitter: Emitter,
     http: Result<reqwest::Client, String>,
     db: Option<Arc<Mutex<Db>>>,
+    /// Why the database couldn't be opened, for messages that need it.
+    db_error: Option<String>,
     config: Mutex<Config>,
     last_run_id: AtomicU64,
     /// Installed launchers, refreshed when custom ones change.
@@ -297,12 +299,14 @@ async fn run(
     paths: Paths,
     config: Config,
 ) {
-    let db = open_db(&paths, &emitter)
-        .await
-        .map(|db| Arc::new(Mutex::new(db)));
+    let (db, db_error) = match open_db(&paths, &emitter).await {
+        Ok(db) => (Some(Arc::new(Mutex::new(db))), None),
+        Err(error) => (None, Some(error)),
+    };
     let shared = Arc::new(Shared {
         http: github::http_client().map_err(|e| format!("{e:#}")),
         db,
+        db_error,
         config: Mutex::new(config),
         emitter,
         last_run_id: AtomicU64::new(0),
@@ -759,7 +763,7 @@ async fn with_db<T: Send + 'static>(
     let db = shared
         .db
         .clone()
-        .ok_or_else(|| anyhow!("The database isn't available."))?;
+        .ok_or_else(|| anyhow!(database_unavailable(shared)))?;
     spawn_blocking(move || work(&mut lock(&db))).await?
 }
 
@@ -783,7 +787,7 @@ async fn run_scan(shared: &Shared) {
     let settings = ScanSettings::from_config(&lock(&shared.config));
     shared.emitter.emit(Event::ScanStarted);
     let result = match &shared.db {
-        None => Err("The database isn't available, so scanning is off.".to_owned()),
+        None => Err(database_unavailable(shared)),
         Some(db) => {
             let emitter = shared.emitter.clone();
             scan::scan(&settings, db.clone(), move |done, total| {
@@ -799,7 +803,14 @@ async fn run_scan(shared: &Shared) {
     shared.emitter.emit(Event::Scan(result));
 }
 
-async fn open_db(paths: &Paths, emitter: &Emitter) -> Option<Db> {
+fn database_unavailable(shared: &Shared) -> String {
+    match &shared.db_error {
+        Some(error) => format!("The database couldn't be opened: {error}"),
+        None => "The database isn't available.".to_owned(),
+    }
+}
+
+async fn open_db(paths: &Paths, emitter: &Emitter) -> Result<Db, String> {
     let path = paths.db_file.clone();
     let opened = spawn_blocking(move || {
         let db = Db::open(&path)?;
@@ -813,16 +824,18 @@ async fn open_db(paths: &Paths, emitter: &Emitter) -> Option<Db> {
                 path: paths.db_file.clone(),
                 schema_version,
             })));
-            Some(db)
+            Ok(db)
         }
         Ok(Err(e)) => {
             tracing::error!("database: {e:#}");
-            emitter.emit(Event::Db(Err(format!("{e:#}"))));
-            None
+            let error = format!("{e:#}");
+            emitter.emit(Event::Db(Err(error.clone())));
+            Err(error)
         }
         Err(e) => {
-            emitter.emit(Event::Db(Err(format!("opening the database crashed: {e}"))));
-            None
+            let error = format!("opening the database crashed: {e}");
+            emitter.emit(Event::Db(Err(error.clone())));
+            Err(error)
         }
     }
 }

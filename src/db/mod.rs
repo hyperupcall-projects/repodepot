@@ -24,6 +24,40 @@ const MIGRATIONS: &[M<'static>] = &[
     M::up(include_str!("migrations/003_github_sync.sql")),
 ];
 
+/// Stamped into every database this app creates (SQLite's `application_id`), so a file
+/// written by some other program (even one also called depository) is never mistaken for ours.
+const APPLICATION_ID: i32 = 0x4445_504F; // "DEPO"
+
+/// Tables and columns each migration creates; a database without a stamp must have all of
+/// them (up to its version) to count as ours.
+const EXPECTED: &[(i64, &str, &[&str])] = &[
+    (
+        1,
+        "repos",
+        &[
+            "host",
+            "owner",
+            "name",
+            "github_node_id",
+            "description",
+            "topics",
+            "ignored",
+        ],
+    ),
+    (1, "clones", &["id", "path", "repo_id"]),
+    (
+        1,
+        "clone_remotes",
+        &["clone_id", "remote_name", "url", "repo_id"],
+    ),
+    (1, "tags", &["id", "name"]),
+    (1, "rules", &["field", "pattern", "tag_template"]),
+    (1, "snippets", &["name", "command"]),
+    (2, "clones", &["main_remote", "missing_since"]),
+    (3, "repos", &["not_found_at", "renamed_to_id"]),
+    (3, "meta", &["key", "value"]),
+];
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::from_slice(MIGRATIONS)
 }
@@ -92,9 +126,20 @@ impl Db {
         }
         let conn =
             Connection::open(path).with_context(|| format!("couldn't open {}", path.display()))?;
-        conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
+        conn.busy_timeout(Duration::from_secs(5))?;
+        // Before anything writes to the file: make sure it's ours.
+        check_owner(&conn).map_err(|problem| {
+            anyhow::anyhow!(
+                "{} {problem} depository hasn't changed it. Move it somewhere else (depository \
+                 will start a new one), or give the other program its own folder.",
+                path.display()
+            )
+        })?;
+        let db = Self::prepare(conn)?;
+        db.conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
             .context("couldn't switch the database to WAL mode")?;
-        Self::prepare(conn)
+        Ok(db)
     }
 
     #[cfg(test)]
@@ -108,6 +153,7 @@ impl Db {
         migrations()
             .to_latest(&mut conn)
             .context("couldn't update the database schema")?;
+        conn.pragma_update(None, "application_id", APPLICATION_ID)?;
         Ok(Self { conn })
     }
 
@@ -325,6 +371,56 @@ impl Db {
     }
 }
 
+/// Checks that a database is this app's (or new). On failure, says what's wrong with it.
+fn check_owner(conn: &Connection) -> std::result::Result<(), String> {
+    let query = |sql: &str| -> std::result::Result<i64, String> {
+        conn.query_row(sql, [], |r| r.get(0))
+            .map_err(|e| format!("couldn't be read: {e}."))
+    };
+    let application_id = query("PRAGMA application_id")?;
+    if application_id == i64::from(APPLICATION_ID) {
+        return Ok(());
+    }
+    if application_id != 0 {
+        return Err(
+            "belongs to a different program (its SQLite application ID isn't depository's).".into(),
+        );
+    }
+    let version = query("PRAGMA user_version")?;
+    let tables = query("SELECT count(*) FROM sqlite_master WHERE type = 'table'")?;
+    if version == 0 && tables == 0 {
+        return Ok(()); // brand new
+    }
+    if version > MIGRATIONS.len() as i64 {
+        return Err(format!(
+            "is at schema version {version}, newer than this build of depository knows \
+             (it knows up to {}).",
+            MIGRATIONS.len()
+        ));
+    }
+    // Made before databases were stamped: accept it only if it has every table and column
+    // our migrations up to its version create.
+    for (since, table, columns) in EXPECTED {
+        if *since > version {
+            continue;
+        }
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info(?1)")
+            .map_err(|e| format!("couldn't be read: {e}."))?;
+        let present: Vec<String> = stmt
+            .query_map([table], |r| r.get(0))
+            .and_then(|rows| rows.collect())
+            .map_err(|e| format!("couldn't be read: {e}."))?;
+        if let Some(missing) = columns.iter().find(|c| !present.iter().any(|p| p == *c)) {
+            return Err(format!(
+                "was written by a different program, maybe another app also called depository: \
+                 its {table} table has no {missing} column, so its layout isn't this app's."
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn upsert_repo(tx: &Transaction<'_>, repo: &RemoteUrl) -> Result<i64> {
     tx.prepare_cached(
         "INSERT INTO repos (host, owner, name) VALUES (?1, ?2, ?3)
@@ -416,6 +512,86 @@ mod tests {
         let snippets = db.snippets().unwrap();
         assert_eq!(snippets.len(), 4);
         assert_eq!(snippets[2].command, "git status --short");
+    }
+
+    fn temp_db(test: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("depository-owner-{test}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("depository.db")
+    }
+
+    #[test]
+    fn new_databases_are_stamped_and_reopen() {
+        let path = temp_db("new");
+        drop(Db::open(&path).unwrap());
+        let db = Db::open(&path).unwrap();
+        let id: i32 = db
+            .conn
+            .pragma_query_value(None, "application_id", |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, APPLICATION_ID);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unstamped_databases_of_ours_are_accepted() {
+        // Like a database from before stamping: our migrations, no application ID.
+        let path = temp_db("legacy");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            Migrations::from_slice(&MIGRATIONS[..1])
+                .to_latest(&mut conn)
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.schema_version().unwrap(),
+            MIGRATIONS.len() as i64,
+            "migrated forward"
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn other_programs_databases_are_refused_untouched() {
+        // Shaped like the other depository's: same version number, different columns.
+        let path = temp_db("foreign");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE clones(id INTEGER PRIMARY KEY, root TEXT, path TEXT, repo_id INTEGER,
+                                     payload TEXT NOT NULL);
+                 CREATE TABLE repos(id INTEGER PRIMARY KEY, host TEXT, owner TEXT, name TEXT,
+                                    github_node_id TEXT, payload TEXT NOT NULL);
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        let error = Db::open(&path).err().unwrap().to_string();
+        assert!(error.contains("different program"), "{error}");
+        assert!(error.contains("hasn't changed it"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), before, "the file wasn't touched");
+
+        // A stamp from another program, or a version from the future, is refused too.
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "application_id", 1234).unwrap();
+        drop(conn);
+        assert!(
+            Db::open(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("application ID")
+        );
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "application_id", 0).unwrap();
+        conn.pragma_update(None, "user_version", 99).unwrap();
+        drop(conn);
+        assert!(Db::open(&path).err().unwrap().to_string().contains("newer"));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
