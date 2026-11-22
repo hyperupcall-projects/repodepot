@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::backend::{ImportMove, SyncReport};
+use crate::backend::{ImportMove, LauncherInfo, SyncReport};
 use crate::db::{Catalog, ForkDecision};
 use crate::git::import::ImportPreview;
 use crate::git::scan::{CloneInfo, MainRemote, Problem, ScanResult};
@@ -56,6 +56,11 @@ pub enum ReposAction {
     Import(Vec<ImportMove>),
     /// Tag changes made from a clone's details.
     Tags(TagsAction),
+    /// Open one clone in an app.
+    Open {
+        launcher: String,
+        clone_id: i64,
+    },
 }
 
 pub struct ReposContext<'a> {
@@ -65,6 +70,7 @@ pub struct ReposContext<'a> {
     pub upstream_name: &'a str,
     pub tags: &'a TagIndex,
     pub rules: &'a [Rule],
+    pub launchers: &'a [LauncherInfo],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -393,7 +399,7 @@ impl ReposPage {
                 }
                 Some(Ok(scan)) => match self.view {
                     View::Problems => self.problems_view(ui, scan, &mut action),
-                    _ => self.clones_view(ui, scan, (cx.tags, cx.rules), &mut action),
+                    _ => self.clones_view(ui, scan, (cx.tags, cx.rules), cx.launchers, &mut action),
                 },
             },
         }
@@ -670,6 +676,7 @@ impl ReposPage {
         ui: &mut egui::Ui,
         scan: &ScanResult,
         (tags, rules): (&TagIndex, &[Rule]),
+        launchers: &[LauncherInfo],
         action: &mut Option<ReposAction>,
     ) {
         if let Some(id) = self.selected
@@ -681,7 +688,7 @@ impl ReposPage {
                 .default_size(400.0)
                 .min_size(280.0)
                 .show(ui, |ui| {
-                    close = details(ui, clone, action);
+                    close = details(ui, clone, launchers, action);
                     ui.add_space(10.0);
                     tags_section(ui, clone.id, tags, rules, &mut self.new_tag, action);
                 });
@@ -1139,13 +1146,32 @@ fn tags_section(
     });
 }
 
-fn details(ui: &mut egui::Ui, clone: &CloneInfo, action: &mut Option<ReposAction>) -> bool {
+fn details(
+    ui: &mut egui::Ui,
+    clone: &CloneInfo,
+    launchers: &[LauncherInfo],
+    action: &mut Option<ReposAction>,
+) -> bool {
     let mut close = false;
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.heading(clone.display_name());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             close = ui.button("Close").clicked();
+            let apps: Vec<&LauncherInfo> = launchers.iter().filter(|l| l.each).collect();
+            ui.add_enabled_ui(!apps.is_empty(), |ui| {
+                ui.menu_button("Open in", |ui| {
+                    for app in apps {
+                        if ui.button(&app.name).clicked() {
+                            *action = Some(ReposAction::Open {
+                                launcher: app.name.clone(),
+                                clone_id: clone.id,
+                            });
+                            ui.close();
+                        }
+                    }
+                });
+            });
         });
     });
     ui.weak(clone.abs_path.display().to_string());
@@ -1675,6 +1701,7 @@ mod tests {
                         upstream_name: "upstream",
                         tags: &tags,
                         rules: &[],
+                        launchers: &[],
                     };
                     if let Some(action) = page.show(ui, cx) {
                         actions.push(action);
@@ -1794,6 +1821,11 @@ mod tests {
                             upstream_name: "upstream",
                             tags: &tags,
                             rules: &rules,
+                            launchers: &[LauncherInfo {
+                                name: "VS Code".into(),
+                                each: true,
+                                together: true,
+                            }],
                         };
                         if let Some(action) = page.show(ui, cx) {
                             actions.push(action);
@@ -1802,6 +1834,25 @@ mod tests {
                 },
                 (page, Vec::new()),
             )
+    }
+
+    #[test]
+    fn details_panel_opens_a_clone() {
+        let mut h = tagged_harness();
+        h.run();
+        h.get_by_label("facebook/react").click();
+        h.run();
+        h.get_by_label("Open in").click();
+        h.run();
+        h.get_by_label("VS Code").click();
+        h.run();
+        assert_eq!(
+            h.state().1,
+            vec![ReposAction::Open {
+                launcher: "VS Code".into(),
+                clone_id: 1
+            }]
+        );
     }
 
     #[test]

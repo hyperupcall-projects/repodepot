@@ -2,8 +2,9 @@
 
 use eframe::egui;
 
-use crate::backend::{AuthState, Backend, Command, DbInfo, FolderPurpose};
+use crate::backend::{AuthState, Backend, Command, DbInfo, FolderPurpose, LauncherInfo};
 use crate::config::{self, Config, Paths};
+use crate::launch::{self, LauncherSpec, WorkspaceKind};
 use crate::token::TokenSource;
 use crate::ui::thousands;
 
@@ -14,6 +15,8 @@ pub struct SettingsContext<'a> {
     pub auth: &'a AuthState,
     pub db: Option<&'a Result<DbInfo, String>>,
     pub backend: &'a Backend,
+    /// Launchers found on this computer.
+    pub launchers: &'a [LauncherInfo],
 }
 
 /// Edits happen on a draft; nothing is written until "Save settings".
@@ -28,6 +31,7 @@ pub struct SettingsPage {
     token_input: String,
     account_message: Option<Result<String, String>>,
     save_message: Option<Result<String, String>>,
+    workspaces_message: Option<Result<String, String>>,
 }
 
 impl SettingsPage {
@@ -41,6 +45,7 @@ impl SettingsPage {
             token_input: String::new(),
             account_message: None,
             save_message: None,
+            workspaces_message: None,
         };
         page.reset(config);
         page
@@ -109,6 +114,17 @@ impl SettingsPage {
 
         let shell = self.shell.trim();
         config.runner.shell = (!shell.is_empty()).then(|| shell.to_owned());
+
+        for (i, spec) in config.launch.custom.iter().enumerate() {
+            if let Err(e) = launch::validate(spec) {
+                let name = if spec.name.trim().is_empty() {
+                    format!("Launcher {}", i + 1)
+                } else {
+                    spec.name.trim().to_owned()
+                };
+                problems.push(format!("{name} {e}"));
+            }
+        }
 
         if problems.is_empty() {
             Ok(config)
@@ -185,6 +201,7 @@ impl SettingsPage {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
                 self.preferences(ui, cx.backend);
+                self.launchers(ui, &cx);
 
                 ui.add_space(20.0);
                 ui.heading("Storage");
@@ -459,7 +476,9 @@ impl SettingsPage {
             );
             ui.end_row();
         });
+    }
 
+    fn launchers(&mut self, ui: &mut egui::Ui, cx: &SettingsContext<'_>) {
         subheading(ui, "Opening repos");
         section_grid(ui, "launch", |ui| {
             ui.label("Ask before opening more than");
@@ -469,8 +488,138 @@ impl SettingsPage {
                     .suffix(" windows"),
             );
             ui.end_row();
+
+            ui.label("Found on this computer");
+            if cx.launchers.is_empty() {
+                ui.weak("None of the known editors");
+            } else {
+                let names: Vec<&str> = cx.launchers.iter().map(|l| l.name.as_str()).collect();
+                ui.label(names.join(", "));
+            }
+            ui.end_row();
+
+            ui.label("Workspace files");
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Delete workspace files")
+                    .on_hover_text(cx.paths.workspaces_dir.display().to_string())
+                    .clicked()
+                {
+                    self.workspaces_message = Some(
+                        launch::delete_workspaces(&cx.paths.workspaces_dir)
+                            .map(|n| format!("Deleted {n}."))
+                            .map_err(|e| format!("{e:#}")),
+                    );
+                }
+                match &self.workspaces_message {
+                    Some(Ok(text)) => {
+                        ui.weak(text);
+                    }
+                    Some(Err(text)) => {
+                        ui.colored_label(ui.visuals().error_fg_color, text);
+                    }
+                    None => {
+                        ui.weak("They're recreated the next time a group is opened together.");
+                    }
+                }
+            });
+            ui.end_row();
         });
+
+        ui.add_space(8.0);
+        ui.strong("Your own launchers");
+        ui.weak(
+            "Arguments use {path} for one folder, {paths} for every folder, and {workspace} for \
+             a workspace file (pick its kind). A launcher with the same name as a built-in one \
+             replaces it.",
+        );
+        let mut remove = None;
+        for (index, spec) in self.draft.launch.custom.iter_mut().enumerate() {
+            ui.push_id(("custom_launcher", index), |ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    egui::Grid::new("fields")
+                        .num_columns(2)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            let label = ui.label("Name");
+                            ui.add(egui::TextEdit::singleline(&mut spec.name).desired_width(200.0))
+                                .labelled_by(label.id);
+                            ui.end_row();
+
+                            let label = ui.label("Program");
+                            if spec.programs.is_empty() {
+                                spec.programs.push(String::new());
+                            }
+                            ui.add(
+                                egui::TextEdit::singleline(&mut spec.programs[0])
+                                    .hint_text("helix, or a full path")
+                                    .desired_width(200.0),
+                            )
+                            .labelled_by(label.id);
+                            ui.end_row();
+
+                            optional_args(ui, "Open each", &mut spec.each, "{path}");
+                            optional_args(ui, "Open together", &mut spec.together, "{paths}");
+
+                            let label = ui.label("Workspace file");
+                            egui::ComboBox::from_id_salt("workspace_kind")
+                                .selected_text(spec.workspace.label())
+                                .show_ui(ui, |ui| {
+                                    for kind in WorkspaceKind::ALL {
+                                        ui.selectable_value(
+                                            &mut spec.workspace,
+                                            kind,
+                                            kind.label(),
+                                        );
+                                    }
+                                })
+                                .response
+                                .labelled_by(label.id);
+                            ui.end_row();
+                        });
+                    if let Err(e) = launch::validate(spec) {
+                        ui.colored_label(ui.visuals().warn_fg_color, format!("This launcher {e}."));
+                    }
+                    if ui.small_button("Remove launcher").clicked() {
+                        remove = Some(index);
+                    }
+                });
+            });
+        }
+        if let Some(index) = remove {
+            self.draft.launch.custom.remove(index);
+        }
+        if ui.button("Add a launcher").clicked() {
+            self.draft.launch.custom.push(LauncherSpec {
+                name: String::new(),
+                programs: vec![String::new()],
+                flatpak: None,
+                requires: Vec::new(),
+                each: Some("{path}".to_owned()),
+                together: None,
+                workspace: WorkspaceKind::None,
+            });
+        }
     }
+}
+
+/// An optional argument string: empty means "this app can't do that".
+fn optional_args(ui: &mut egui::Ui, title: &str, value: &mut Option<String>, hint: &str) {
+    let label = ui.label(title);
+    let mut text = value.clone().unwrap_or_default();
+    if ui
+        .add(
+            egui::TextEdit::singleline(&mut text)
+                .font(egui::TextStyle::Monospace)
+                .hint_text(format!("e.g. -n {hint}; empty if it can't"))
+                .desired_width(260.0),
+        )
+        .labelled_by(label.id)
+        .changed()
+    {
+        *value = (!text.trim().is_empty()).then_some(text);
+    }
+    ui.end_row();
 }
 
 fn subheading(ui: &mut egui::Ui, title: &str) {
@@ -560,6 +709,24 @@ mod tests {
         page.draft.remotes.default_name = "upstream".into();
         let problems = page.build().unwrap_err();
         assert_eq!(problems.len(), 2, "{problems:?}");
+    }
+
+    #[test]
+    fn custom_launchers_must_be_valid() {
+        let mut page = SettingsPage::new(&Config::default());
+        page.draft.launch.custom.push(LauncherSpec {
+            name: "Helix".into(),
+            programs: vec!["hx".into()],
+            flatpak: None,
+            requires: Vec::new(),
+            each: Some("--open".into()),
+            together: None,
+            workspace: WorkspaceKind::None,
+        });
+        let problems = page.build().unwrap_err();
+        assert_eq!(problems, ["Helix its \"each\" arguments need {path}"]);
+        page.draft.launch.custom[0].each = Some("{path}".into());
+        assert!(page.build().is_ok());
     }
 
     #[test]

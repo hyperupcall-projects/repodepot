@@ -7,7 +7,9 @@ use egui_extras::{Column, TableBuilder};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as MatcherConfig, Matcher};
 
+use crate::backend::LauncherInfo;
 use crate::git::scan::CloneInfo;
+use crate::launch;
 use crate::tags::query::{self, Query};
 use crate::tags::{self, CloneFacts, Rule, RuleField, TagIndex, Tagging};
 
@@ -37,6 +39,13 @@ pub enum TagsAction {
         label: String,
         clone_ids: Vec<i64>,
     },
+    /// Open clones in an app, each in its own window or all together.
+    Open {
+        launcher: String,
+        together: bool,
+        clone_ids: Vec<i64>,
+        workspace_name: String,
+    },
 }
 
 pub struct TagsContext<'a> {
@@ -44,6 +53,9 @@ pub struct TagsContext<'a> {
     pub facts: &'a [CloneFacts],
     pub index: &'a TagIndex,
     pub rules: &'a [Rule],
+    pub launchers: &'a [LauncherInfo],
+    /// Ask before opening more windows than this.
+    pub confirm_over: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,6 +77,8 @@ pub struct TagsPage {
     tag_name: String,
     editor: Option<Rule>,
     error: Option<String>,
+    /// "Open each" waiting for confirmation: (launcher, clone IDs).
+    pending_open: Option<(String, Vec<i64>)>,
 }
 
 impl TagsPage {
@@ -79,6 +93,18 @@ impl TagsPage {
             tag_name: String::new(),
             editor: None,
             error: None,
+            pending_open: None,
+        }
+    }
+
+    /// Names the workspace file: the query when the set is exactly its result, otherwise a
+    /// hash of the clones, so the same group always reuses the same file.
+    fn workspace_name(&self, set: &[i64]) -> String {
+        let unchanged = self.excluded.is_empty() && self.extra.is_empty();
+        match self.query.trim() {
+            "*" if unchanged => "all-clones".to_owned(),
+            query if unchanged && !query.is_empty() => query.to_owned(),
+            _ => launch::set_name(set),
         }
     }
 
@@ -214,6 +240,7 @@ impl TagsPage {
 
         ui.add_space(4.0);
         self.set_actions(ui, &set, action);
+        self.open_actions(ui, cx, &set, action);
         self.picker(ui, cx, &rows);
         ui.add_space(4.0);
 
@@ -369,6 +396,80 @@ impl TagsPage {
                 });
             }
         });
+    }
+
+    fn open_actions(
+        &mut self,
+        ui: &mut egui::Ui,
+        cx: &TagsContext<'_>,
+        set: &[i64],
+        action: &mut Option<TagsAction>,
+    ) {
+        ui.horizontal(|ui| {
+            let each: Vec<&LauncherInfo> = cx.launchers.iter().filter(|l| l.each).collect();
+            let together: Vec<&LauncherInfo> = cx.launchers.iter().filter(|l| l.together).collect();
+            ui.add_enabled_ui(!set.is_empty() && !each.is_empty(), |ui| {
+                ui.menu_button("Open each", |ui| {
+                    for launcher in &each {
+                        if ui.button(&launcher.name).clicked() {
+                            if set.len() > cx.confirm_over {
+                                self.pending_open = Some((launcher.name.clone(), set.to_vec()));
+                            } else {
+                                *action = Some(TagsAction::Open {
+                                    launcher: launcher.name.clone(),
+                                    together: false,
+                                    clone_ids: set.to_vec(),
+                                    workspace_name: String::new(),
+                                });
+                            }
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("One window per repo");
+            });
+            ui.add_enabled_ui(!set.is_empty() && !together.is_empty(), |ui| {
+                ui.menu_button("Open together", |ui| {
+                    for launcher in &together {
+                        if ui.button(&launcher.name).clicked() {
+                            *action = Some(TagsAction::Open {
+                                launcher: launcher.name.clone(),
+                                together: true,
+                                clone_ids: set.to_vec(),
+                                workspace_name: self.workspace_name(set),
+                            });
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Every repo in one window, for apps that support workspaces");
+            });
+            if cx.launchers.is_empty() {
+                ui.weak("No editors found. Add one in Settings.");
+            }
+        });
+        if let Some((launcher, ids)) = self.pending_open.clone() {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("Open {} windows in {launcher}?", ids.len()),
+                );
+                if ui.button("Open them").clicked() {
+                    *action = Some(TagsAction::Open {
+                        launcher,
+                        together: false,
+                        clone_ids: ids,
+                        workspace_name: String::new(),
+                    });
+                    self.pending_open = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.pending_open = None;
+                }
+            });
+        }
     }
 
     /// Fuzzy search for clones to add to the working set.
@@ -665,6 +766,7 @@ mod tests {
         facts: Vec<CloneFacts>,
         rules: Vec<Rule>,
         index: TagIndex,
+        launchers: Vec<LauncherInfo>,
     }
 
     fn fixture() -> Fixture {
@@ -723,11 +825,17 @@ mod tests {
             (2, BTreeSet::from(["work".to_owned()])),
         ]);
         let index = TagIndex::build(&facts, &manual, &rules);
+        let launcher = |name: &str, together: bool| LauncherInfo {
+            name: name.into(),
+            each: true,
+            together,
+        };
         Fixture {
             clones,
             facts,
             rules,
             index,
+            launchers: vec![launcher("VS Code", true), launcher("Kate", false)],
         }
     }
 
@@ -742,6 +850,8 @@ mod tests {
                         facts: &fixture.facts,
                         index: &fixture.index,
                         rules: &fixture.rules,
+                        launchers: &fixture.launchers,
+                        confirm_over: 2,
                     };
                     if let Some(action) = page.show(ui, cx) {
                         actions.push(action);
@@ -885,6 +995,70 @@ mod tests {
                 TagsAction::DeleteRule(11),
             ]
         );
+    }
+
+    #[test]
+    fn opening_the_working_set() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.query = "lang:rust".into();
+        h.run();
+        h.get_by_label("Open each").click();
+        h.run();
+        h.get_by_label("VS Code").click();
+        h.run();
+        h.get_by_label("Open together").click();
+        h.run();
+        assert!(
+            h.query_by_label("Kate").is_none(),
+            "Kate can't open several in one window"
+        );
+        h.get_by_label("VS Code").click();
+        h.run();
+
+        // Over the limit (2 in this test) asks first.
+        h.state_mut().0.query = "*".into();
+        h.run();
+        h.get_by_label("Open each").click();
+        h.run();
+        h.get_by_label("Kate").click();
+        h.run();
+        assert!(h.query_by_label("Open 4 windows in Kate?").is_some());
+        h.get_by_label("Open them").click();
+        h.run();
+        assert_eq!(
+            h.state().2,
+            vec![
+                TagsAction::Open {
+                    launcher: "VS Code".into(),
+                    together: false,
+                    clone_ids: vec![1, 3],
+                    workspace_name: String::new(),
+                },
+                TagsAction::Open {
+                    launcher: "VS Code".into(),
+                    together: true,
+                    clone_ids: vec![1, 3],
+                    workspace_name: "lang:rust".into(),
+                },
+                TagsAction::Open {
+                    launcher: "Kate".into(),
+                    together: false,
+                    clone_ids: vec![1, 2, 3, 4],
+                    workspace_name: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_names() {
+        let mut page = TagsPage::new();
+        page.set_query("rust");
+        assert_eq!(page.workspace_name(&[1, 2]), "rust");
+        page.excluded.insert(2);
+        assert_eq!(page.workspace_name(&[1]), launch::set_name(&[1]));
+        page.set_query("*");
+        assert_eq!(page.workspace_name(&[1, 2]), "all-clones");
     }
 
     /// Renders the Tags tab when `DEPOSITORY_UI_SHOTS` names a folder.

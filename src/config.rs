@@ -126,11 +126,16 @@ impl Default for Runner {
 pub struct Launch {
     /// Ask before opening more than this many windows at once.
     pub confirm_over: u32,
+    /// Launchers added in Settings, listed before the built-in ones.
+    pub custom: Vec<crate::launch::LauncherSpec>,
 }
 
 impl Default for Launch {
     fn default() -> Self {
-        Self { confirm_over: 10 }
+        Self {
+            confirm_over: 10,
+            custom: Vec::new(),
+        }
     }
 }
 

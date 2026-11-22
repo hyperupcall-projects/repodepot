@@ -358,14 +358,19 @@ fn spawn(shell: &str, command: &str, target: &Target) -> std::io::Result<Child> 
     // Its own session (and so its own process group): cancelling reaches everything it
     // started, and nothing can read from the terminal the app was started in. Without a
     // terminal, ssh asks for passphrases through SSH_ASKPASS instead.
+    in_new_session(&mut command_builder);
+    command_builder.spawn()
+}
+
+/// Makes the process start its own session (and process group), with no controlling terminal.
+pub fn in_new_session(command: &mut Command) {
     // SAFETY: setsid is async-signal-safe and touches no memory of the parent.
     unsafe {
-        command_builder.pre_exec(|| {
+        command.pre_exec(|| {
             nix::unistd::setsid().map_err(std::io::Error::from)?;
             Ok(())
         });
     }
-    command_builder.spawn()
 }
 
 /// SIGTERM to the whole process group, then SIGKILL if it hasn't exited in time.

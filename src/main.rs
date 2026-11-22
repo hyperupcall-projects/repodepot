@@ -6,6 +6,7 @@ mod db;
 mod git;
 mod github;
 mod jobs;
+mod launch;
 mod layout;
 mod tags;
 mod token;

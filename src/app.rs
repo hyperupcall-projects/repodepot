@@ -2,7 +2,9 @@
 
 use eframe::egui;
 
-use crate::backend::{AuthState, Backend, Command, DbInfo, Event, FolderPurpose};
+use crate::backend::{
+    AuthState, Backend, Command, DbInfo, Event, FolderPurpose, LaunchRequest, LauncherInfo, Origin,
+};
 use crate::config::{Config, Paths};
 use crate::db::TagStore;
 use crate::tags::{CloneFacts, TagIndex};
@@ -47,6 +49,7 @@ pub struct App {
     /// What rules see about each scanned clone.
     facts: Vec<CloneFacts>,
     tag_index: TagIndex,
+    launchers: Vec<LauncherInfo>,
     auth: AuthState,
     db: Option<Result<DbInfo, String>>,
 }
@@ -73,6 +76,7 @@ impl App {
             tag_store: TagStore::default(),
             facts: Vec::new(),
             tag_index: TagIndex::default(),
+            launchers: Vec::new(),
             paths,
             backend,
             tab,
@@ -115,6 +119,11 @@ impl App {
                 self.rebuild_tags();
             }
             Event::TagActionFailed(message) => self.tags.action_failed(message),
+            Event::Launchers(launchers) => self.launchers = launchers,
+            Event::LaunchFailed { origin, message } => match origin {
+                Origin::Repos => self.repos.action_failed(message),
+                Origin::Tags => self.tags.action_failed(message),
+            },
             Event::RepoActionFailed(message) => self.repos.action_failed(message),
             Event::Snippets(snippets) => self.runner.set_snippets(snippets),
             Event::RunStarted(run) => self.runner.run_started(run),
@@ -177,6 +186,9 @@ impl App {
             }
             ReposAction::Import(moves) => self.backend.send(Command::Import(moves)),
             ReposAction::Tags(action) => self.handle_tags_action(action),
+            ReposAction::Open { launcher, clone_id } => {
+                self.launch(launcher, false, &[clone_id], String::new(), Origin::Repos);
+            }
             ReposAction::SetRemote {
                 path,
                 name,
@@ -214,8 +226,40 @@ impl App {
                 self.tab = Tab::Runner;
                 return;
             }
+            TagsAction::Open {
+                launcher,
+                together,
+                clone_ids,
+                workspace_name,
+            } => {
+                self.launch(launcher, together, &clone_ids, workspace_name, Origin::Tags);
+                return;
+            }
         };
         self.backend.send(command);
+    }
+
+    fn launch(
+        &self,
+        launcher: String,
+        together: bool,
+        clone_ids: &[i64],
+        workspace_name: String,
+        origin: Origin,
+    ) {
+        let clones = self.repos.clones().unwrap_or_default();
+        let targets = clone_ids
+            .iter()
+            .filter_map(|id| clones.iter().find(|c| c.id == *id))
+            .map(|c| (c.display_name(), c.abs_path.clone()))
+            .collect();
+        self.backend.send(Command::Launch(LaunchRequest {
+            launcher,
+            together,
+            targets,
+            workspace_name,
+            origin,
+        }));
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
@@ -301,6 +345,7 @@ impl eframe::App for App {
                     upstream_name: &self.config.remotes.upstream_name,
                     tags: &self.tag_index,
                     rules: &self.tag_store.rules,
+                    launchers: &self.launchers,
                 };
                 if let Some(action) = self.repos.show(ui, cx) {
                     self.handle_repos_action(action);
@@ -312,6 +357,8 @@ impl eframe::App for App {
                     facts: &self.facts,
                     index: &self.tag_index,
                     rules: &self.tag_store.rules,
+                    launchers: &self.launchers,
+                    confirm_over: self.config.launch.confirm_over as usize,
                 };
                 if let Some(action) = self.tags.show(ui, cx) {
                     self.handle_tags_action(action);
@@ -346,6 +393,7 @@ impl eframe::App for App {
                         auth: &self.auth,
                         db: self.db.as_ref(),
                         backend: &self.backend,
+                        launchers: &self.launchers,
                     },
                 );
                 if saved {

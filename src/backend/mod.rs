@@ -2,6 +2,7 @@
 //! egui to repaint. Slow work (network, keyring, database, processes) never runs on the UI thread.
 
 mod import;
+mod open;
 mod repos;
 
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, spawn_blocking};
 
 pub use import::ImportMove;
+pub use open::{LaunchRequest, LauncherInfo, Origin};
 pub use repos::SyncReport;
 
 use crate::config::{Config, Paths};
@@ -103,6 +105,8 @@ pub enum Command {
         clone_id: i64,
         excepted: bool,
     },
+    /// Open repos in an editor or other app.
+    Launch(LaunchRequest),
 }
 
 /// What a picked folder is for.
@@ -147,6 +151,12 @@ pub enum Event {
     Tags(TagStore),
     /// Something the user asked for on the Tags tab failed.
     TagActionFailed(String),
+    /// The apps that can open repos on this computer.
+    Launchers(Vec<LauncherInfo>),
+    LaunchFailed {
+        origin: Origin,
+        message: String,
+    },
 }
 
 pub struct DbInfo {
@@ -256,6 +266,9 @@ struct Shared {
     db: Option<Arc<Mutex<Db>>>,
     config: Mutex<Config>,
     last_run_id: AtomicU64,
+    /// Installed launchers, refreshed when custom ones change.
+    launchers: Mutex<Vec<crate::launch::Launcher>>,
+    workspaces_dir: PathBuf,
 }
 
 enum AuthJob {
@@ -279,6 +292,8 @@ async fn run(
         config: Mutex::new(config),
         emitter,
         last_run_id: AtomicU64::new(0),
+        launchers: Mutex::new(Vec::new()),
+        workspaces_dir: paths.workspaces_dir.clone(),
     });
 
     // Auth jobs run one at a time, in order.
@@ -348,6 +363,10 @@ async fn run(
         let _ = sync_tx.send(());
     }
     tokio::spawn(load_snippets(shared.clone()));
+    tokio::spawn({
+        let shared = shared.clone();
+        async move { open::detect_launchers(&shared).await }
+    });
 
     while let Some(command) = commands.recv().await {
         match command {
@@ -361,14 +380,30 @@ async fn run(
                 let _ = auth_tx.send(AuthJob::Forget);
             }
             Command::ConfigChanged(new) => {
-                let rescan = {
+                let (rescan, launchers_changed) = {
                     let mut config = lock(&shared.config);
-                    let changed = scan_inputs_differ(&config, &new);
+                    let changed = (
+                        scan_inputs_differ(&config, &new),
+                        config.launch.custom != new.launch.custom,
+                    );
                     *config = new;
                     changed
                 };
                 if rescan {
                     let _ = scan_tx.send(());
+                }
+                if launchers_changed {
+                    let shared = shared.clone();
+                    tokio::spawn(async move { open::detect_launchers(&shared).await });
+                }
+            }
+            Command::Launch(request) => {
+                let origin = request.origin;
+                if let Err(e) = open::open(&shared, request).await {
+                    shared.emitter.emit(Event::LaunchFailed {
+                        origin,
+                        message: format!("{e:#}"),
+                    });
                 }
             }
             Command::Scan => {
@@ -1250,6 +1285,118 @@ mod tests {
             _ => None,
         });
         assert!(store.rules[0].exceptions.contains(&id));
+
+        drop(backend);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Opens repos with a fake "editor" script that records its arguments.
+    #[test]
+    fn launching_end_to_end() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::launch::{LauncherSpec, WorkspaceKind};
+
+        let base =
+            std::env::temp_dir().join(format!("depository-launch-e2e-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let log = base.join("calls.log");
+        let editor = base.join("fake-editor");
+        fs::write(
+            &editor,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+        let broken = base.join("broken-editor");
+        fs::write(&broken, "#!/bin/sh\nexit 3\n").unwrap();
+        fs::set_permissions(&broken, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let spec = |name: &str, program: &PathBuf| LauncherSpec {
+            name: name.into(),
+            programs: vec![program.display().to_string()],
+            flatpak: None,
+            requires: Vec::new(),
+            each: Some("--one {path}".into()),
+            together: Some("--ws {workspace}".into()),
+            workspace: WorkspaceKind::VsCode,
+        };
+        let paths = Paths {
+            config_file: base.join("config.toml"),
+            db_file: base.join("data/depository.db"),
+            workspaces_dir: base.join("data/workspaces"),
+        };
+        let mut config = Config::default();
+        config.launch.custom = vec![spec("Fake", &editor), spec("Broken", &broken)];
+        let backend = Backend::start(egui::Context::default(), paths, config);
+        let launchers = wait_for(&backend, "the launchers", |event| match event {
+            Event::Launchers(list) => Some(list),
+            _ => None,
+        });
+        assert_eq!(&launchers[0].name, "Fake");
+        assert!(launchers[0].each && launchers[0].together);
+
+        let targets = vec![
+            ("me/api".to_owned(), PathBuf::from("/code/a/api")),
+            ("me/web".to_owned(), PathBuf::from("/code/w/web")),
+        ];
+        let request = |launcher: &str, together: bool| {
+            Command::Launch(LaunchRequest {
+                launcher: launcher.into(),
+                together,
+                targets: targets.clone(),
+                workspace_name: "lang:rust".into(),
+                origin: Origin::Tags,
+            })
+        };
+        backend.send(request("Fake", false));
+        backend.send(request("Fake", true));
+        wait_until("three launches", || {
+            fs::read_to_string(&log).is_ok_and(|text| text.lines().count() == 3)
+        });
+        let mut calls: Vec<String> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        calls.sort();
+        let workspace = base.join("data/workspaces/lang-rust.code-workspace");
+        assert_eq!(
+            calls,
+            [
+                "--one /code/a/api".to_owned(),
+                "--one /code/w/web".to_owned(),
+                format!("--ws {}", workspace.display()),
+            ]
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&workspace).unwrap()).unwrap();
+        assert_eq!(json["folders"][1]["name"], "me/web");
+
+        backend.send(request("Broken", false));
+        let failure = wait_for(&backend, "the failure", |event| match event {
+            Event::LaunchFailed { origin, message } => Some((origin, message)),
+            _ => None,
+        });
+        assert_eq!(failure.0, Origin::Tags);
+        assert!(
+            failure
+                .1
+                .contains("broken-editor stopped with exit status: 3"),
+            "{}",
+            failure.1
+        );
+
+        backend.send(request("Nope", false));
+        // (The broken editor fails once per repo, so skip its second report.)
+        let missing = wait_for(&backend, "the missing launcher", |event| match event {
+            Event::LaunchFailed { message, .. } if message.contains("isn't installed") => {
+                Some(message)
+            }
+            _ => None,
+        });
+        assert!(missing.contains("isn't installed"));
 
         drop(backend);
         let _ = fs::remove_dir_all(&base);
