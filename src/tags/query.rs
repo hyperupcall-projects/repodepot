@@ -1,11 +1,14 @@
 //! Tag queries: `rust AND work`, `rust OR go`, `work AND NOT archived`, parentheses.
-//! Adjacent terms mean AND; `*` matches every clone. Keywords are case-insensitive.
+//! Adjacent terms mean AND; `*` matches everything and `untagged` matches what has no tags.
+//! Keywords are case-insensitive.
 
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Query {
     All,
+    /// No tags at all, manual or automatic.
+    Untagged,
     Tag(String),
     Not(Box<Query>),
     And(Vec<Query>),
@@ -16,6 +19,7 @@ impl Query {
     pub fn matches(&self, tags: &BTreeSet<String>) -> bool {
         match self {
             Query::All => true,
+            Query::Untagged => tags.is_empty(),
             Query::Tag(tag) => tags.contains(tag),
             Query::Not(inner) => !inner.matches(tags),
             Query::And(parts) => parts.iter().all(|p| p.matches(tags)),
@@ -26,7 +30,7 @@ impl Query {
     /// Every tag name the query mentions.
     pub fn tags(&self) -> Vec<&str> {
         match self {
-            Query::All => Vec::new(),
+            Query::All | Query::Untagged => Vec::new(),
             Query::Tag(tag) => vec![tag],
             Query::Not(inner) => inner.tags(),
             Query::And(parts) | Query::Or(parts) => parts.iter().flat_map(Query::tags).collect(),
@@ -42,6 +46,7 @@ enum Token {
     Or,
     Not,
     All,
+    Untagged,
     Word(String),
 }
 
@@ -57,6 +62,7 @@ fn tokenize(text: &str) -> Vec<Token> {
             "or" => Token::Or,
             "not" => Token::Not,
             "*" => Token::All,
+            "untagged" => Token::Untagged,
             lower => Token::Word(lower.to_owned()),
         });
         word.clear();
@@ -100,6 +106,7 @@ fn describe(token: &Token) -> String {
         Token::Or => "OR".into(),
         Token::Not => "NOT".into(),
         Token::All => "*".into(),
+        Token::Untagged => "UNTAGGED".into(),
         Token::Word(w) => format!("\"{w}\""),
     }
 }
@@ -136,7 +143,7 @@ impl Parser {
                     parts.push(self.not()?);
                 }
                 // Two terms side by side mean AND.
-                Some(Token::Word(_) | Token::Not | Token::Open | Token::All) => {
+                Some(Token::Word(_) | Token::Not | Token::Open | Token::All | Token::Untagged) => {
                     parts.push(self.not()?);
                 }
                 _ => break,
@@ -163,6 +170,7 @@ impl Parser {
         match token {
             Some(Token::Word(word)) => Ok(Query::Tag(word)),
             Some(Token::All) => Ok(Query::All),
+            Some(Token::Untagged) => Ok(Query::Untagged),
             Some(Token::Open) => {
                 let inner = self.or()?;
                 if self.peek() != Some(&Token::Close) {
@@ -205,6 +213,16 @@ mod tests {
         assert!(matches("*", &[]));
         assert!(matches("* NOT archived", &["rust"]));
         assert!(matches("RUST", &["rust"]), "tags are lowercase");
+    }
+
+    #[test]
+    fn untagged_matches_only_what_has_no_tags() {
+        assert!(matches("untagged", &[]));
+        assert!(!matches("untagged", &["rust"]));
+        assert!(matches("NOT untagged", &["rust"]));
+        assert!(matches("Untagged OR work", &["work"]));
+        assert!(matches("untagged OR work", &[]));
+        assert_eq!(parse("untagged OR work").unwrap().tags(), ["work"]);
     }
 
     #[test]

@@ -1,4 +1,6 @@
-//! Tags: manual ones stored per clone, and automatic ones computed from rules every time.
+//! Tags: manual ones stored per clone or per repo, and automatic ones computed from rules
+//! every time. A clone's manual tags are its own plus its repo's, so a repo tagged before it's
+//! cloned keeps those tags once it is.
 
 pub mod query;
 
@@ -6,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use regex::{Regex, RegexBuilder};
 
-use crate::db::RepoFacts;
+use crate::db::{RepoFacts, RepoRow};
 use crate::git::scan::CloneInfo;
 use crate::layout;
 
@@ -124,7 +126,7 @@ impl Rule {
 }
 
 /// Cleans up a tag name: trimmed, lowercase, spaces become `-`. Names that would confuse
-/// queries (empty, parentheses, quotes, `and`/`or`/`not`, `*`) are refused.
+/// queries (empty, parentheses, quotes, `and`/`or`/`not`/`untagged`, `*`) are refused.
 pub fn normalize_tag(raw: &str) -> Result<String, String> {
     let tag: String = raw
         .trim()
@@ -141,16 +143,17 @@ pub fn normalize_tag(raw: &str) -> Result<String, String> {
     {
         return Err(format!("Tags can't contain '{bad}'."));
     }
-    if matches!(tag.as_str(), "and" | "or" | "not") {
+    if matches!(tag.as_str(), "and" | "or" | "not" | "untagged") {
         return Err(format!("\"{tag}\" is reserved for queries."));
     }
     Ok(tag)
 }
 
-/// What rules can see about a clone.
+/// What rules can see about a clone, or about a repo that isn't cloned.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CloneFacts {
-    pub clone_id: i64,
+    /// The clone's ID, or the repo's in an index of repos that aren't cloned.
+    pub id: i64,
     /// `owner/name`, or the folder name for clones without a hosted remote.
     pub full_name: String,
     pub owner: Option<String>,
@@ -169,7 +172,7 @@ impl CloneFacts {
         let url = clone.repo();
         let (folder, _) = layout::split_suffix(clone.folder_name());
         Self {
-            clone_id: clone.id,
+            id: clone.id,
             full_name: clone.display_name(),
             owner: url.map(|u| u.owner.clone()),
             name: url.map_or_else(|| folder.to_owned(), |u| u.name.clone()),
@@ -180,6 +183,40 @@ impl CloneFacts {
             is_private: repo.and_then(|r| r.is_private),
         }
     }
+
+    /// Facts for a repo that isn't cloned, as the last sync described it.
+    pub fn from_repo(repo: &RepoRow) -> Self {
+        Self {
+            id: repo.id,
+            full_name: repo.full_name(),
+            owner: Some(repo.owner.clone()),
+            name: repo.name.clone(),
+            language: repo.language.clone(),
+            topics: repo.topics.clone(),
+            is_fork: Some(repo.is_fork),
+            is_archived: Some(repo.is_archived),
+            is_private: Some(repo.is_private),
+        }
+    }
+}
+
+/// Each clone's manual tags: its own plus its repo's, so tags given to a repo before it was
+/// cloned stay with it. `clones` is (clone ID, repo ID).
+pub fn clone_manual_tags(
+    clone_tags: &HashMap<i64, BTreeSet<String>>,
+    repo_tags: &HashMap<i64, BTreeSet<String>>,
+    clones: impl IntoIterator<Item = (i64, Option<i64>)>,
+) -> HashMap<i64, BTreeSet<String>> {
+    let mut manual = clone_tags.clone();
+    for (clone, repo) in clones {
+        if let Some(tags) = repo.and_then(|id| repo_tags.get(&id)) {
+            manual
+                .entry(clone)
+                .or_default()
+                .extend(tags.iter().cloned());
+        }
+    }
+    manual
 }
 
 /// A rule ready to apply.
@@ -274,7 +311,7 @@ impl CompiledRule {
     }
 }
 
-/// One clone's tags.
+/// One clone's (or repo's) tags.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tagging {
     pub manual: BTreeSet<String>,
@@ -290,19 +327,35 @@ impl Tagging {
             .cloned()
             .collect()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.manual.is_empty() && self.auto.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TagCount {
-    /// Clones with the tag at all.
+    /// Clones (or repos) with the tag at all.
     pub total: usize,
     pub manual: usize,
     pub auto: usize,
 }
 
+/// Adds one clone's (or repo's) tags to per-tag counts.
+fn count_tagging(counts: &mut BTreeMap<String, TagCount>, tagging: &Tagging) {
+    for tag in tagging.all() {
+        let count = counts.entry(tag.clone()).or_default();
+        count.total += 1;
+        count.manual += usize::from(tagging.manual.contains(&tag));
+        count.auto += usize::from(tagging.auto.contains_key(&tag));
+    }
+}
+
 /// Every clone's tags, plus per-tag counts. Rebuilt whenever clones, tags or rules change.
+/// The same type indexes repos that aren't cloned, keyed by repo ID.
 #[derive(Default)]
 pub struct TagIndex {
+    /// By clone ID (or repo ID, in an index of repos).
     pub by_clone: HashMap<i64, Tagging>,
     pub counts: BTreeMap<String, TagCount>,
     /// Rules that don't compile (only possible if the database was edited by hand).
@@ -310,10 +363,30 @@ pub struct TagIndex {
 }
 
 impl TagIndex {
+    /// Tags of scanned clones.
     pub fn build(
         clones: &[CloneFacts],
         manual: &HashMap<i64, BTreeSet<String>>,
         rules: &[Rule],
+    ) -> Self {
+        Self::build_with(clones, manual, rules, true)
+    }
+
+    /// Tags of repos that aren't cloned, by repo ID. Rules apply to them as they do to
+    /// clones, but exceptions don't: those are made for one clone.
+    pub fn build_for_repos(
+        repos: &[CloneFacts],
+        manual: &HashMap<i64, BTreeSet<String>>,
+        rules: &[Rule],
+    ) -> Self {
+        Self::build_with(repos, manual, rules, false)
+    }
+
+    fn build_with(
+        subjects: &[CloneFacts],
+        manual: &HashMap<i64, BTreeSet<String>>,
+        rules: &[Rule],
+        exceptions: bool,
     ) -> Self {
         let mut index = TagIndex::default();
         let mut compiled = Vec::new();
@@ -325,25 +398,44 @@ impl TagIndex {
                 }
             }
         }
-        for facts in clones {
+        for facts in subjects {
             let mut tagging = Tagging {
-                manual: manual.get(&facts.clone_id).cloned().unwrap_or_default(),
+                manual: manual.get(&facts.id).cloned().unwrap_or_default(),
                 auto: BTreeMap::new(),
             };
-            for rule in compiled.iter().filter(|r| r.applies_to(facts.clone_id)) {
+            let applies = |rule: &&CompiledRule| {
+                if exceptions {
+                    rule.applies_to(facts.id)
+                } else {
+                    rule.enabled
+                }
+            };
+            for rule in compiled.iter().filter(applies) {
                 for tag in rule.tags_for(facts) {
                     tagging.auto.entry(tag).or_default().push(rule.id);
                 }
             }
-            for tag in tagging.all() {
-                let count = index.counts.entry(tag.clone()).or_default();
-                count.total += 1;
-                count.manual += usize::from(tagging.manual.contains(&tag));
-                count.auto += usize::from(tagging.auto.contains_key(&tag));
-            }
-            index.by_clone.insert(facts.clone_id, tagging);
+            count_tagging(&mut index.counts, &tagging);
+            index.by_clone.insert(facts.id, tagging);
         }
         index
+    }
+
+    /// Per-tag counts over some of the indexed IDs, added to `counts`.
+    pub fn count_into(
+        &self,
+        ids: impl IntoIterator<Item = i64>,
+        counts: &mut BTreeMap<String, TagCount>,
+    ) {
+        for id in ids {
+            if let Some(tagging) = self.by_clone.get(&id) {
+                count_tagging(counts, tagging);
+            }
+        }
+    }
+
+    pub fn is_untagged(&self, id: i64) -> bool {
+        self.by_clone.get(&id).is_none_or(Tagging::is_empty)
     }
 
     pub fn tags_of(&self, clone_id: i64) -> BTreeSet<String> {
@@ -361,7 +453,7 @@ mod tests {
     fn facts(id: i64, full: &str, language: Option<&str>) -> CloneFacts {
         let (owner, name) = full.split_once('/').unwrap();
         CloneFacts {
-            clone_id: id,
+            id,
             full_name: full.into(),
             owner: Some(owner.into()),
             name: name.into(),
@@ -402,6 +494,7 @@ mod tests {
         assert!(normalize_tag("a(b").is_err());
         assert!(normalize_tag("AND").is_err());
         assert!(normalize_tag("*").is_err());
+        assert!(normalize_tag("Untagged").is_err());
     }
 
     #[test]
@@ -493,5 +586,70 @@ mod tests {
         );
         assert!(index.by_clone[&2].auto.contains_key("typescript"));
         assert!(!index.counts.contains_key("mine"));
+    }
+
+    #[test]
+    fn clones_have_their_repos_tags_too() {
+        let set = |tags: &[&str]| {
+            tags.iter()
+                .map(|t| (*t).to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        let clone_tags = HashMap::from([(1, set(&["work"]))]);
+        let repo_tags = HashMap::from([(10, set(&["later", "work"])), (11, set(&["x"]))]);
+        let manual = clone_manual_tags(
+            &clone_tags,
+            &repo_tags,
+            [(1, Some(10)), (2, Some(10)), (3, None), (4, Some(99))],
+        );
+        assert_eq!(manual[&1], set(&["later", "work"]));
+        assert_eq!(manual[&2], set(&["later", "work"]));
+        assert!(!manual.contains_key(&3) && !manual.contains_key(&4));
+    }
+
+    #[test]
+    fn repo_index_applies_rules_but_not_clone_exceptions() {
+        let repo = RepoRow {
+            id: 1,
+            owner: "me".into(),
+            name: "api".into(),
+            description: None,
+            language: Some("Rust".into()),
+            topics: Vec::new(),
+            is_fork: false,
+            is_archived: true,
+            is_private: false,
+            pushed_at: None,
+            stars: None,
+            sources: Vec::new(),
+            fork_of: None,
+        };
+        let mut lang = rule(10, RuleField::Language, "(.+)", "lang:$1");
+        lang.exceptions.insert(1); // clone 1, which isn't repo 1
+        let archived = rule(11, RuleField::Archived, "yes", "archived");
+        let manual = HashMap::from([(1, BTreeSet::from(["later".to_owned()]))]);
+        let index = TagIndex::build_for_repos(
+            &[
+                CloneFacts::from_repo(&repo),
+                CloneFacts {
+                    id: 2,
+                    ..Default::default()
+                },
+            ],
+            &manual,
+            &[lang, archived],
+        );
+        assert_eq!(
+            index.tags_of(1),
+            BTreeSet::from(["archived".into(), "lang:rust".into(), "later".into()])
+        );
+        assert!(!index.is_untagged(1));
+        assert!(index.is_untagged(2));
+        assert!(index.is_untagged(99), "unknown IDs have no tags");
+
+        let mut counts = BTreeMap::new();
+        index.count_into([1, 2], &mut counts);
+        assert_eq!(counts["later"].manual, 1);
+        assert_eq!(counts.len(), 3);
     }
 }

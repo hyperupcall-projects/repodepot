@@ -1,13 +1,16 @@
 //! The Remote List, Ignored and Forks views of the Repositories tab.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use crate::db::{Catalog, ForkDecision, RepoRow};
+use crate::tags::query::Query;
+use crate::tags::{self, TagIndex};
 use crate::ui::repos::ReposAction;
+use crate::ui::tags::{TagsAction, tag_summary};
 use crate::ui::{sort_header, thousands};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,6 +27,7 @@ enum SortKey {
     Language,
     Stars,
     Pushed,
+    Tags,
     Description,
 }
 
@@ -40,6 +44,8 @@ pub struct ListState {
     sort: SortKey,
     descending: bool,
     hide_archived: bool,
+    /// The "Tag" field for tagging the selected repos.
+    tag_name: String,
 }
 
 impl ListState {
@@ -49,6 +55,7 @@ impl ListState {
             sort: SortKey::Name,
             descending: false,
             hide_archived: false,
+            tag_name: String::new(),
         }
     }
 
@@ -120,9 +127,28 @@ fn present_first<T>(
     }
 }
 
-/// Sorts by `key`. Rows without that value (no language, stars not fetched yet, …) go last
-/// in both directions; ties go by name.
-fn sort_rows(rows: &mut [&RepoRow], key: SortKey, descending: bool) {
+/// Sorts by `key`. Rows without that value (no language, no tags, stars not fetched yet, …)
+/// go last in both directions; ties go by name.
+fn sort_rows(rows: &mut [&RepoRow], key: SortKey, descending: bool, tags: &TagIndex) {
+    // Joined once up front rather than on every comparison.
+    let tag_text: HashMap<i64, String> = if key == SortKey::Tags {
+        rows.iter()
+            .map(|r| {
+                (
+                    r.id,
+                    tags.tags_of(r.id).into_iter().collect::<Vec<_>>().join(" "),
+                )
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let joined = |r: &RepoRow| {
+        tag_text
+            .get(&r.id)
+            .map(String::as_str)
+            .filter(|t| !t.is_empty())
+    };
     rows.sort_by(|a, b| {
         let order = match key {
             SortKey::Name => present_first(Some(a), Some(b), descending, |x, y| by_name(x, y)),
@@ -144,6 +170,7 @@ fn sort_rows(rows: &mut [&RepoRow], key: SortKey, descending: bool) {
                 descending,
                 Ord::cmp,
             ),
+            SortKey::Tags => present_first(joined(a), joined(b), descending, Ord::cmp),
             SortKey::Description => present_first(
                 text(&a.description),
                 text(&b.description),
@@ -155,22 +182,39 @@ fn sort_rows(rows: &mut [&RepoRow], key: SortKey, descending: bool) {
     });
 }
 
-/// The Remote List or Ignored list: select rows, then Clone / Ignore / Un-ignore them.
+/// What the Remote List and Ignored lists need besides their rows.
+pub struct ListContext<'a> {
+    /// The text filter.
+    pub filter: &'a str,
+    /// The tag filter, when one is typed and valid.
+    pub tag_query: Option<&'a Query>,
+    /// Tags of repos that aren't cloned, by repo ID.
+    pub tags: &'a TagIndex,
+    /// Repo IDs with a clone run in progress.
+    pub cloning: &'a HashSet<i64>,
+}
+
+/// The Remote List or Ignored list: select rows, then Clone / Ignore / Un-ignore or tag them.
 pub fn repo_list(
     ui: &mut egui::Ui,
     kind: ListKind,
     rows: &[RepoRow],
     state: &mut ListState,
-    filter: &str,
-    cloning: &HashSet<i64>,
+    cx: &ListContext<'_>,
     action: &mut Option<ReposAction>,
 ) {
-    let needle = filter.trim().to_lowercase();
+    let needle = cx.filter.trim().to_lowercase();
     let mut shown: Vec<&RepoRow> = rows
         .iter()
-        .filter(|r| matches(r, &needle) && !(state.hide_archived && r.is_archived))
+        .filter(|r| {
+            matches(r, &needle)
+                && !(state.hide_archived && r.is_archived)
+                && cx
+                    .tag_query
+                    .is_none_or(|q| q.matches(&cx.tags.tags_of(r.id)))
+        })
         .collect();
-    sort_rows(&mut shown, state.sort, state.descending);
+    sort_rows(&mut shown, state.sort, state.descending, cx.tags);
 
     ui.horizontal(|ui| {
         if ui
@@ -191,7 +235,7 @@ pub fn repo_list(
         ui.separator();
         let count = state.selected.len();
         ui.label(format!("{count} selected"));
-        let ids = || state.selected.iter().copied().collect::<Vec<i64>>();
+        let ids = |state: &ListState| state.selected.iter().copied().collect::<Vec<i64>>();
         match kind {
             ListKind::Remote => {
                 if ui
@@ -199,7 +243,7 @@ pub fn repo_list(
                     .on_hover_text("Clone over SSH into the clone root's layout")
                     .clicked()
                 {
-                    *action = Some(ReposAction::Clone(ids()));
+                    *action = Some(ReposAction::Clone(ids(state)));
                 }
                 if ui
                     .add_enabled(count > 0, egui::Button::new("Ignore"))
@@ -207,7 +251,7 @@ pub fn repo_list(
                     .clicked()
                 {
                     *action = Some(ReposAction::SetIgnored {
-                        repo_ids: ids(),
+                        repo_ids: ids(state),
                         ignored: true,
                     });
                 }
@@ -218,14 +262,58 @@ pub fn repo_list(
                     .clicked()
                 {
                     *action = Some(ReposAction::SetIgnored {
-                        repo_ids: ids(),
+                        repo_ids: ids(state),
                         ignored: false,
                     });
                 }
             }
         }
+        // These rows leave the list, so nothing stays selected.
         if action.is_some() {
             state.selected.clear();
+        }
+
+        // Tagging keeps the selection, so several tags can go on the same repos.
+        ui.separator();
+        let label = ui.label("Tag");
+        let field = ui
+            .add(
+                egui::TextEdit::singleline(&mut state.tag_name)
+                    .hint_text("tag name")
+                    .desired_width(120.0),
+            )
+            .labelled_by(label.id);
+        let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let valid = tags::normalize_tag(&state.tag_name);
+        let enabled = count > 0 && valid.is_ok();
+        let why_not = match &valid {
+            _ if count == 0 => "Select repos first".to_owned(),
+            Err(e) => e.clone(),
+            Ok(_) => String::new(),
+        };
+        let add = ui
+            .add_enabled(enabled, egui::Button::new("Add tag"))
+            .on_hover_text("Tag the selected repos; a repo keeps its tags once it's cloned")
+            .on_disabled_hover_text(&why_not)
+            .clicked();
+        if (add || entered) && enabled {
+            *action = Some(ReposAction::Tags(TagsAction::AddTag {
+                clone_ids: Vec::new(),
+                repo_ids: ids(state),
+                tag: std::mem::take(&mut state.tag_name),
+            }));
+        }
+        if ui
+            .add_enabled(enabled, egui::Button::new("Remove tag"))
+            .on_hover_text("Removes manual tags only; tags from rules stay")
+            .on_disabled_hover_text(&why_not)
+            .clicked()
+        {
+            *action = Some(ReposAction::Tags(TagsAction::RemoveTag {
+                clone_ids: Vec::new(),
+                repo_ids: ids(state),
+                tag: std::mem::take(&mut state.tag_name),
+            }));
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -255,13 +343,13 @@ pub fn repo_list(
                 .sense(egui::Sense::click())
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .column(
-                    Column::initial(300.0)
+                    Column::initial(280.0)
                         .at_least(140.0)
                         .clip(true)
                         .resizable(true),
                 )
                 .column(
-                    Column::initial(170.0)
+                    Column::initial(150.0)
                         .at_least(80.0)
                         .clip(true)
                         .resizable(true),
@@ -274,6 +362,12 @@ pub fn repo_list(
                 )
                 .column(Column::initial(75.0).at_least(65.0))
                 .column(Column::initial(100.0).at_least(90.0))
+                .column(
+                    Column::initial(150.0)
+                        .at_least(60.0)
+                        .clip(true)
+                        .resizable(true),
+                )
                 .column(Column::remainder().at_least(120.0).clip(true))
                 .header(24.0, |mut header| {
                     for (title, key) in [
@@ -282,6 +376,7 @@ pub fn repo_list(
                         ("Language", SortKey::Language),
                         ("Stars", SortKey::Stars),
                         ("Last push", SortKey::Pushed),
+                        ("Tags", SortKey::Tags),
                         ("Description", SortKey::Description),
                     ] {
                         header.col(|ui| state.header(ui, title, key));
@@ -292,7 +387,7 @@ pub fn repo_list(
                         let repo = shown[row.index()];
                         let selected = state.selected.contains(&repo.id);
                         row.set_selected(selected);
-                        row.col(|ui| name_cell(ui, repo, cloning.contains(&repo.id)));
+                        row.col(|ui| name_cell(ui, repo, cx.cloning.contains(&repo.id)));
                         row.col(|ui| {
                             let labels: Vec<&str> =
                                 repo.sources.iter().map(|s| s.label()).collect();
@@ -316,6 +411,11 @@ pub fn repo_list(
                                 .as_deref()
                                 .map_or("", |d| &d[..d.len().min(10)]);
                             ui.weak(date);
+                        });
+                        row.col(|ui| {
+                            if let Some(tagging) = cx.tags.by_clone.get(&repo.id) {
+                                tag_summary(ui, tagging);
+                            }
                         });
                         row.col(|ui| {
                             let description = repo.description.as_deref().unwrap_or("");
@@ -533,7 +633,7 @@ mod tests {
         let rows = [&big, &unsynced, &small];
         let order = |key, descending| {
             let mut sorted = rows.to_vec();
-            sort_rows(&mut sorted, key, descending);
+            sort_rows(&mut sorted, key, descending, &TagIndex::default());
             sorted.iter().map(|r| r.id).collect::<Vec<_>>()
         };
         assert_eq!(order(SortKey::Stars, true), [1, 3, 2]);

@@ -1,6 +1,6 @@
 //! The Tags tab: groups (tag sidebar, query, working set) and rules.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -8,19 +8,24 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as MatcherConfig, Matcher};
 
 use crate::backend::LauncherInfo;
+use crate::db::RepoRow;
 use crate::git::scan::CloneInfo;
 use crate::launch;
 use crate::tags::query::{self, Query};
-use crate::tags::{self, CloneFacts, Rule, RuleField, TagIndex, Tagging};
+use crate::tags::{self, CloneFacts, Rule, RuleField, TagCount, TagIndex, Tagging};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum TagsAction {
+    /// Add a manual tag to clones and to repos that aren't cloned.
     AddTag {
         clone_ids: Vec<i64>,
+        repo_ids: Vec<i64>,
         tag: String,
     },
+    /// Remove a manual tag from clones (and their repos) and from repos.
     RemoveTag {
         clone_ids: Vec<i64>,
+        repo_ids: Vec<i64>,
         tag: String,
     },
     SaveRule(Rule),
@@ -50,8 +55,12 @@ pub enum TagsAction {
 
 pub struct TagsContext<'a> {
     pub clones: &'a [CloneInfo],
+    /// Repos in the Remote List: listed, not cloned, not ignored.
+    pub repos: &'a [RepoRow],
     pub facts: &'a [CloneFacts],
     pub index: &'a TagIndex,
+    /// Tags of repos that aren't cloned, by repo ID.
+    pub repo_index: &'a TagIndex,
     pub rules: &'a [Rule],
     pub launchers: &'a [LauncherInfo],
     /// Ask before opening more windows than this.
@@ -64,15 +73,76 @@ enum View {
     Rules,
 }
 
+/// One entry of the working set: a clone, or a repo that isn't cloned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Item {
+    Clone(i64),
+    Repo(i64),
+}
+
+#[derive(Clone, Copy)]
+enum Row<'a> {
+    Clone(&'a CloneInfo),
+    Repo(&'a RepoRow),
+}
+
+impl Row<'_> {
+    fn item(self) -> Item {
+        match self {
+            Row::Clone(clone) => Item::Clone(clone.id),
+            Row::Repo(repo) => Item::Repo(repo.id),
+        }
+    }
+
+    fn name(self) -> String {
+        match self {
+            Row::Clone(clone) => clone.display_name(),
+            Row::Repo(repo) => repo.full_name(),
+        }
+    }
+
+    fn tagging<'i>(self, cx: &'i TagsContext<'_>) -> Option<&'i Tagging> {
+        match self {
+            Row::Clone(clone) => cx.index.by_clone.get(&clone.id),
+            Row::Repo(repo) => cx.repo_index.by_clone.get(&repo.id),
+        }
+    }
+}
+
+/// The clone IDs and the repo IDs in a set of items.
+fn split(items: &[Item]) -> (Vec<i64>, Vec<i64>) {
+    let mut clones = Vec::new();
+    let mut repos = Vec::new();
+    for item in items {
+        match item {
+            Item::Clone(id) => clones.push(*id),
+            Item::Repo(id) => repos.push(*id),
+        }
+    }
+    (clones, repos)
+}
+
+/// "3 clones", or "3 clones and 2 repos not cloned".
+fn describe_count(clones: usize, repos: usize, include_repos: bool) -> String {
+    let clones = plural(clones, "clone", "clones");
+    if include_repos {
+        format!("{clones} and {} not cloned", plural(repos, "repo", "repos"))
+    } else {
+        clones
+    }
+}
+
 pub struct TagsPage {
     view: View,
     query: String,
     /// The last parsed query, keyed by its text.
     parsed: Option<(String, Result<Query, String>)>,
+    /// Also list repos from the Remote List, which can be tagged but not opened or run on.
+    include_repos: bool,
     /// Query matches unticked from the working set.
-    excluded: HashSet<i64>,
-    /// Clones added to the working set by hand.
-    extra: Vec<i64>,
+    excluded: HashSet<Item>,
+    /// Clones (or repos) added to the working set by hand.
+    extra: Vec<Item>,
     picker: String,
     tag_name: String,
     editor: Option<Rule>,
@@ -87,6 +157,7 @@ impl TagsPage {
             view: View::Groups,
             query: String::new(),
             parsed: None,
+            include_repos: false,
             excluded: HashSet::new(),
             extra: Vec::new(),
             picker: String::new(),
@@ -98,7 +169,7 @@ impl TagsPage {
     }
 
     /// Names the workspace file: the query when the set is exactly its result, otherwise a
-    /// hash of the clones, so the same group always reuses the same file.
+    /// hash of the clones, so the same group always reuses the same file. `set` is clone IDs.
     fn workspace_name(&self, set: &[i64]) -> String {
         let unchanged = self.excluded.is_empty() && self.extra.is_empty();
         match self.query.trim() {
@@ -162,18 +233,36 @@ impl TagsPage {
     }
 
     fn groups(&mut self, ui: &mut egui::Ui, cx: &TagsContext<'_>, action: &mut Option<TagsAction>) {
+        let include = self.include_repos;
+        // Tag counts over the Remote List's repos (the repo index also holds Ignored ones).
+        let mut repo_counts = BTreeMap::new();
+        cx.repo_index
+            .count_into(cx.repos.iter().map(|r| r.id), &mut repo_counts);
+        let counts: BTreeMap<String, TagCount> = if include {
+            let mut merged = cx.index.counts.clone();
+            for (tag, count) in &repo_counts {
+                let entry = merged.entry(tag.clone()).or_default();
+                entry.total += count.total;
+                entry.manual += count.manual;
+                entry.auto += count.auto;
+            }
+            merged
+        } else {
+            cx.index.counts.clone()
+        };
+
         egui::Panel::left("tag_sidebar")
             .resizable(true)
             .default_size(220.0)
             .min_size(160.0)
-            .show(ui, |ui| self.sidebar(ui, cx));
+            .show(ui, |ui| self.sidebar(ui, cx, &counts));
 
         ui.horizontal(|ui| {
             let label = ui.label("Query");
             let edited = ui
                 .add(
                     egui::TextEdit::singleline(&mut self.query)
-                        .hint_text("rust AND NOT archived")
+                        .hint_text("rust AND NOT archived, or untagged")
                         .desired_width(320.0),
                 )
                 .labelled_by(label.id)
@@ -182,65 +271,101 @@ impl TagsPage {
                 self.excluded.clear();
                 self.extra.clear();
             }
+            ui.checkbox(&mut self.include_repos, "Include repos not cloned")
+                .on_hover_text(
+                    "Also list repos from the Remote List. They can be tagged, \
+                     but not opened or run on until they're cloned.",
+                );
         });
 
         let parsed = self.parsed_query();
-        let matched: Vec<&CloneInfo> = match &parsed {
-            Ok(query) => cx
-                .clones
-                .iter()
-                .filter(|c| query.matches(&cx.index.tags_of(c.id)))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let mut matched: Vec<Row<'_>> = Vec::new();
+        if let Ok(query) = &parsed {
+            matched.extend(
+                cx.clones
+                    .iter()
+                    .filter(|c| query.matches(&cx.index.tags_of(c.id)))
+                    .map(Row::Clone),
+            );
+            if include {
+                matched.extend(
+                    cx.repos
+                        .iter()
+                        .filter(|r| query.matches(&cx.repo_index.tags_of(r.id)))
+                        .map(Row::Repo),
+                );
+            }
+        }
         match &parsed {
             Err(_) if self.query.trim().is_empty() => {
-                ui.weak("Pick a tag on the left, or type a query. * means every clone.");
+                ui.weak(
+                    "Pick a tag on the left, or type a query. * means everything, \
+                     untagged means no tags.",
+                );
             }
             Err(error) => {
                 ui.colored_label(ui.visuals().warn_fg_color, error);
             }
             Ok(query) => {
+                let clones = matched
+                    .iter()
+                    .filter(|r| matches!(r, Row::Clone(_)))
+                    .count();
+                let repos = matched.len() - clones;
                 let unknown: Vec<&str> = query
                     .tags()
                     .into_iter()
-                    .filter(|t| !cx.index.counts.contains_key(*t))
+                    .filter(|t| !counts.contains_key(*t))
                     .collect();
                 ui.horizontal(|ui| {
-                    ui.weak(format!(
-                        "{} match",
-                        plural(matched.len(), "clone", "clones")
-                    ));
-                    if !unknown.is_empty() {
+                    ui.weak(format!("{} match", describe_count(clones, repos, include)));
+                    let (only_uncloned, nowhere): (Vec<&str>, Vec<&str>) = unknown
+                        .iter()
+                        .partition(|t| !include && repo_counts.contains_key(**t));
+                    if !nowhere.is_empty() {
                         ui.colored_label(
                             ui.visuals().warn_fg_color,
-                            format!("· no clone has the tag {}", unknown.join(", ")),
+                            format!(
+                                "· no {} has the tag {}",
+                                if include { "repo" } else { "clone" },
+                                nowhere.join(", ")
+                            ),
+                        );
+                    }
+                    if !only_uncloned.is_empty() {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            format!(
+                                "· only repos not cloned have the tag {}",
+                                only_uncloned.join(", ")
+                            ),
                         );
                     }
                 });
             }
         }
 
-        let matched_ids: HashSet<i64> = matched.iter().map(|c| c.id).collect();
-        self.extra.retain(|id| !matched_ids.contains(id));
-        let mut rows: Vec<&CloneInfo> = matched.clone();
-        rows.extend(
-            self.extra
-                .iter()
-                .filter_map(|id| cx.clones.iter().find(|c| c.id == *id)),
-        );
-        let in_set = |id: i64, excluded: &HashSet<i64>, extra: &[i64]| {
-            (matched_ids.contains(&id) && !excluded.contains(&id)) || extra.contains(&id)
+        let matched_items: HashSet<Item> = matched.iter().map(|r| r.item()).collect();
+        self.extra
+            .retain(|i| !matched_items.contains(i) && (include || matches!(i, Item::Clone(_))));
+        let mut rows: Vec<Row<'_>> = matched.clone();
+        rows.extend(self.extra.iter().filter_map(|item| match item {
+            Item::Clone(id) => cx.clones.iter().find(|c| c.id == *id).map(Row::Clone),
+            Item::Repo(id) => cx.repos.iter().find(|r| r.id == *id).map(Row::Repo),
+        }));
+        let in_set = |item: Item, excluded: &HashSet<Item>, extra: &[Item]| {
+            (matched_items.contains(&item) && !excluded.contains(&item)) || extra.contains(&item)
         };
-        let set: Vec<i64> = rows
+        let set: Vec<Item> = rows
             .iter()
-            .map(|c| c.id)
-            .filter(|id| in_set(*id, &self.excluded, &self.extra))
+            .map(|r| r.item())
+            .filter(|item| in_set(*item, &self.excluded, &self.extra))
             .collect();
+        let (clone_set, repo_set) = split(&set);
 
         ui.add_space(4.0);
-        self.set_actions(ui, &set, action);
-        self.open_actions(ui, cx, &set, action);
+        self.set_actions(ui, &clone_set, &repo_set, action);
+        self.open_actions(ui, cx, &clone_set, repo_set.len(), action);
         self.picker(ui, cx, &rows);
         ui.add_space(4.0);
 
@@ -277,8 +402,9 @@ impl TagsPage {
             })
             .body(|body| {
                 body.rows(row_height, rows.len(), |mut row| {
-                    let clone = rows[row.index()];
-                    let member = in_set(clone.id, &self.excluded, &self.extra);
+                    let entry = rows[row.index()];
+                    let item = entry.item();
+                    let member = in_set(item, &self.excluded, &self.extra);
                     row.set_selected(member);
                     row.col(|ui| {
                         if member {
@@ -286,45 +412,80 @@ impl TagsPage {
                         }
                     });
                     row.col(|ui| {
-                        ui.label(clone.display_name());
-                        if !matched_ids.contains(&clone.id) {
+                        ui.label(entry.name());
+                        if !matched_items.contains(&item) {
                             ui.weak("added");
                         }
                     });
-                    row.col(|ui| {
-                        ui.weak(&clone.rel_path);
+                    row.col(|ui| match entry {
+                        Row::Clone(clone) => {
+                            ui.weak(&clone.rel_path);
+                        }
+                        Row::Repo(_) => {
+                            ui.weak("not cloned").on_hover_text(
+                                "In the Remote List. Clone it there to open it or run on it.",
+                            );
+                        }
                     });
                     row.col(|ui| {
-                        if let Some(tagging) = cx.index.by_clone.get(&clone.id) {
+                        if let Some(tagging) = entry.tagging(cx) {
                             tag_summary(ui, tagging);
                         }
                     });
                     if row.response().clicked() {
-                        if !matched_ids.contains(&clone.id) {
-                            self.extra.retain(|id| *id != clone.id);
-                        } else if !self.excluded.remove(&clone.id) {
-                            self.excluded.insert(clone.id);
+                        if !matched_items.contains(&item) {
+                            self.extra.retain(|i| *i != item);
+                        } else if !self.excluded.remove(&item) {
+                            self.excluded.insert(item);
                         }
                     }
                 });
             });
     }
 
-    fn sidebar(&mut self, ui: &mut egui::Ui, cx: &TagsContext<'_>) {
+    fn sidebar(
+        &mut self,
+        ui: &mut egui::Ui,
+        cx: &TagsContext<'_>,
+        counts: &BTreeMap<String, TagCount>,
+    ) {
+        let include = self.include_repos;
         ui.add_space(4.0);
-        if ui
-            .selectable_label(
-                self.query.trim() == "*",
-                format!("All clones ({})", cx.clones.len()),
-            )
-            .clicked()
-        {
+        let all = if include {
+            format!("All repos ({})", cx.clones.len() + cx.repos.len())
+        } else {
+            format!("All clones ({})", cx.clones.len())
+        };
+        if ui.selectable_label(self.query.trim() == "*", all).clicked() {
             self.set_query("*");
         }
+        let mut untagged = cx
+            .clones
+            .iter()
+            .filter(|c| cx.index.is_untagged(c.id))
+            .count();
+        if include {
+            untagged += cx
+                .repos
+                .iter()
+                .filter(|r| cx.repo_index.is_untagged(r.id))
+                .count();
+        }
+        if ui
+            .selectable_label(
+                self.query.trim().eq_ignore_ascii_case("untagged"),
+                format!("Untagged ({untagged})"),
+            )
+            .on_hover_text("No tags at all, manual or automatic")
+            .clicked()
+        {
+            self.set_query("untagged");
+        }
         ui.separator();
-        if cx.index.counts.is_empty() {
+        if counts.is_empty() {
             ui.weak(
-                "No tags yet. Add one from a clone's details on the Repositories tab, or make a rule.",
+                "No tags yet. Add one from a clone's details or the Remote List on the \
+                 Repositories tab, or make a rule.",
             );
             return;
         }
@@ -332,7 +493,7 @@ impl TagsPage {
             .id_salt("tag_sidebar_scroll")
             .auto_shrink(false)
             .show(ui, |ui| {
-                for (tag, count) in &cx.index.counts {
+                for (tag, count) in counts {
                     let clicked = ui
                         .selectable_label(
                             self.query.trim() == tag,
@@ -347,12 +508,29 @@ impl TagsPage {
             });
     }
 
-    fn set_actions(&mut self, ui: &mut egui::Ui, set: &[i64], action: &mut Option<TagsAction>) {
+    fn set_actions(
+        &mut self,
+        ui: &mut egui::Ui,
+        clones: &[i64],
+        repos: &[i64],
+        action: &mut Option<TagsAction>,
+    ) {
         ui.horizontal(|ui| {
-            ui.label(format!("{} in the working set", set.len()));
+            ui.label(format!("{} in the working set", clones.len() + repos.len()));
+            if !repos.is_empty() {
+                ui.weak(format!("· {} not cloned", repos.len()));
+            }
+            let skipped = if repos.is_empty() {
+                "Open the Runner with these clones".to_owned()
+            } else {
+                format!(
+                    "Open the Runner with the {}; repos that aren't cloned are skipped",
+                    plural(clones.len(), "clone", "clones")
+                )
+            };
             if ui
-                .add_enabled(!set.is_empty(), egui::Button::new("Run command…"))
-                .on_hover_text("Open the Runner with these clones")
+                .add_enabled(!clones.is_empty(), egui::Button::new("Run command…"))
+                .on_hover_text(skipped)
                 .clicked()
             {
                 let label = match self.query.trim() {
@@ -361,7 +539,7 @@ impl TagsPage {
                 };
                 *action = Some(TagsAction::RunOn {
                     label,
-                    clone_ids: set.to_vec(),
+                    clone_ids: clones.to_vec(),
                 });
             }
             ui.separator();
@@ -373,7 +551,7 @@ impl TagsPage {
             )
             .labelled_by(label.id);
             let valid = tags::normalize_tag(&self.tag_name);
-            let enabled = valid.is_ok() && !set.is_empty();
+            let enabled = valid.is_ok() && !(clones.is_empty() && repos.is_empty());
             let hover = valid.as_ref().err().cloned().unwrap_or_default();
             if ui
                 .add_enabled(enabled, egui::Button::new("Add to all"))
@@ -381,7 +559,8 @@ impl TagsPage {
                 .clicked()
             {
                 *action = Some(TagsAction::AddTag {
-                    clone_ids: set.to_vec(),
+                    clone_ids: clones.to_vec(),
+                    repo_ids: repos.to_vec(),
                     tag: std::mem::take(&mut self.tag_name),
                 });
             }
@@ -391,18 +570,21 @@ impl TagsPage {
                 .clicked()
             {
                 *action = Some(TagsAction::RemoveTag {
-                    clone_ids: set.to_vec(),
+                    clone_ids: clones.to_vec(),
+                    repo_ids: repos.to_vec(),
                     tag: std::mem::take(&mut self.tag_name),
                 });
             }
         });
     }
 
+    /// Open each / Open together for the clones in the set (`set` is clone IDs).
     fn open_actions(
         &mut self,
         ui: &mut egui::Ui,
         cx: &TagsContext<'_>,
         set: &[i64],
+        not_cloned: usize,
         action: &mut Option<TagsAction>,
     ) {
         ui.horizontal(|ui| {
@@ -449,6 +631,12 @@ impl TagsPage {
             if cx.launchers.is_empty() {
                 ui.weak("No editors found. Add one in Settings.");
             }
+            if not_cloned > 0 {
+                ui.weak(format!(
+                    "· {} not cloned can't be opened",
+                    plural(not_cloned, "repo", "repos")
+                ));
+            }
         });
         if let Some((launcher, ids)) = self.pending_open.clone() {
             ui.horizontal(|ui| {
@@ -472,8 +660,8 @@ impl TagsPage {
         }
     }
 
-    /// Fuzzy search for clones to add to the working set.
-    fn picker(&mut self, ui: &mut egui::Ui, cx: &TagsContext<'_>, rows: &[&CloneInfo]) {
+    /// Fuzzy search for clones (and, when included, repos not cloned) to add to the working set.
+    fn picker(&mut self, ui: &mut egui::Ui, cx: &TagsContext<'_>, rows: &[Row<'_>]) {
         ui.horizontal(|ui| {
             let label = ui.label("Add a repo");
             ui.add(
@@ -488,33 +676,39 @@ impl TagsPage {
         }
         struct Candidate {
             text: String,
-            id: i64,
+            item: Item,
         }
         impl AsRef<str> for Candidate {
             fn as_ref(&self) -> &str {
                 &self.text
             }
         }
-        let shown: HashSet<i64> = rows.iter().map(|c| c.id).collect();
-        let candidates: Vec<Candidate> = cx
+        let shown: HashSet<Item> = rows.iter().map(|r| r.item()).collect();
+        let mut candidates: Vec<Candidate> = cx
             .clones
             .iter()
-            .filter(|c| !shown.contains(&c.id))
             .map(|c| Candidate {
                 text: format!("{}  {}", c.display_name(), c.rel_path),
-                id: c.id,
+                item: Item::Clone(c.id),
             })
             .collect();
+        if self.include_repos {
+            candidates.extend(cx.repos.iter().map(|r| Candidate {
+                text: format!("{}  (not cloned)", r.full_name()),
+                item: Item::Repo(r.id),
+            }));
+        }
+        candidates.retain(|c| !shown.contains(&c.item));
         let mut matcher = Matcher::new(MatcherConfig::DEFAULT);
         let pattern = Pattern::parse(&self.picker, CaseMatching::Ignore, Normalization::Smart);
         let found = pattern.match_list(candidates.iter(), &mut matcher);
         ui.horizontal_wrapped(|ui| {
             if found.is_empty() {
-                ui.weak("No other clone matches.");
+                ui.weak("Nothing else matches.");
             }
             for (candidate, _) in found.into_iter().take(8) {
                 if ui.button(&candidate.text).clicked() {
-                    self.extra.push(candidate.id);
+                    self.extra.push(candidate.item);
                     self.picker.clear();
                 }
             }
@@ -558,7 +752,21 @@ impl TagsPage {
                     .values()
                     .filter(|t| t.auto.values().any(|rules| rules.contains(&rule.id)))
                     .count();
-                ui.weak(format!("· tags {}", plural(tagged, "clone", "clones")));
+                let repos_tagged = cx
+                    .repos
+                    .iter()
+                    .filter_map(|r| cx.repo_index.by_clone.get(&r.id))
+                    .filter(|t| t.auto.values().any(|rules| rules.contains(&rule.id)))
+                    .count();
+                if repos_tagged > 0 {
+                    ui.weak(format!(
+                        "· tags {} and {} not cloned",
+                        plural(tagged, "clone", "clones"),
+                        plural(repos_tagged, "repo", "repos")
+                    ));
+                } else {
+                    ui.weak(format!("· tags {}", plural(tagged, "clone", "clones")));
+                }
                 if !rule.exceptions.is_empty() {
                     ui.weak(format!(
                         "· {}",
@@ -681,7 +889,7 @@ impl TagsPage {
                         .show(ui, |ui| {
                             for (facts, tags) in hits {
                                 ui.horizontal(|ui| {
-                                    let excepted = rule.exceptions.contains(&facts.clone_id);
+                                    let excepted = rule.exceptions.contains(&facts.id);
                                     let text = format!("{}: {}", facts.full_name, tags.join(", "));
                                     if excepted {
                                         ui.label(egui::RichText::new(text).strikethrough().weak())
@@ -701,13 +909,13 @@ impl TagsPage {
                                     };
                                     if ui.small_button(button).clicked() {
                                         if excepted_now {
-                                            rule.exceptions.insert(facts.clone_id);
+                                            rule.exceptions.insert(facts.id);
                                         } else {
-                                            rule.exceptions.remove(&facts.clone_id);
+                                            rule.exceptions.remove(&facts.id);
                                         }
                                         *action = Some(TagsAction::SetRuleException {
                                             rule_id: rule.id,
-                                            clone_id: facts.clone_id,
+                                            clone_id: facts.id,
                                             excepted: excepted_now,
                                         });
                                     }
@@ -763,10 +971,42 @@ mod tests {
 
     struct Fixture {
         clones: Vec<CloneInfo>,
+        repos: Vec<RepoRow>,
         facts: Vec<CloneFacts>,
         rules: Vec<Rule>,
         index: TagIndex,
+        repo_index: TagIndex,
         launchers: Vec<LauncherInfo>,
+    }
+
+    /// Repos in the Remote List: one tagged `work` and `someday` (and lang:rust by the rule),
+    /// one with no tags at all.
+    fn uncloned() -> (Vec<RepoRow>, HashMap<i64, BTreeSet<String>>) {
+        let repo = |id: i64, owner: &str, name: &str, language: Option<&str>| RepoRow {
+            id,
+            owner: owner.into(),
+            name: name.into(),
+            description: None,
+            language: language.map(Into::into),
+            topics: Vec::new(),
+            is_fork: false,
+            is_archived: false,
+            is_private: false,
+            pushed_at: None,
+            stars: None,
+            sources: Vec::new(),
+            fork_of: None,
+        };
+        (
+            vec![
+                repo(20, "me", "side-project", Some("Rust")),
+                repo(21, "org", "empty", None),
+            ],
+            HashMap::from([(
+                20,
+                BTreeSet::from(["work".to_owned(), "someday".to_owned()]),
+            )]),
+        )
     }
 
     fn fixture() -> Fixture {
@@ -797,7 +1037,7 @@ mod tests {
             .map(|(id, full, language)| {
                 let (owner, name) = full.split_once('/').unwrap();
                 CloneFacts {
-                    clone_id: *id,
+                    id: *id,
                     full_name: (*full).into(),
                     owner: Some(owner.into()),
                     name: name.into(),
@@ -825,6 +1065,9 @@ mod tests {
             (2, BTreeSet::from(["work".to_owned()])),
         ]);
         let index = TagIndex::build(&facts, &manual, &rules);
+        let (repos, repo_manual) = uncloned();
+        let repo_facts: Vec<CloneFacts> = repos.iter().map(CloneFacts::from_repo).collect();
+        let repo_index = TagIndex::build_for_repos(&repo_facts, &repo_manual, &rules);
         let launcher = |name: &str, together: bool| LauncherInfo {
             name: name.into(),
             each: true,
@@ -832,9 +1075,11 @@ mod tests {
         };
         Fixture {
             clones,
+            repos,
             facts,
             rules,
             index,
+            repo_index,
             launchers: vec![launcher("VS Code", true), launcher("Kate", false)],
         }
     }
@@ -847,8 +1092,10 @@ mod tests {
                 egui::CentralPanel::default_margins().show(ui, |ui| {
                     let cx = TagsContext {
                         clones: &fixture.clones,
+                        repos: &fixture.repos,
                         facts: &fixture.facts,
                         index: &fixture.index,
+                        repo_index: &fixture.repo_index,
                         rules: &fixture.rules,
                         launchers: &fixture.launchers,
                         confirm_over: 2,
@@ -922,11 +1169,106 @@ mod tests {
             vec![
                 TagsAction::AddTag {
                     clone_ids: vec![1, 4],
+                    repo_ids: vec![],
                     tag: "Needs Review".into()
                 },
                 TagsAction::RunOn {
                     label: "lang:rust".into(),
                     clone_ids: vec![1, 4]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn repos_not_cloned_are_left_out_until_included() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        assert!(h.query_by_label("All clones (4)").is_some());
+        assert!(h.query_by_label("Untagged (0)").is_some());
+        assert!(h.query_by_label("work  (2)").is_some());
+        h.state_mut().0.query = "someday".into();
+        h.run();
+        assert!(h.query_by_label("0 clones match").is_some());
+        assert!(
+            h.query_by_label_contains("only repos not cloned have the tag someday")
+                .is_some()
+        );
+
+        h.get_by_label("Include repos not cloned").click();
+        h.run();
+        assert!(
+            h.query_by_label("0 clones and 1 repo not cloned match")
+                .is_some()
+        );
+        assert!(h.query_by_label("All repos (6)").is_some());
+        assert!(h.query_by_label("Untagged (1)").is_some());
+        assert!(h.query_by_label("work  (3)").is_some());
+        assert!(h.query_by_label("me/side-project").is_some());
+        assert!(h.query_by_label("not cloned").is_some());
+
+        h.get_by_label("Untagged (1)").click();
+        h.run();
+        assert!(h.query_by_label("org/empty").is_some());
+        assert!(h.query_by_label("me/side-project").is_none());
+
+        // Untick the toggle and the repos leave the working set.
+        h.get_by_label("Include repos not cloned").click();
+        h.run();
+        assert!(h.query_by_label("org/empty").is_none());
+        assert!(h.query_by_label("0 in the working set").is_some());
+    }
+
+    #[test]
+    fn working_set_with_repos_tags_all_but_opens_and_runs_clones() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.include_repos = true;
+        h.state_mut().0.query = "work".into();
+        h.run();
+        assert!(
+            h.query_by_label("2 clones and 1 repo not cloned match")
+                .is_some()
+        );
+        assert!(h.query_by_label("3 in the working set").is_some());
+        assert!(h.query_by_label("· 1 not cloned").is_some());
+        assert!(
+            h.query_by_label("· 1 repo not cloned can't be opened")
+                .is_some()
+        );
+
+        h.state_mut().0.picker = "empty".into();
+        h.run();
+        h.get_by_label("org/empty  (not cloned)").click();
+        h.run();
+        assert!(h.query_by_label("4 in the working set").is_some());
+
+        h.state_mut().0.tag_name = "q4".into();
+        h.run();
+        h.get_by_label("Add to all").click();
+        h.run();
+        h.get_by_label("Run command…").click();
+        h.run();
+        h.get_by_label("Open together").click();
+        h.run();
+        h.get_by_label("VS Code").click();
+        h.run();
+        assert_eq!(
+            h.state().2,
+            vec![
+                TagsAction::AddTag {
+                    clone_ids: vec![1, 2],
+                    repo_ids: vec![20, 21],
+                    tag: "q4".into()
+                },
+                TagsAction::RunOn {
+                    label: "work".into(),
+                    clone_ids: vec![1, 2]
+                },
+                TagsAction::Open {
+                    launcher: "VS Code".into(),
+                    together: true,
+                    clone_ids: vec![1, 2],
+                    workspace_name: launch::set_name(&[1, 2]),
                 },
             ]
         );
@@ -1055,7 +1397,7 @@ mod tests {
         let mut page = TagsPage::new();
         page.set_query("rust");
         assert_eq!(page.workspace_name(&[1, 2]), "rust");
-        page.excluded.insert(2);
+        page.excluded.insert(Item::Clone(2));
         assert_eq!(page.workspace_name(&[1]), launch::set_name(&[1]));
         page.set_query("*");
         assert_eq!(page.workspace_name(&[1, 2]), "all-clones");
@@ -1070,6 +1412,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut h = harness(Harness::builder().wgpu());
         h.state_mut().0.query = "work OR lang:rust".into();
+        h.state_mut().0.include_repos = true;
         h.state_mut().0.picker = "no".into();
         h.run();
         h.render()

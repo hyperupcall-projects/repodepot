@@ -7,7 +7,7 @@ use crate::backend::{
 };
 use crate::config::{Config, Paths};
 use crate::db::TagStore;
-use crate::tags::{CloneFacts, TagIndex};
+use crate::tags::{self, CloneFacts, TagIndex};
 use crate::ui::repos::{ReposAction, ReposContext, ReposPage};
 use crate::ui::runner::{RunnerAction, RunnerContext, RunnerPage};
 use crate::ui::settings::{SettingsContext, SettingsPage};
@@ -49,6 +49,8 @@ pub struct App {
     /// What rules see about each scanned clone.
     facts: Vec<CloneFacts>,
     tag_index: TagIndex,
+    /// Tags of repos that aren't cloned (the Remote List and Ignored), by repo ID.
+    repo_tag_index: TagIndex,
     launchers: Vec<LauncherInfo>,
     auth: AuthState,
     db: Option<Result<DbInfo, String>>,
@@ -76,6 +78,7 @@ impl App {
             tag_store: TagStore::default(),
             facts: Vec::new(),
             tag_index: TagIndex::default(),
+            repo_tag_index: TagIndex::default(),
             launchers: Vec::new(),
             paths,
             backend,
@@ -87,20 +90,37 @@ impl App {
         }
     }
 
-    /// Recomputes every clone's tags after the clones, tags or rules change.
+    /// Recomputes every clone's and uncloned repo's tags after the clones, the GitHub lists,
+    /// tags or rules change.
     fn rebuild_tags(&mut self) {
         let store = &self.tag_store;
-        self.facts = self
-            .repos
-            .clones()
-            .unwrap_or_default()
+        let clones = self.repos.clones().unwrap_or_default();
+        self.facts = clones
             .iter()
             .map(|clone| {
                 let repo = clone.repo_id.and_then(|id| store.repo_facts.get(&id));
                 CloneFacts::from_clone(clone, repo)
             })
             .collect();
-        self.tag_index = TagIndex::build(&self.facts, &store.manual, &store.rules);
+        let manual = tags::clone_manual_tags(
+            &store.manual,
+            &store.repo_manual,
+            clones.iter().map(|c| (c.id, c.repo_id)),
+        );
+        self.tag_index = TagIndex::build(&self.facts, &manual, &store.rules);
+
+        let repos: Vec<CloneFacts> = self
+            .repos
+            .catalog()
+            .map(|c| {
+                c.inbox
+                    .iter()
+                    .chain(&c.ignored)
+                    .map(CloneFacts::from_repo)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.repo_tag_index = TagIndex::build_for_repos(&repos, &store.repo_manual, &store.rules);
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -131,7 +151,10 @@ impl App {
             Event::SyncStarted => self.repos.sync_started(),
             Event::SyncProgress(message) => self.repos.sync_progress(message),
             Event::SyncFinished(result) => self.repos.sync_finished(result),
-            Event::Catalog(catalog) => self.repos.set_catalog(catalog),
+            Event::Catalog(catalog) => {
+                self.repos.set_catalog(catalog);
+                self.rebuild_tags();
+            }
             Event::ClonesFinished(repo_ids) => self.repos.clones_finished(&repo_ids),
             Event::RepoNotice(message) => self.repos.notice(message),
             Event::FolderPicked { purpose, path } => match purpose {
@@ -206,8 +229,24 @@ impl App {
 
     fn handle_tags_action(&mut self, action: TagsAction) {
         let command = match action {
-            TagsAction::AddTag { clone_ids, tag } => Command::AddTag { clone_ids, tag },
-            TagsAction::RemoveTag { clone_ids, tag } => Command::RemoveTag { clone_ids, tag },
+            TagsAction::AddTag {
+                clone_ids,
+                repo_ids,
+                tag,
+            } => Command::AddTag {
+                clone_ids,
+                repo_ids,
+                tag,
+            },
+            TagsAction::RemoveTag {
+                clone_ids,
+                repo_ids,
+                tag,
+            } => Command::RemoveTag {
+                clone_ids,
+                repo_ids,
+                tag,
+            },
             TagsAction::SaveRule(rule) => Command::SaveRule(rule),
             TagsAction::DeleteRule(id) => Command::DeleteRule(id),
             TagsAction::SetRuleEnabled { rule_id, enabled } => {
@@ -345,6 +384,7 @@ impl eframe::App for App {
                     default_remote: &self.config.remotes.default_name,
                     upstream_name: &self.config.remotes.upstream_name,
                     tags: &self.tag_index,
+                    repo_tags: &self.repo_tag_index,
                     rules: &self.tag_store.rules,
                     launchers: &self.launchers,
                 };
@@ -355,8 +395,10 @@ impl eframe::App for App {
             Tab::Tags => {
                 let cx = TagsContext {
                     clones: self.repos.clones().unwrap_or_default(),
+                    repos: self.repos.catalog().map_or(&[][..], |c| &c.inbox),
                     facts: &self.facts,
                     index: &self.tag_index,
+                    repo_index: &self.repo_tag_index,
                     rules: &self.tag_store.rules,
                     launchers: &self.launchers,
                     confirm_over: self.config.launch.confirm_over as usize,

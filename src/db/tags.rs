@@ -1,4 +1,4 @@
-//! Manual tags, tag rules and rule exceptions.
+//! Manual tags (on clones and on repos), tag rules and rule exceptions.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -18,11 +18,13 @@ pub struct RepoFacts {
     pub is_private: Option<bool>,
 }
 
-/// Everything needed to work out every clone's tags.
+/// Everything needed to work out every clone's and repo's tags.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TagStore {
     /// Manual tags by clone ID.
     pub manual: HashMap<i64, BTreeSet<String>>,
+    /// Manual tags by repo ID. A clone has its repo's tags too.
+    pub repo_manual: HashMap<i64, BTreeSet<String>>,
     /// In display order.
     pub rules: Vec<Rule>,
     /// By repo ID.
@@ -39,6 +41,13 @@ impl Db {
         for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
             let (clone, tag) = row?;
             store.manual.entry(clone).or_default().insert(tag);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT rt.repo_id, t.name FROM repo_tags rt JOIN tags t ON t.id = rt.tag_id",
+        )?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (repo, tag) = row?;
+            store.repo_manual.entry(repo).or_default().insert(tag);
         }
 
         let mut exceptions: HashMap<i64, BTreeSet<i64>> = HashMap::new();
@@ -106,8 +115,8 @@ impl Db {
         Ok(store)
     }
 
-    /// Adds a manual tag (already normalized) to clones.
-    pub fn add_tag(&mut self, clone_ids: &[i64], tag: &str) -> Result<()> {
+    /// Adds a manual tag (already normalized) to clones and to repos.
+    pub fn add_tag(&mut self, clone_ids: &[i64], repo_ids: &[i64], tag: &str) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO tags (name) VALUES (?1) ON CONFLICT (name) DO NOTHING",
@@ -121,12 +130,20 @@ impl Db {
                 params![clone, tag_id],
             )?;
         }
+        for repo in repo_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO repo_tags (repo_id, tag_id) VALUES (?1, ?2)",
+                params![repo, tag_id],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
 
-    /// Removes a manual tag from clones; tags nothing uses any more are deleted.
-    pub fn remove_tag(&mut self, clone_ids: &[i64], tag: &str) -> Result<()> {
+    /// Removes a manual tag from clones and repos; tags nothing uses any more are deleted.
+    /// A clone shows its repo's tags as its own, so removing one from a clone removes it from
+    /// the clone's repo too.
+    pub fn remove_tag(&mut self, clone_ids: &[i64], repo_ids: &[i64], tag: &str) -> Result<()> {
         let tx = self.conn.transaction()?;
         for clone in clone_ids {
             tx.execute(
@@ -134,9 +151,23 @@ impl Db {
                  WHERE clone_id = ?1 AND tag_id = (SELECT id FROM tags WHERE name = ?2)",
                 params![clone, tag],
             )?;
+            tx.execute(
+                "DELETE FROM repo_tags
+                 WHERE repo_id = (SELECT repo_id FROM clones WHERE id = ?1)
+                   AND tag_id = (SELECT id FROM tags WHERE name = ?2)",
+                params![clone, tag],
+            )?;
+        }
+        for repo in repo_ids {
+            tx.execute(
+                "DELETE FROM repo_tags
+                 WHERE repo_id = ?1 AND tag_id = (SELECT id FROM tags WHERE name = ?2)",
+                params![repo, tag],
+            )?;
         }
         tx.execute(
-            "DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM clone_tags)",
+            "DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM clone_tags)
+                                AND id NOT IN (SELECT tag_id FROM repo_tags)",
             [],
         )?;
         tx.commit()?;
@@ -271,9 +302,9 @@ mod tests {
     #[test]
     fn manual_tags_add_and_remove() {
         let (mut db, ids) = db_with_clones();
-        db.add_tag(&ids, "work").unwrap();
-        db.add_tag(&ids[..1], "work").unwrap();
-        db.add_tag(&ids[..1], "rust").unwrap();
+        db.add_tag(&ids, &[], "work").unwrap();
+        db.add_tag(&ids[..1], &[], "work").unwrap();
+        db.add_tag(&ids[..1], &[], "rust").unwrap();
         let store = db.tag_store().unwrap();
         assert_eq!(
             store.manual[&ids[0]],
@@ -281,14 +312,53 @@ mod tests {
         );
         assert_eq!(store.manual[&ids[1]], BTreeSet::from(["work".into()]));
 
-        db.remove_tag(&ids, "work").unwrap();
-        db.remove_tag(&ids[..1], "rust").unwrap();
+        db.remove_tag(&ids, &[], "work").unwrap();
+        db.remove_tag(&ids[..1], &[], "rust").unwrap();
         assert!(db.tag_store().unwrap().manual.is_empty());
         let tags: i64 = db
             .conn
             .query_row("SELECT count(*) FROM tags", [], |r| r.get(0))
             .unwrap();
         assert_eq!(tags, 0, "unused tags are cleaned up");
+    }
+
+    #[test]
+    fn repo_tags_belong_to_repos_and_their_clones() {
+        let (mut db, ids) = db_with_clones();
+        let repo_of = |db: &Db, clone: i64| -> i64 {
+            db.conn
+                .query_row("SELECT repo_id FROM clones WHERE id = ?1", [clone], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        let api_repo = repo_of(&db, ids[0]);
+        let other_repo = repo_of(&db, ids[1]);
+        db.add_tag(&[], &[api_repo, other_repo], "later").unwrap();
+        db.add_tag(&[ids[0]], &[], "work").unwrap();
+        let store = db.tag_store().unwrap();
+        assert_eq!(
+            store.repo_manual[&api_repo],
+            BTreeSet::from(["later".into()])
+        );
+        assert_eq!(store.manual[&ids[0]], BTreeSet::from(["work".into()]));
+
+        // Removing it from a clone removes it from that clone's repo; the other repo keeps it.
+        db.remove_tag(&[ids[0]], &[], "later").unwrap();
+        let store = db.tag_store().unwrap();
+        assert!(!store.repo_manual.contains_key(&api_repo));
+        assert!(store.repo_manual[&other_repo].contains("later"));
+
+        db.remove_tag(&[], &[other_repo], "later").unwrap();
+        let tags: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM tags")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(tags, ["work"], "a tag only repos used is cleaned up");
     }
 
     #[test]

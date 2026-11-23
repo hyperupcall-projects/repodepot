@@ -14,7 +14,7 @@ A Rust + egui desktop app (Linux first) for managing the GitHub repositories I c
 | Forks | Listed together. Each fork is either linked to its parent or kept separate; you decide case by case. |
 | Updating | No automatic fetch or pull. You update through the command runner. |
 | Import | Moves repos into the layout |
-| Tags | Only on cloned repos. Manual and rule-made tags are tracked separately; rules can have exceptions. |
+| Tags | On clones, and on repos that aren't cloned yet (a clone keeps its repo's tags). Manual and rule-made tags are tracked separately; rules can have exceptions. |
 | Opening in one window | Only editors that support workspaces are offered |
 | Command runner | Run on a group, then pick a subset and run again in its own tab, with its own sorting and filtering |
 
@@ -78,7 +78,9 @@ For each repo, store: GitHub node ID, owner, name, description, main language, t
 Every relevant repo that isn't cloned and isn't ignored waits in the **Remote List** until you act on it. Nothing is cloned automatically. It's the first view of the Repositories tab, left of **Local Clones**.
 
 - **Remote List columns**: `owner/name`, source badges, fork/archived/private badges, language, GitHub stars, last push, description.
-- Click a column title to sort by it; click again to reverse. Stars and last push start biggest/newest first. Rows missing the value (no language, stars not fetched yet) stay last either way.
+- Click a column title to sort by it; click again to reverse. Stars and last push start biggest/newest first. Rows missing the value (no language, no tags, stars not fetched yet) stay last either way.
+- **Tags column**, and **Add tag** / **Remove tag** for the selected repos (see Part 2).
+- **Tag filter** (here, in Ignored and in Local Clones): a tag query such as `work AND NOT old`, or `untagged` for repos with no tags. The ⏷ menu next to it picks a tag, or its opposite.
 - **Actions** (on one repo or many selected): **Clone**, **Ignore**.
 - **Ignored list**: same columns, with an **Un-ignore** action.
 - Every list can be searched and filtered.
@@ -150,11 +152,14 @@ Breaking absolute paths inside a repo (Python venvs and similar) is accepted.
 
 ## Part 2 — Tags, groups and actions
 
-Only cloned repos can be tagged.
+Clones can be tagged, and so can repos in the Remote List that aren't cloned yet.
+
+- Manual tags given to a repo are stored on the repo (`repo_tags`); a clone's manual tags are its own plus its repo's, so a repo tagged before cloning keeps those tags once it's cloned. Removing a tag from a clone removes it from the clone's repo too.
+- Rules apply to repos that aren't cloned as well, using what the last sync said about them. Exceptions are only for clones.
 
 ### 2.1 Manual tags
 
-Add and remove tags from the repo's detail panel, or for a whole working set from the Groups view. Any name works, and `:` can be used for namespaces (`org:myorg`, `lang:rust`). Names are lowercased and spaces become `-`; `and`, `or`, `not` and parentheses are kept for queries.
+Add and remove tags from the repo's detail panel, for the selected repos in the Remote List, or for a whole working set from the Groups view. Any name works, and `:` can be used for namespaces (`org:myorg`, `lang:rust`). Names are lowercased and spaces become `-`; `and`, `or`, `not`, `untagged`, `*` and parentheses are kept for queries.
 
 ### 2.2 Rules (automatic tags)
 
@@ -187,7 +192,8 @@ A rule says: **if a field matches a pattern, add a tag**.
 ### 2.4 Groups view
 
 - **Sidebar**: every tag, with its count split into manual and automatic.
-- **Query bar** for combining tags: `rust AND work`, `rust OR go`, `work AND NOT archived`, with parentheses. Words in a query are tag names, side-by-side words mean AND, and `*` means every clone.
+- **Query bar** for combining tags: `rust AND work`, `rust OR go`, `work AND NOT archived`, with parentheses. Words in a query are tag names, side-by-side words mean AND, `*` means everything, and `untagged` means no tags at all (the sidebar has an **Untagged** entry).
+- **Include repos not cloned**: off by default, so the working set is clones only and every action works on it. When on, repos from the Remote List are listed too (marked "not cloned"); they can be tagged with the rest, but Open and Run command skip them.
 - **Fuzzy name search** on top of the query, using `nucleo`.
 - **Working set**: starts as the query result.
   - Add any cloned repo with a fuzzy picker, or untick the ones you don't want.

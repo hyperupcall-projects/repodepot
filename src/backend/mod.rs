@@ -92,13 +92,16 @@ pub enum Command {
         paths: Vec<PathBuf>,
     },
     Import(Vec<ImportMove>),
-    /// Add a manual tag to clones. The name is normalized first.
+    /// Add a manual tag to clones and to repos. The name is normalized first.
     AddTag {
         clone_ids: Vec<i64>,
+        repo_ids: Vec<i64>,
         tag: String,
     },
+    /// Remove a manual tag from clones (and their repos) and from repos.
     RemoveTag {
         clone_ids: Vec<i64>,
+        repo_ids: Vec<i64>,
         tag: String,
     },
     /// Insert (id 0) or update a rule. It's checked first.
@@ -605,12 +608,24 @@ async fn run(
                     }
                 });
             }
-            Command::AddTag { clone_ids, tag } => match tags::normalize_tag(&tag) {
-                Ok(tag) => tag_write(&shared, move |db| db.add_tag(&clone_ids, &tag)),
+            Command::AddTag {
+                clone_ids,
+                repo_ids,
+                tag,
+            } => match tags::normalize_tag(&tag) {
+                Ok(tag) => tag_write(&shared, move |db| db.add_tag(&clone_ids, &repo_ids, &tag)),
                 Err(e) => shared.emitter.emit(Event::TagActionFailed(e)),
             },
-            Command::RemoveTag { clone_ids, tag } => match tags::normalize_tag(&tag) {
-                Ok(tag) => tag_write(&shared, move |db| db.remove_tag(&clone_ids, &tag)),
+            Command::RemoveTag {
+                clone_ids,
+                repo_ids,
+                tag,
+            } => match tags::normalize_tag(&tag) {
+                Ok(tag) => {
+                    tag_write(&shared, move |db| {
+                        db.remove_tag(&clone_ids, &repo_ids, &tag)
+                    });
+                }
                 Err(e) => shared.emitter.emit(Event::TagActionFailed(e)),
             },
             Command::SaveRule(rule) => match tags::compile(&rule) {
@@ -1305,6 +1320,7 @@ mod tests {
 
         backend.send(Command::AddTag {
             clone_ids: vec![id],
+            repo_ids: Vec::new(),
             tag: " Work Stuff ".into(),
         });
         let store = wait_for(&backend, "the tag", |event| match event {
@@ -1315,6 +1331,7 @@ mod tests {
 
         backend.send(Command::AddTag {
             clone_ids: vec![id],
+            repo_ids: Vec::new(),
             tag: "and".into(),
         });
         let error = wait_for(&backend, "the refusal", |event| match event {

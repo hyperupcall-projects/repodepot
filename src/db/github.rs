@@ -753,6 +753,8 @@ fn merge_repo(tx: &Transaction<'_>, from: i64, into: i64) -> Result<()> {
              SELECT ?2, source FROM repo_sources WHERE repo_id = ?1",
         "UPDATE OR IGNORE fork_links SET fork_repo_id = ?2 WHERE fork_repo_id = ?1",
         "UPDATE OR IGNORE fork_links SET parent_repo_id = ?2 WHERE parent_repo_id = ?1",
+        "INSERT OR IGNORE INTO repo_tags (repo_id, tag_id)
+             SELECT ?2, tag_id FROM repo_tags WHERE repo_id = ?1",
         "UPDATE repos SET parent_repo_id = ?2 WHERE parent_repo_id = ?1",
         "UPDATE repos SET renamed_to_id = ?2 WHERE renamed_to_id = ?1",
         "UPDATE repos SET ignored = max(ignored, (SELECT ignored FROM repos WHERE id = ?1))
@@ -901,6 +903,13 @@ mod tests {
             .unwrap();
         // A local clone already points at the new name, creating a second row for it.
         scan(&mut db, &[("n/new-name", &url("me", "new-name"), None)]);
+        let scanned_row: i64 = db
+            .conn
+            .query_row("SELECT id FROM repos WHERE name = 'new-name'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        db.add_tag(&[], &[scanned_row], "kept").unwrap();
         db.apply_sync(&[fetched(meta("A", "me", "new-name"), &[Source::Owned])])
             .unwrap();
 
@@ -909,6 +918,12 @@ mod tests {
             .query_row("SELECT count(*) FROM repos", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 1, "the two rows were merged");
+        let store = db.tag_store().unwrap();
+        assert_eq!(
+            store.repo_manual.values().collect::<Vec<_>>(),
+            [&BTreeSet::from(["kept".to_owned()])],
+            "repo tags move to the surviving row"
+        );
         let catalog = db.catalog().unwrap();
         assert!(catalog.inbox.is_empty(), "the merged repo is cloned");
         assert!(db.unlisted_clone_repos().unwrap().is_empty());

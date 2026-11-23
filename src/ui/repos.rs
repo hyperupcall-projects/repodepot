@@ -1,7 +1,7 @@
 //! The Repositories tab: the Remote List, Ignored and Forks lists from GitHub, local clones
 //! with their status, and a Problems view.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 
 use eframe::egui;
@@ -12,10 +12,11 @@ use crate::db::{Catalog, ForkDecision};
 use crate::git::import::ImportPreview;
 use crate::git::scan::{CloneInfo, MainRemote, Problem, ScanResult};
 use crate::git::status::Status;
+use crate::tags::query::{self, Query};
 use crate::tags::{Rule, TagIndex};
 use crate::ui::import::ImportPage;
-use crate::ui::remote_list::{self, ListKind, ListState};
-use crate::ui::tags::TagsAction;
+use crate::ui::remote_list::{self, ListContext, ListKind, ListState};
+use crate::ui::tags::{TagsAction, tag_summary};
 use crate::ui::{sort_header, thousands};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -68,7 +69,10 @@ pub struct ReposContext<'a> {
     /// Remote names from the settings.
     pub default_remote: &'a str,
     pub upstream_name: &'a str,
+    /// Tags of clones, by clone ID.
     pub tags: &'a TagIndex,
+    /// Tags of repos that aren't cloned (Remote List and Ignored), by repo ID.
+    pub repo_tags: &'a TagIndex,
     pub rules: &'a [Rule],
     pub launchers: &'a [LauncherInfo],
 }
@@ -239,6 +243,8 @@ const STRAYS_HELP: &str = "Folders under the clone root that aren't git repos. O
 pub struct ReposPage {
     view: View,
     filter: String,
+    /// A tag query for the Remote List, Ignored and Local Clones, like `work AND NOT old`.
+    tag_filter: String,
     show: Show,
     sort: SortKey,
     descending: bool,
@@ -269,6 +275,7 @@ impl ReposPage {
         Self {
             view: View::LocalClones,
             filter: String::new(),
+            tag_filter: String::new(),
             show: Show::All,
             sort: SortKey::Name,
             descending: false,
@@ -359,6 +366,11 @@ impl ReposPage {
         self.action_error = Some(message);
     }
 
+    /// The Remote List, Ignored and Forks lists from the last sync.
+    pub fn catalog(&self) -> Option<&Catalog> {
+        self.catalog.as_ref()
+    }
+
     /// The clones from the latest successful scan.
     pub fn clones(&self) -> Option<&[CloneInfo]> {
         match &self.result {
@@ -373,15 +385,27 @@ impl ReposPage {
         // Taken out so the views can borrow them while changing the page's own state.
         let result = self.result.take();
         let catalog = self.catalog.take();
+        let tag_query = match self.tag_filter.trim() {
+            "" => None,
+            text => Some(query::parse(text)),
+        };
+        // A query that's still being typed (or is wrong) doesn't filter; the toolbar says why.
+        let valid_query = tag_query.as_ref().and_then(|q| q.as_ref().ok());
 
-        self.toolbar(ui, result.as_ref(), catalog.as_ref(), &mut action);
+        self.toolbar(
+            ui,
+            result.as_ref(),
+            catalog.as_ref(),
+            (&cx, tag_query.as_ref()),
+            &mut action,
+        );
         self.messages(ui, &mut action);
         ui.separator();
 
         match self.view {
             View::Import => self.import.show(ui, cx.default_remote, &mut action),
             View::RemoteList | View::Ignored | View::Forks => {
-                self.github_view(ui, catalog.as_ref(), &mut action);
+                self.github_view(ui, catalog.as_ref(), cx.repo_tags, valid_query, &mut action);
             }
             View::LocalClones | View::Problems => match &result {
                 None if self.scanning.is_some() => {
@@ -399,7 +423,13 @@ impl ReposPage {
                 }
                 Some(Ok(scan)) => match self.view {
                     View::Problems => self.problems_view(ui, scan, &mut action),
-                    _ => self.clones_view(ui, scan, (cx.tags, cx.rules), cx.launchers, &mut action),
+                    _ => self.clones_view(
+                        ui,
+                        scan,
+                        (cx.tags, cx.rules, valid_query),
+                        cx.launchers,
+                        &mut action,
+                    ),
                 },
             },
         }
@@ -501,6 +531,8 @@ impl ReposPage {
         &mut self,
         ui: &mut egui::Ui,
         catalog: Option<&Catalog>,
+        tags: &TagIndex,
+        tag_query: Option<&Query>,
         action: &mut Option<ReposAction>,
     ) {
         let Some(catalog) = catalog else {
@@ -525,6 +557,12 @@ impl ReposPage {
             });
             return;
         }
+        let list = ListContext {
+            filter: &self.filter,
+            tag_query,
+            tags,
+            cloning: &self.cloning,
+        };
         match self.view {
             View::RemoteList => {
                 remote_list::add_by_hand(ui, &mut self.add_text, &catalog.manual_owners, action);
@@ -534,8 +572,7 @@ impl ReposPage {
                     ListKind::Remote,
                     &catalog.inbox,
                     &mut self.remote,
-                    &self.filter,
-                    &self.cloning,
+                    &list,
                     action,
                 );
             }
@@ -544,8 +581,7 @@ impl ReposPage {
                 ListKind::Ignored,
                 &catalog.ignored,
                 &mut self.ignored,
-                &self.filter,
-                &self.cloning,
+                &list,
                 action,
             ),
             _ => {
@@ -559,6 +595,7 @@ impl ReposPage {
         ui: &mut egui::Ui,
         result: Option<&Result<ScanResult, String>>,
         catalog: Option<&Catalog>,
+        (cx, tag_query): (&ReposContext<'_>, Option<&Result<Query, String>>),
         action: &mut Option<ReposAction>,
     ) {
         ui.horizontal(|ui| {
@@ -629,8 +666,14 @@ impl ReposPage {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.filter)
                         .hint_text(hint)
-                        .desired_width(390.0),
+                        .desired_width(300.0),
                 );
+            }
+            if matches!(
+                self.view,
+                View::RemoteList | View::Ignored | View::LocalClones
+            ) {
+                self.tag_filter_field(ui, cx, tag_query);
             }
             {
                 if self.view == View::LocalClones {
@@ -673,11 +716,82 @@ impl ReposPage {
         });
     }
 
+    /// The tag query field, with a menu of known tags.
+    fn tag_filter_field(
+        &mut self,
+        ui: &mut egui::Ui,
+        cx: &ReposContext<'_>,
+        parsed: Option<&Result<Query, String>>,
+    ) {
+        ui.separator();
+        let label = ui.label("Tags");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.tag_filter)
+                .hint_text("work AND NOT old, or untagged")
+                .desired_width(200.0),
+        )
+        .labelled_by(label.id)
+        .on_hover_text(
+            "Tag names, combined with AND, OR, NOT and parentheses. \
+             untagged matches repos with no tags at all.",
+        );
+        let known: BTreeSet<&str> = cx
+            .tags
+            .counts
+            .keys()
+            .chain(cx.repo_tags.counts.keys())
+            .map(String::as_str)
+            .collect();
+        ui.menu_button("⏷", |ui| {
+            if ui
+                .button("untagged")
+                .on_hover_text("Repos with no tags at all")
+                .clicked()
+            {
+                self.tag_filter = "untagged".to_owned();
+                ui.close();
+            }
+            ui.separator();
+            if known.is_empty() {
+                ui.weak("No tags yet");
+            }
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    for tag in &known {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(*tag)
+                                .on_hover_text(format!("Has {tag}"))
+                                .clicked()
+                            {
+                                self.tag_filter = (*tag).to_owned();
+                                ui.close();
+                            }
+                            if ui
+                                .small_button("not")
+                                .on_hover_text(format!("Doesn't have {tag}"))
+                                .clicked()
+                            {
+                                self.tag_filter = format!("NOT {tag}");
+                                ui.close();
+                            }
+                        });
+                    }
+                });
+        })
+        .response
+        .on_hover_text("Pick a tag");
+        if let Some(Err(error)) = parsed {
+            ui.colored_label(ui.visuals().warn_fg_color, error);
+        }
+    }
+
     fn clones_view(
         &mut self,
         ui: &mut egui::Ui,
         scan: &ScanResult,
-        (tags, rules): (&TagIndex, &[Rule]),
+        (tags, rules, tag_query): (&TagIndex, &[Rule], Option<&Query>),
         launchers: &[LauncherInfo],
         action: &mut Option<ReposAction>,
     ) {
@@ -704,7 +818,9 @@ impl ReposPage {
             .clones
             .iter()
             .filter(|c| {
-                matches_text(&needle, &c.display_name(), &c.rel_path) && self.show.matches(c)
+                matches_text(&needle, &c.display_name(), &c.rel_path)
+                    && self.show.matches(c)
+                    && tag_query.is_none_or(|q| q.matches(&tags.tags_of(c.id)))
             })
             .collect();
         sort_rows(&mut rows, self.sort, self.descending);
@@ -724,10 +840,10 @@ impl ReposPage {
         // When the details panel leaves too little room, scroll sideways instead of overlapping it.
         egui::ScrollArea::horizontal()
             .auto_shrink(false)
-            .show(ui, |ui| self.clones_table(ui, &rows));
+            .show(ui, |ui| self.clones_table(ui, &rows, tags));
     }
 
-    fn clones_table(&mut self, ui: &mut egui::Ui, rows: &[&CloneInfo]) {
+    fn clones_table(&mut self, ui: &mut egui::Ui, rows: &[&CloneInfo], tags: &TagIndex) {
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + 8.0;
         TableBuilder::new(ui)
             .striped(true)
@@ -754,6 +870,12 @@ impl ReposPage {
             .column(Column::initial(70.0).at_least(60.0))
             .column(Column::initial(70.0).at_least(50.0))
             .column(Column::initial(50.0).at_least(45.0))
+            .column(
+                Column::initial(140.0)
+                    .at_least(60.0)
+                    .clip(true)
+                    .resizable(true),
+            )
             .column(Column::remainder().at_least(110.0).clip(true))
             .header(24.0, |mut header| {
                 header.col(|ui| self.sort_button(ui, "Repository", SortKey::Name));
@@ -763,6 +885,9 @@ impl ReposPage {
                 header.col(|ui| self.sort_button(ui, "Sync", SortKey::Sync));
                 header.col(|ui| {
                     ui.strong("Stash");
+                });
+                header.col(|ui| {
+                    ui.strong("Tags");
                 });
                 header.col(|ui| {
                     ui.strong("Problems");
@@ -780,6 +905,11 @@ impl ReposPage {
                     row.col(|ui| changes_cell(ui, clone));
                     row.col(|ui| sync_cell(ui, clone));
                     row.col(|ui| stash_cell(ui, clone));
+                    row.col(|ui| {
+                        if let Some(tagging) = tags.by_clone.get(&clone.id) {
+                            tag_summary(ui, tagging);
+                        }
+                    });
                     row.col(|ui| problems_cell(ui, clone));
                     if row.response().clicked() {
                         self.selected = if self.selected == Some(clone.id) {
@@ -1077,6 +1207,7 @@ fn tags_section(
             {
                 *action = Some(ReposAction::Tags(TagsAction::RemoveTag {
                     clone_ids: vec![clone_id],
+                    repo_ids: Vec::new(),
                     tag: tag.clone(),
                 }));
             }
@@ -1128,6 +1259,7 @@ fn tags_section(
         if (clicked || entered) && valid.is_ok() {
             *action = Some(ReposAction::Tags(TagsAction::AddTag {
                 clone_ids: vec![clone_id],
+                repo_ids: Vec::new(),
                 tag: std::mem::take(new_tag),
             }));
         }
@@ -1693,6 +1825,7 @@ mod tests {
                         default_remote: "me",
                         upstream_name: "upstream",
                         tags: &tags,
+                        repo_tags: &tags,
                         rules: &[],
                         launchers: &[],
                     };
@@ -1807,12 +1940,14 @@ mod tests {
                     }];
                     let manual = HashMap::from([(1, BTreeSet::from(["work".to_owned()]))]);
                     let tags = TagIndex::build(&facts, &manual, &rules);
+                    let repo_tags = TagIndex::default();
                     egui::CentralPanel::default_margins().show(ui, |ui| {
                         let cx = ReposContext {
                             has_clone_root: true,
                             default_remote: "me",
                             upstream_name: "upstream",
                             tags: &tags,
+                            repo_tags: &repo_tags,
                             rules: &rules,
                             launchers: &[LauncherInfo {
                                 name: "VS Code".into(),
@@ -1854,7 +1989,11 @@ mod tests {
         h.run();
         h.get_by_label("facebook/react").click();
         h.run();
-        assert!(h.query_by_label("upstream").is_some(), "rule tag shown");
+        assert_eq!(
+            h.query_all_by_label("upstream").count(),
+            2,
+            "the rule tag shows in the Tags column and the details panel"
+        );
         h.get_by_label("work ×").click();
         h.run();
         h.get_by_label("Add exception").click();
@@ -1868,6 +2007,7 @@ mod tests {
             vec![
                 ReposAction::Tags(TagsAction::RemoveTag {
                     clone_ids: vec![1],
+                    repo_ids: vec![],
                     tag: "work".into()
                 }),
                 ReposAction::Tags(TagsAction::SetRuleException {
@@ -1877,6 +2017,7 @@ mod tests {
                 }),
                 ReposAction::Tags(TagsAction::AddTag {
                     clone_ids: vec![1],
+                    repo_ids: vec![],
                     tag: "Later".into()
                 }),
             ]
@@ -2021,6 +2162,178 @@ mod tests {
         );
     }
 
+    /// Like `harness`, with tags: clone 1 (facebook/react) has `work`; in the Remote List,
+    /// me/dotfiles has `later` and myorg/api has `later` and `work`.
+    fn tags_harness<'a>(builder: egui_kittest::HarnessBuilder<State>) -> Harness<'a, State> {
+        use std::collections::{BTreeSet, HashMap};
+
+        use crate::tags::CloneFacts;
+
+        let set = |tags: &[&str]| {
+            tags.iter()
+                .map(|t| (*t).to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        let mut page = ReposPage::new();
+        page.scan_finished(Ok(synced_scan()));
+        page.set_catalog(sample_catalog());
+        let facts: Vec<CloneFacts> = page
+            .clones()
+            .unwrap()
+            .iter()
+            .map(|c| CloneFacts::from_clone(c, None))
+            .collect();
+        let tags = TagIndex::build(&facts, &HashMap::from([(1, set(&["work"]))]), &[]);
+        let catalog = page.catalog().unwrap();
+        let repos: Vec<CloneFacts> = catalog
+            .inbox
+            .iter()
+            .chain(&catalog.ignored)
+            .map(CloneFacts::from_repo)
+            .collect();
+        let repo_tags = TagIndex::build_for_repos(
+            &repos,
+            &HashMap::from([(10, set(&["later"])), (11, set(&["later", "work"]))]),
+            &[],
+        );
+        builder.with_size([1280.0, 560.0]).build_ui_state(
+            move |ui, (page, actions): &mut State| {
+                egui::CentralPanel::default_margins().show(ui, |ui| {
+                    let cx = ReposContext {
+                        has_clone_root: true,
+                        default_remote: "me",
+                        upstream_name: "upstream",
+                        tags: &tags,
+                        repo_tags: &repo_tags,
+                        rules: &[],
+                        launchers: &[],
+                    };
+                    if let Some(action) = page.show(ui, cx) {
+                        actions.push(action);
+                    }
+                });
+            },
+            (page, Vec::new()),
+        )
+    }
+
+    fn shown(h: &Harness<'_, State>, names: &[&str]) -> Vec<String> {
+        names
+            .iter()
+            .filter(|n| h.query_by_label(n).is_some())
+            .map(|n| (*n).to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn remote_list_filters_by_tag_query() {
+        let all = ["me/dotfiles", "myorg/api", "myorg/website", "me/react"];
+        let mut h = tags_harness(Harness::builder());
+        h.state_mut().0.view = View::RemoteList;
+        h.state_mut().0.tag_filter = "later".into();
+        h.run();
+        assert_eq!(shown(&h, &all), ["me/dotfiles", "myorg/api"]);
+
+        h.state_mut().0.tag_filter = "later AND NOT work".into();
+        h.run();
+        assert_eq!(shown(&h, &all), ["me/dotfiles"]);
+
+        h.state_mut().0.tag_filter = "untagged".into();
+        h.run();
+        assert_eq!(shown(&h, &all), ["myorg/website", "me/react"]);
+
+        // A query still being typed doesn't hide anything, and says what's wrong.
+        h.state_mut().0.tag_filter = "work AND".into();
+        h.run();
+        assert_eq!(shown(&h, &all), all);
+        assert!(h.query_by_label_contains("ends too early").is_some());
+    }
+
+    #[test]
+    fn local_clones_filter_by_tag_query() {
+        let all = ["facebook/react", "someone/react", "serde-rs/serde"];
+        let mut h = tags_harness(Harness::builder());
+        h.state_mut().0.tag_filter = "work".into();
+        h.run();
+        assert_eq!(shown(&h, &all), ["facebook/react"]);
+        h.state_mut().0.tag_filter = "NOT work".into();
+        h.run();
+        assert_eq!(shown(&h, &all), ["someone/react", "serde-rs/serde"]);
+        h.state_mut().0.tag_filter = "untagged".into();
+        h.run();
+        assert_eq!(shown(&h, &all), ["someone/react", "serde-rs/serde"]);
+    }
+
+    #[test]
+    fn tag_menu_fills_the_query() {
+        let mut h = tags_harness(Harness::builder());
+        h.state_mut().0.view = View::RemoteList;
+        h.run();
+        h.get_by_label("⏷").click();
+        h.run();
+        // Tags from clones and from repos, alphabetically: later, work.
+        h.get_all_by_label("not").next().unwrap().click();
+        h.run();
+        assert_eq!(h.state().0.tag_filter, "NOT later");
+        h.get_by_label("⏷").click();
+        h.run();
+        h.get_by_label("untagged").click();
+        h.run();
+        assert_eq!(h.state().0.tag_filter, "untagged");
+    }
+
+    #[test]
+    fn remote_list_tags_the_selected_repos() {
+        let mut h = tags_harness(Harness::builder());
+        h.state_mut().0.view = View::RemoteList;
+        h.run();
+        h.get_by_label("me/dotfiles").click();
+        h.run();
+        h.get_by_label("myorg/website").click();
+        h.run();
+        h.get_by_label("Tag").focus();
+        h.run();
+        h.get_by_label("Tag").type_text("Some Day");
+        h.run();
+        h.get_by_label("Add tag").click();
+        h.run();
+        assert!(
+            h.query_by_label("2 selected").is_some(),
+            "tagging keeps the selection"
+        );
+        h.get_by_label("Tag").focus();
+        h.run();
+        h.get_by_label("Tag").type_text("later");
+        h.run();
+        h.get_by_label("Remove tag").click();
+        h.run();
+
+        let actions = std::mem::take(&mut h.state_mut().1);
+        let [
+            ReposAction::Tags(TagsAction::AddTag {
+                clone_ids: added_clones,
+                repo_ids: added,
+                tag: added_tag,
+            }),
+            ReposAction::Tags(TagsAction::RemoveTag {
+                clone_ids: removed_clones,
+                repo_ids: removed,
+                tag: removed_tag,
+            }),
+        ] = actions.as_slice()
+        else {
+            panic!("expected an add and a remove, got {actions:?}");
+        };
+        let ids = |v: &[i64]| v.iter().copied().collect::<HashSet<_>>();
+        assert!(added_clones.is_empty() && removed_clones.is_empty());
+        assert_eq!(ids(added), HashSet::from([10, 12]));
+        assert_eq!(ids(removed), HashSet::from([10, 12]));
+        assert_eq!(
+            (added_tag.as_str(), removed_tag.as_str()),
+            ("Some Day", "later")
+        );
+    }
+
     fn sample_import() -> ImportPreview {
         let item =
             |source: &str, name: &str, destination: &str, rename: bool, note: &str| ImportItem {
@@ -2158,7 +2471,7 @@ mod tests {
             return;
         };
         std::fs::create_dir_all(&dir).unwrap();
-        let mut h = harness(Harness::builder().wgpu());
+        let mut h = tags_harness(Harness::builder().wgpu());
         h.run();
         h.get_by_label("someone/react").click();
         h.run();
@@ -2176,6 +2489,13 @@ mod tests {
             .unwrap()
             .save(dir.join("remote_list.png"))
             .unwrap();
+        h.state_mut().0.tag_filter = "later".into();
+        h.run();
+        h.render()
+            .unwrap()
+            .save(dir.join("remote_list_tagged.png"))
+            .unwrap();
+        h.state_mut().0.tag_filter.clear();
         h.get_by_label("Forks (1 undecided)").click();
         h.run();
         h.render().unwrap().save(dir.join("forks.png")).unwrap();
