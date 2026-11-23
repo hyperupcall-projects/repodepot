@@ -110,6 +110,7 @@ pub struct RepoMeta {
     pub is_private: bool,
     pub pushed_at: Option<String>,
     pub ssh_url: Option<String>,
+    pub stars: u32,
 }
 
 impl RepoMeta {
@@ -145,7 +146,7 @@ pub struct RepoState {
     pub linked_upstream: Option<(String, String)>,
 }
 
-/// A repo for the Inbox and Ignored lists.
+/// A repo for the Remote List and Ignored lists.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RepoRow {
     pub id: i64,
@@ -158,6 +159,8 @@ pub struct RepoRow {
     pub is_archived: bool,
     pub is_private: bool,
     pub pushed_at: Option<String>,
+    /// `None` for repos not synced since stars were added.
+    pub stars: Option<u32>,
     pub sources: Vec<Source>,
     /// Parent's full name and the decision for this fork.
     pub fork_of: Option<(String, ForkDecision)>,
@@ -194,6 +197,7 @@ pub struct Catalog {
     /// UTC `YYYY-MM-DD HH:MM:SS`, or `None` before the first sync.
     pub last_sync: Option<String>,
     pub relevant: usize,
+    /// Listed repos that aren't cloned or ignored, shown as the Remote List.
     pub inbox: Vec<RepoRow>,
     pub ignored: Vec<RepoRow>,
     pub forks: Vec<ForkFamily>,
@@ -499,7 +503,7 @@ impl Db {
         Ok(items)
     }
 
-    /// Builds the Inbox, Ignored and Forks lists.
+    /// Builds the Remote List, Ignored and Forks lists.
     pub fn catalog(&self) -> Result<Catalog> {
         let mut sources: HashMap<i64, Vec<Source>> = HashMap::new();
         {
@@ -577,7 +581,7 @@ impl Db {
             let mut stmt = self.conn.prepare(
                 "SELECT r.id, r.owner, r.name, r.description, r.language, r.topics, r.is_fork,
                         r.is_archived, r.is_private, r.pushed_at, r.ignored,
-                        p.owner, p.name, f.decision
+                        p.owner, p.name, f.decision, r.stars
                  FROM repos r
                  LEFT JOIN fork_links f ON f.fork_repo_id = r.id
                  LEFT JOIN repos p ON p.id = f.parent_repo_id
@@ -601,6 +605,7 @@ impl Db {
                         is_archived: r.get(7)?,
                         is_private: r.get(8)?,
                         pushed_at: r.get(9)?,
+                        stars: r.get(14)?,
                         sources: Vec::new(),
                         fork_of: parent.map(|(o, n)| {
                             (
@@ -717,7 +722,8 @@ pub(super) fn upsert_github(tx: &Transaction<'_>, meta: &RepoMeta) -> Result<i64
     tx.execute(
         "UPDATE repos SET owner = ?2, name = ?3, github_node_id = ?4, description = ?5,
                 language = ?6, topics = ?7, is_fork = ?8, is_archived = ?9, is_private = ?10,
-                pushed_at = ?11, ssh_url = ?12, not_found_at = NULL, renamed_to_id = NULL
+                pushed_at = ?11, ssh_url = ?12, stars = ?13, not_found_at = NULL,
+                renamed_to_id = NULL
          WHERE id = ?1",
         params![
             id,
@@ -732,6 +738,7 @@ pub(super) fn upsert_github(tx: &Transaction<'_>, meta: &RepoMeta) -> Result<i64
             meta.is_private,
             meta.pushed_at,
             meta.ssh_url,
+            meta.stars,
         ],
     )?;
     Ok(id)
@@ -837,7 +844,10 @@ mod tests {
         db.apply_sync(&[
             fetched(meta("A", "me", "alpha"), &[Source::Owned]),
             fetched(
-                meta("B", "org", "beta"),
+                RepoMeta {
+                    stars: 1234,
+                    ..meta("B", "org", "beta")
+                },
                 &[Source::OrgMember, Source::Contributed],
             ),
             fetched(meta("C", "me", "gamma"), &[Source::Owned]),
@@ -862,6 +872,7 @@ mod tests {
             catalog.inbox[0].sources,
             [Source::OrgMember, Source::Contributed]
         );
+        assert_eq!(catalog.inbox[0].stars, Some(1234));
         assert_eq!(names(&catalog.ignored), ["me/gamma"]);
     }
 

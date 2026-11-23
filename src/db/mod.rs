@@ -22,6 +22,7 @@ const MIGRATIONS: &[M<'static>] = &[
     M::up(include_str!("migrations/001_initial.sql")),
     M::up(include_str!("migrations/002_clone_scan.sql")),
     M::up(include_str!("migrations/003_github_sync.sql")),
+    M::up(include_str!("migrations/004_repo_stars.sql")),
 ];
 
 /// Stamped into every database this app creates (SQLite's `application_id`), so a file
@@ -56,6 +57,7 @@ const EXPECTED: &[(i64, &str, &[&str])] = &[
     (2, "clones", &["main_remote", "missing_since"]),
     (3, "repos", &["not_found_at", "renamed_to_id"]),
     (3, "meta", &["key", "value"]),
+    (4, "repos", &["stars"]),
 ];
 
 pub fn migrations() -> Migrations<'static> {

@@ -1,5 +1,5 @@
-//! The Repositories tab: clones with their status, the Inbox, Ignored and Forks lists from
-//! GitHub, and a Problems view.
+//! The Repositories tab: the Remote List, Ignored and Forks lists from GitHub, local clones
+//! with their status, and a Problems view.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -14,9 +14,9 @@ use crate::git::scan::{CloneInfo, MainRemote, Problem, ScanResult};
 use crate::git::status::Status;
 use crate::tags::{Rule, TagIndex};
 use crate::ui::import::ImportPage;
-use crate::ui::inbox::{self, ListKind, ListState};
+use crate::ui::remote_list::{self, ListKind, ListState};
 use crate::ui::tags::TagsAction;
-use crate::ui::thousands;
+use crate::ui::{sort_header, thousands};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReposAction {
@@ -75,8 +75,8 @@ pub struct ReposContext<'a> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
-    Clones,
-    Inbox,
+    RemoteList,
+    LocalClones,
     Ignored,
     Forks,
     Problems,
@@ -252,7 +252,7 @@ pub struct ReposPage {
     syncing: Option<String>,
     sync_report: Option<SyncReport>,
     catalog: Option<Catalog>,
-    inbox: ListState,
+    remote: ListState,
     ignored: ListState,
     /// Repo IDs with a clone run in progress.
     cloning: HashSet<i64>,
@@ -267,7 +267,7 @@ pub struct ReposPage {
 impl ReposPage {
     pub fn new() -> Self {
         Self {
-            view: View::Clones,
+            view: View::LocalClones,
             filter: String::new(),
             show: Show::All,
             sort: SortKey::Name,
@@ -280,7 +280,7 @@ impl ReposPage {
             syncing: None,
             sync_report: None,
             catalog: None,
-            inbox: ListState::new(),
+            remote: ListState::new(),
             ignored: ListState::new(),
             cloning: HashSet::new(),
             add_text: String::new(),
@@ -308,7 +308,7 @@ impl ReposPage {
     }
 
     pub fn set_catalog(&mut self, catalog: Catalog) {
-        self.inbox.retain(&catalog.inbox);
+        self.remote.retain(&catalog.inbox);
         self.ignored.retain(&catalog.ignored);
         self.catalog = Some(catalog);
     }
@@ -380,10 +380,10 @@ impl ReposPage {
 
         match self.view {
             View::Import => self.import.show(ui, cx.default_remote, &mut action),
-            View::Inbox | View::Ignored | View::Forks => {
+            View::RemoteList | View::Ignored | View::Forks => {
                 self.github_view(ui, catalog.as_ref(), &mut action);
             }
-            View::Clones | View::Problems => match &result {
+            View::LocalClones | View::Problems => match &result {
                 None if self.scanning.is_some() => {
                     ui.weak("Scanning the clone root…");
                 }
@@ -526,20 +526,20 @@ impl ReposPage {
             return;
         }
         match self.view {
-            View::Inbox => {
-                inbox::add_by_hand(ui, &mut self.add_text, &catalog.manual_owners, action);
+            View::RemoteList => {
+                remote_list::add_by_hand(ui, &mut self.add_text, &catalog.manual_owners, action);
                 ui.add_space(4.0);
-                inbox::repo_list(
+                remote_list::repo_list(
                     ui,
-                    ListKind::Inbox,
+                    ListKind::Remote,
                     &catalog.inbox,
-                    &mut self.inbox,
+                    &mut self.remote,
                     &self.filter,
                     &self.cloning,
                     action,
                 );
             }
-            View::Ignored => inbox::repo_list(
+            View::Ignored => remote_list::repo_list(
                 ui,
                 ListKind::Ignored,
                 &catalog.ignored,
@@ -548,7 +548,9 @@ impl ReposPage {
                 &self.cloning,
                 action,
             ),
-            _ => inbox::forks_view(ui, catalog, &self.filter, &mut self.only_undecided, action),
+            _ => {
+                remote_list::forks_view(ui, catalog, &self.filter, &mut self.only_undecided, action)
+            }
         }
     }
 
@@ -561,17 +563,17 @@ impl ReposPage {
     ) {
         ui.horizontal(|ui| {
             let count = |n: usize| thousands(n as u64);
-            let clones = match result {
-                Some(Ok(scan)) => format!("Clones ({})", count(scan.clones.len())),
-                _ => "Clones".to_owned(),
+            let remote = match catalog {
+                Some(catalog) => format!("Remote List ({})", count(catalog.inbox.len())),
+                None => "Remote List".to_owned(),
             };
-            ui.selectable_value(&mut self.view, View::Clones, clones);
+            ui.selectable_value(&mut self.view, View::RemoteList, remote);
+            let clones = match result {
+                Some(Ok(scan)) => format!("Local Clones ({})", count(scan.clones.len())),
+                _ => "Local Clones".to_owned(),
+            };
+            ui.selectable_value(&mut self.view, View::LocalClones, clones);
             if let Some(catalog) = catalog {
-                ui.selectable_value(
-                    &mut self.view,
-                    View::Inbox,
-                    format!("Inbox ({})", count(catalog.inbox.len())),
-                );
                 ui.selectable_value(
                     &mut self.view,
                     View::Ignored,
@@ -620,7 +622,7 @@ impl ReposPage {
 
         ui.horizontal(|ui| {
             let hint = match self.view {
-                View::Clones | View::Problems => "Filter by name or folder",
+                View::LocalClones | View::Problems => "Filter by name or folder",
                 _ => "Filter by name, description, language, topic or source",
             };
             if self.view != View::Import {
@@ -631,7 +633,7 @@ impl ReposPage {
                 );
             }
             {
-                if self.view == View::Clones {
+                if self.view == View::LocalClones {
                     let label = ui.label("Show");
                     egui::ComboBox::from_id_salt("repos_show")
                         .selected_text(self.show.label())
@@ -791,21 +793,7 @@ impl ReposPage {
     }
 
     fn sort_button(&mut self, ui: &mut egui::Ui, label: &str, key: SortKey) {
-        let arrow = match (self.sort == key, self.descending) {
-            (true, false) => " ⏶",
-            (true, true) => " ⏷",
-            (false, _) => "",
-        };
-        let button =
-            egui::Button::new(egui::RichText::new(format!("{label}{arrow}")).strong()).frame(false);
-        if ui.add(button).on_hover_text("Sort").clicked() {
-            if self.sort == key {
-                self.descending = !self.descending;
-            } else {
-                self.sort = key;
-                self.descending = false;
-            }
-        }
+        sort_header(ui, label, key, &mut self.sort, &mut self.descending, false);
     }
 
     fn problems_view(
@@ -874,11 +862,11 @@ impl ReposPage {
                             ui.horizontal(|ui| {
                                 if ui
                                     .link(clone.display_name())
-                                    .on_hover_text("Show in the clones list")
+                                    .on_hover_text("Show in Local Clones")
                                     .clicked()
                                 {
                                     self.selected = Some(clone.id);
-                                    self.view = View::Clones;
+                                    self.view = View::LocalClones;
                                 }
                                 ui.weak(&clone.rel_path);
                                 problem_detail(ui, clone, problem, &self.upstream_name, action);
@@ -1635,6 +1623,7 @@ mod tests {
             is_archived: false,
             is_private: false,
             pushed_at: Some(format!("{pushed}T12:00:00Z")),
+            stars: Some(1),
             sources: sources.to_vec(),
             fork_of: None,
         }
@@ -1649,15 +1638,19 @@ mod tests {
             &[Source::OrgMember, Source::Contributed],
         );
         website.is_archived = true;
+        website.stars = None; // not synced since stars were added
         let mut fork = repo_row(13, "me/react", "JavaScript", "2026-09-01", &[Source::Owned]);
         fork.is_fork = true;
         fork.fork_of = Some(("facebook/react".into(), ForkDecision::Undecided));
+        fork.stars = Some(0);
+        let mut api = repo_row(11, "myorg/api", "Rust", "2026-11-01", &[Source::OrgMember]);
+        api.stars = Some(1520);
         Catalog {
             last_sync: Some("2026-11-21 18:00:00".into()),
             relevant: 5,
             inbox: vec![
                 repo_row(10, "me/dotfiles", "Shell", "2026-11-20", &[Source::Owned]),
-                repo_row(11, "myorg/api", "Rust", "2026-11-01", &[Source::OrgMember]),
+                api,
                 website,
                 fork,
             ],
@@ -1892,10 +1885,73 @@ mod tests {
     }
 
     #[test]
-    fn inbox_selects_then_clones_or_ignores() {
+    fn remote_list_comes_before_local_clones() {
         let mut h = harness(Harness::builder());
         h.run();
-        h.get_by_label("Inbox (4)").click();
+        let remote = h.get_by_label("Remote List (4)").rect();
+        let local = h.get_by_label("Local Clones (5)").rect();
+        assert!(remote.right() <= local.left());
+        assert!(h.query_by_label_contains("Inbox").is_none());
+    }
+
+    /// Repository names in the Remote List, top to bottom.
+    fn remote_list_order(h: &Harness<'_, State>) -> Vec<String> {
+        let mut rows: Vec<(f32, String)> =
+            ["me/dotfiles", "myorg/api", "myorg/website", "me/react"]
+                .into_iter()
+                .map(|name| (h.get_by_label(name).rect().top(), name.to_owned()))
+                .collect();
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        rows.into_iter().map(|(_, name)| name).collect()
+    }
+
+    #[test]
+    fn remote_list_sorts_by_clicked_column() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.view = View::RemoteList;
+        h.run();
+        assert_eq!(
+            remote_list_order(&h),
+            ["me/dotfiles", "me/react", "myorg/api", "myorg/website"]
+        );
+        assert!(h.query_by_label("1,520").is_some(), "stars use separators");
+
+        // Stars start most-first; the repo with no count yet stays last either way.
+        h.get_by_label("Stars").click();
+        h.run();
+        assert!(h.query_by_label("Stars ⏷").is_some());
+        assert_eq!(
+            remote_list_order(&h),
+            ["myorg/api", "me/dotfiles", "me/react", "myorg/website"]
+        );
+        h.get_by_label("Stars ⏷").click();
+        h.run();
+        assert_eq!(
+            remote_list_order(&h),
+            ["me/react", "me/dotfiles", "myorg/api", "myorg/website"]
+        );
+
+        h.get_by_label("Language").click();
+        h.run();
+        assert_eq!(
+            remote_list_order(&h),
+            ["me/react", "myorg/api", "me/dotfiles", "myorg/website"]
+        );
+        h.get_by_label("Repository").click();
+        h.run();
+        h.get_by_label("Repository ⏶").click();
+        h.run();
+        assert_eq!(
+            remote_list_order(&h),
+            ["myorg/website", "myorg/api", "me/react", "me/dotfiles"]
+        );
+    }
+
+    #[test]
+    fn remote_list_selects_then_clones_or_ignores() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        h.get_by_label("Remote List (4)").click();
         h.run();
         h.get_by_label("me/dotfiles").click();
         h.run();
@@ -1929,9 +1985,9 @@ mod tests {
     }
 
     #[test]
-    fn inbox_filters_and_hides_archived() {
+    fn remote_list_filters_and_hides_archived() {
         let mut h = harness(Harness::builder());
-        h.state_mut().0.view = View::Inbox;
+        h.state_mut().0.view = View::RemoteList;
         h.state_mut().0.filter = "rust".into();
         h.run();
         assert!(h.query_by_label("myorg/api").is_some());
@@ -1949,7 +2005,7 @@ mod tests {
     #[test]
     fn add_by_hand_and_remove_an_owner() {
         let mut h = harness(Harness::builder());
-        h.state_mut().0.view = View::Inbox;
+        h.state_mut().0.view = View::RemoteList;
         h.state_mut().0.add_text = " rust-lang/rust ".into();
         h.run();
         h.get_by_label("Add").click();
@@ -2110,11 +2166,16 @@ mod tests {
         h.get_by_label("Problems (7)").click();
         h.run();
         h.render().unwrap().save(dir.join("problems.png")).unwrap();
-        h.get_by_label("Inbox (4)").click();
+        h.get_by_label("Remote List (4)").click();
         h.run();
         h.get_by_label("myorg/api").click();
         h.run();
-        h.render().unwrap().save(dir.join("inbox.png")).unwrap();
+        h.get_by_label("Stars").click();
+        h.run();
+        h.render()
+            .unwrap()
+            .save(dir.join("remote_list.png"))
+            .unwrap();
         h.get_by_label("Forks (1 undecided)").click();
         h.run();
         h.render().unwrap().save(dir.join("forks.png")).unwrap();

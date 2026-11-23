@@ -23,6 +23,7 @@ fragment RepoFields on Repository {
   isPrivate
   pushedAt
   sshUrl
+  stargazerCount
   primaryLanguage { name }
   repositoryTopics(first: 20) { nodes { topic { name } } }
 }
@@ -95,6 +96,8 @@ struct GhRepo {
     is_private: bool,
     pushed_at: Option<String>,
     ssh_url: Option<String>,
+    #[serde(default)]
+    stargazer_count: u32,
     primary_language: Option<GhName>,
     repository_topics: Option<GhTopics>,
     #[serde(default)]
@@ -154,6 +157,7 @@ impl GhRepo {
             is_private: self.is_private,
             pushed_at: self.pushed_at.clone(),
             ssh_url: self.ssh_url.clone(),
+            stars: self.stargazer_count,
         }
     }
 }
@@ -495,6 +499,8 @@ pub async fn check_repo(
         private: bool,
         pushed_at: Option<String>,
         ssh_url: Option<String>,
+        #[serde(default)]
+        stargazers_count: u32,
     }
     let response = http
         .get(format!("https://api.github.com/repos/{owner}/{name}"))
@@ -528,6 +534,7 @@ pub async fn check_repo(
         is_private: repo.private,
         pushed_at: repo.pushed_at,
         ssh_url: repo.ssh_url,
+        stars: repo.stargazers_count,
     }))
 }
 
@@ -611,6 +618,7 @@ mod tests {
                     "id": "R_1", "name": "react", "owner": { "login": "me" },
                     "description": "", "isFork": true, "isArchived": false, "isPrivate": false,
                     "pushedAt": "2026-10-01T12:00:00Z", "sshUrl": "git@github.com:me/react.git",
+                    "stargazerCount": 42,
                     "primaryLanguage": { "name": "JavaScript" },
                     "repositoryTopics": { "nodes": [ { "topic": { "name": "ui" } } ] },
                     "parent": {
@@ -637,6 +645,7 @@ mod tests {
         );
         assert_eq!(fetched.meta.language.as_deref(), Some("JavaScript"));
         assert_eq!(fetched.meta.topics, ["ui"]);
+        assert_eq!(fetched.meta.stars, 42);
         assert_eq!(
             fetched.parent.as_ref().unwrap().full_name(),
             "facebook/react"

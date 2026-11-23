@@ -1,5 +1,6 @@
-//! The Inbox, Ignored and Forks views of the Repositories tab.
+//! The Remote List, Ignored and Forks views of the Repositories tab.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use eframe::egui;
@@ -7,23 +8,37 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::db::{Catalog, ForkDecision, RepoRow};
 use crate::ui::repos::ReposAction;
+use crate::ui::{sort_header, thousands};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ListKind {
-    Inbox,
+    Remote,
     Ignored,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SortBy {
+/// The columns a list can be sorted by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SortKey {
     Name,
+    Sources,
+    Language,
+    Stars,
     Pushed,
+    Description,
 }
 
-/// Selection and options for one list (Inbox or Ignored).
+impl SortKey {
+    /// Counts and dates read best biggest or newest first.
+    fn starts_descending(self) -> bool {
+        matches!(self, SortKey::Stars | SortKey::Pushed)
+    }
+}
+
+/// Selection and options for one list (Remote List or Ignored).
 pub struct ListState {
     pub selected: HashSet<i64>,
-    sort: SortBy,
+    sort: SortKey,
+    descending: bool,
     hide_archived: bool,
 }
 
@@ -31,9 +46,21 @@ impl ListState {
     pub fn new() -> Self {
         Self {
             selected: HashSet::new(),
-            sort: SortBy::Name,
+            sort: SortKey::Name,
+            descending: false,
             hide_archived: false,
         }
+    }
+
+    fn header(&mut self, ui: &mut egui::Ui, label: &str, key: SortKey) {
+        sort_header(
+            ui,
+            label,
+            key,
+            &mut self.sort,
+            &mut self.descending,
+            key.starts_descending(),
+        );
     }
 
     /// Drops selected IDs that are no longer in the list.
@@ -58,7 +85,77 @@ fn matches(row: &RepoRow, needle: &str) -> bool {
         || row.sources.iter().any(|s| s.label() == needle)
 }
 
-/// The Inbox or Ignored list: select rows, then Clone / Ignore / Un-ignore them.
+/// Case-insensitive, without allocating.
+fn cmp_text(a: &str, b: &str) -> Ordering {
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(b.chars().flat_map(char::to_lowercase))
+}
+
+fn by_name(a: &RepoRow, b: &RepoRow) -> Ordering {
+    cmp_text(&a.owner, &b.owner).then_with(|| cmp_text(&a.name, &b.name))
+}
+
+/// Text worth sorting on: not missing and not blank.
+fn text(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|v| !v.trim().is_empty())
+}
+
+/// Orders present values with `cmp` (reversed when `descending`) and puts missing ones last
+/// either way.
+fn present_first<T>(
+    a: Option<T>,
+    b: Option<T>,
+    descending: bool,
+    cmp: impl FnOnce(&T, &T) -> Ordering,
+) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let order = cmp(&a, &b);
+            if descending { order.reverse() } else { order }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Sorts by `key`. Rows without that value (no language, stars not fetched yet, …) go last
+/// in both directions; ties go by name.
+fn sort_rows(rows: &mut [&RepoRow], key: SortKey, descending: bool) {
+    rows.sort_by(|a, b| {
+        let order = match key {
+            SortKey::Name => present_first(Some(a), Some(b), descending, |x, y| by_name(x, y)),
+            SortKey::Sources => present_first(
+                Some(&a.sources).filter(|s| !s.is_empty()),
+                Some(&b.sources).filter(|s| !s.is_empty()),
+                descending,
+                Ord::cmp,
+            ),
+            SortKey::Language => {
+                present_first(text(&a.language), text(&b.language), descending, |x, y| {
+                    cmp_text(x, y)
+                })
+            }
+            SortKey::Stars => present_first(a.stars, b.stars, descending, Ord::cmp),
+            SortKey::Pushed => present_first(
+                a.pushed_at.as_deref(),
+                b.pushed_at.as_deref(),
+                descending,
+                Ord::cmp,
+            ),
+            SortKey::Description => present_first(
+                text(&a.description),
+                text(&b.description),
+                descending,
+                |x, y| cmp_text(x, y),
+            ),
+        };
+        order.then_with(|| by_name(a, b))
+    });
+}
+
+/// The Remote List or Ignored list: select rows, then Clone / Ignore / Un-ignore them.
 pub fn repo_list(
     ui: &mut egui::Ui,
     kind: ListKind,
@@ -73,10 +170,7 @@ pub fn repo_list(
         .iter()
         .filter(|r| matches(r, &needle) && !(state.hide_archived && r.is_archived))
         .collect();
-    match state.sort {
-        SortBy::Name => {}
-        SortBy::Pushed => shown.sort_by(|a, b| b.pushed_at.cmp(&a.pushed_at)),
-    }
+    sort_rows(&mut shown, state.sort, state.descending);
 
     ui.horizontal(|ui| {
         if ui
@@ -99,7 +193,7 @@ pub fn repo_list(
         ui.label(format!("{count} selected"));
         let ids = || state.selected.iter().copied().collect::<Vec<i64>>();
         match kind {
-            ListKind::Inbox => {
+            ListKind::Remote => {
                 if ui
                     .add_enabled(count > 0, egui::Button::new("Clone"))
                     .on_hover_text("Clone over SSH into the clone root's layout")
@@ -136,16 +230,13 @@ pub fn repo_list(
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.checkbox(&mut state.hide_archived, "Hide archived");
-            ui.selectable_value(&mut state.sort, SortBy::Pushed, "Last push");
-            ui.selectable_value(&mut state.sort, SortBy::Name, "Name");
-            ui.weak("Sort:");
         });
     });
     ui.add_space(4.0);
 
     if shown.is_empty() {
         ui.weak(match (kind, rows.is_empty()) {
-            (ListKind::Inbox, true) => "Nothing waiting: every listed repo is cloned or ignored.",
+            (ListKind::Remote, true) => "Nothing waiting: every listed repo is cloned or ignored.",
             (ListKind::Ignored, true) => "Nothing ignored.",
             (_, false) => "Nothing matches the filter.",
         });
@@ -155,11 +246,11 @@ pub fn repo_list(
     ui.style_mut().interaction.selectable_labels = false;
     let row_height = ui.text_style_height(&egui::TextStyle::Body) + 8.0;
     egui::ScrollArea::horizontal()
-        .id_salt(("list_scroll", kind == ListKind::Inbox))
+        .id_salt(("list_scroll", kind == ListKind::Remote))
         .auto_shrink(false)
         .show(ui, |ui| {
             TableBuilder::new(ui)
-                .id_salt(("repo_list", kind == ListKind::Inbox))
+                .id_salt(("repo_list", kind == ListKind::Remote))
                 .striped(true)
                 .sense(egui::Sense::click())
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
@@ -181,19 +272,19 @@ pub fn repo_list(
                         .clip(true)
                         .resizable(true),
                 )
-                .column(Column::initial(90.0).at_least(80.0))
+                .column(Column::initial(75.0).at_least(65.0))
+                .column(Column::initial(100.0).at_least(90.0))
                 .column(Column::remainder().at_least(120.0).clip(true))
-                .header(22.0, |mut header| {
-                    for title in [
-                        "Repository",
-                        "Sources",
-                        "Language",
-                        "Last push",
-                        "Description",
+                .header(24.0, |mut header| {
+                    for (title, key) in [
+                        ("Repository", SortKey::Name),
+                        ("Sources", SortKey::Sources),
+                        ("Language", SortKey::Language),
+                        ("Stars", SortKey::Stars),
+                        ("Last push", SortKey::Pushed),
+                        ("Description", SortKey::Description),
                     ] {
-                        header.col(|ui| {
-                            ui.strong(title);
-                        });
+                        header.col(|ui| state.header(ui, title, key));
                     }
                 })
                 .body(|body| {
@@ -209,6 +300,15 @@ pub fn repo_list(
                         });
                         row.col(|ui| {
                             ui.label(repo.language.as_deref().unwrap_or(""));
+                        });
+                        row.col(|ui| match repo.stars {
+                            Some(stars) => {
+                                ui.label(thousands(u64::from(stars)));
+                            }
+                            None => {
+                                ui.weak("—")
+                                    .on_hover_text("Sync with GitHub to fetch the star count");
+                            }
                         });
                         row.col(|ui| {
                             let date = repo
@@ -313,7 +413,7 @@ pub fn forks_view(
 ) {
     ui.weak(
         "Linked: a fork you contribute from. Its clone gets the parent as an upstream remote, \
-         and the parent leaves the Inbox. Separate: a hard fork; fork and parent are handled \
+         and the parent leaves the Remote List. Separate: a hard fork; fork and parent are handled \
          on their own, with no upstream remote.",
     );
     ui.checkbox(only_undecided, "Only undecided");
@@ -404,6 +504,7 @@ mod tests {
             is_archived: false,
             is_private: false,
             pushed_at: Some("2026-10-01T00:00:00Z".into()),
+            stars: Some(10),
             sources: vec![Source::Owned],
             fork_of: None,
         }
@@ -418,6 +519,32 @@ mod tests {
         for needle in ["rus", "cl", "org"] {
             assert!(!matches(&repo, needle), "{needle}");
         }
+    }
+
+    #[test]
+    fn sorting_puts_missing_values_last_both_ways() {
+        let mut big = row(1, "me", "big");
+        big.stars = Some(5000);
+        big.language = None;
+        let mut unsynced = row(2, "Me", "Alpha");
+        unsynced.stars = None;
+        unsynced.language = Some("go".into());
+        let small = row(3, "me", "small");
+        let rows = [&big, &unsynced, &small];
+        let order = |key, descending| {
+            let mut sorted = rows.to_vec();
+            sort_rows(&mut sorted, key, descending);
+            sorted.iter().map(|r| r.id).collect::<Vec<_>>()
+        };
+        assert_eq!(order(SortKey::Stars, true), [1, 3, 2]);
+        assert_eq!(order(SortKey::Stars, false), [3, 1, 2]);
+        assert_eq!(order(SortKey::Language, false), [2, 3, 1]);
+        assert_eq!(order(SortKey::Language, true), [3, 2, 1]);
+        // Case-insensitive, owner then name.
+        assert_eq!(order(SortKey::Name, false), [2, 1, 3]);
+        assert_eq!(order(SortKey::Name, true), [3, 1, 2]);
+        // Equal descriptions fall back to the name.
+        assert_eq!(order(SortKey::Description, true), [2, 1, 3]);
     }
 
     #[test]

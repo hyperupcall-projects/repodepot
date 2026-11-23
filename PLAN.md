@@ -58,7 +58,7 @@ Sync runs when you click Sync (and optionally on startup). Results are cached in
 | Added by hand: one repo | `repository(owner, name)`, from `owner/name` or a URL |
 | Added by hand: org or user | `repositoryOwner(login).repositories`, which gives every repo of that owner |
 
-For each repo, store: GitHub node ID, owner, name, description, main language, topics, whether it's a fork (and its parent), archived, private, SSH URL, last push date, and which sources listed it. Sources show as badges.
+For each repo, store: GitHub node ID, owner, name, description, main language, topics, whether it's a fork (and its parent), archived, private, SSH URL, last push date, star count, and which sources listed it. Sources show as badges.
 
 - The node ID is stored so that a renamed or transferred repo updates its existing row instead of becoming a new one.
 - A repo that no longer appears in any source is flagged "no longer listed". It is never deleted.
@@ -73,11 +73,12 @@ For each repo, store: GitHub node ID, owner, name, description, main language, t
 - The path is chosen once, when the repo is cloned, and saved. It is never recomputed.
 - The UI always shows the repo as `owner/name`. The folder path only appears in its own column and in tooltips.
 
-### 1.3 Inbox and Ignored
+### 1.3 Remote List and Ignored
 
-Every relevant repo that isn't cloned and isn't ignored waits in the **Inbox** until you act on it. Nothing is cloned automatically.
+Every relevant repo that isn't cloned and isn't ignored waits in the **Remote List** until you act on it. Nothing is cloned automatically. It's the first view of the Repositories tab, left of **Local Clones**.
 
-- **Inbox columns**: `owner/name`, source badges, fork/archived/private badges, language, description, last push.
+- **Remote List columns**: `owner/name`, source badges, fork/archived/private badges, language, GitHub stars, last push, description.
+- Click a column title to sort by it; click again to reverse. Stars and last push start biggest/newest first. Rows missing the value (no language, stars not fetched yet) stay last either way.
 - **Actions** (on one repo or many selected): **Clone**, **Ignore**.
 - **Ignored list**: same columns, with an **Un-ignore** action.
 - Every list can be searched and filtered.
@@ -90,7 +91,7 @@ When a relevant repo is a fork, the app fetches its parent too. The family appea
 |---|---|
 | Undecided | The default. Shown as needing a decision. |
 | Linked | A fork for contributing. There is one clone of the fork, with remote `me` → fork and `upstream` → parent. The parent doesn't need its own clone or an Ignore. |
-| Separate | A hard fork. The fork and the parent go through the Inbox independently, and the fork's clone only has the `me` remote. |
+| Separate | A hard fork. The fork and the parent go through the Remote List independently, and the fork's clone only has the `me` remote. |
 
 If an existing clone already has remotes pointing at both the fork and the parent, the view suggests Linked. You still confirm it.
 
@@ -126,7 +127,7 @@ The app scans the clone root (two levels deep) on startup and when you ask. The 
 | Repo was renamed or moved on GitHub (found through the REST API, which follows redirects) | Update the remote URL; move the folder to the new name |
 | Not a git repo, or not in the layout (wrong depth or wrong letter folder) | Import (move) |
 
-Relevant repos that aren't cloned are the Inbox (1.3).
+Relevant repos that aren't cloned are the Remote List (1.3).
 
 ### 1.7 Import (move)
 
@@ -145,7 +146,7 @@ Breaking absolute paths inside a repo (Python venvs and similar) is accepted.
 
 - Before deleting, the app warns about uncommitted changes, unpushed commits and stashes, and needs you to confirm past them.
 - The folder goes to the trash (`trash` crate), never `rm -rf`.
-- The repo goes back to the Inbox. Its manual tags are removed, and the confirmation says so.
+- The repo goes back to the Remote List. Its manual tags are removed, and the confirmation says so.
 
 ## Part 2 — Tags, groups and actions
 
@@ -326,7 +327,7 @@ src/
   jobs/               engine, process groups, output buffers, ANSI parsing
   tags/               rules, exceptions, query parser, working set
   launchers.rs        presets, detection, workspace files
-  ui/                 repos, inbox, ignored, forks, problems, import,
+  ui/                 repos, remote list, ignored, forks, problems, import,
                       tags, groups, runner, settings
 ```
 
@@ -360,9 +361,9 @@ Each step ends with something usable.
    - Done when an existing folder of clones is listed with its status.
 3. **Job engine and basic runner**: run a command over all clones with live output, a limit on how many run at once, cancel and timeout.
    - Done when `git status --short` runs over every clone and cancels cleanly.
-4. **GitHub sync, Inbox and cloning**:
+4. **GitHub sync, Remote List and cloning**:
    - sources and the metadata cache
-   - Inbox, Ignored list and adding repos by hand
+   - Remote List, Ignored list and adding repos by hand
    - fork families
    - path assignment and SSH clones through the job engine
    - the problem categories that need the network
