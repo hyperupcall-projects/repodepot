@@ -1054,13 +1054,9 @@ mod tests {
                 },
             ])
             .unwrap();
-            let family = db.catalog().unwrap().forks[0].clone();
-            db.set_fork_decision(
-                family.forks[0].fork_id,
-                family.parent_id,
-                ForkDecision::Linked,
-            )
-            .unwrap();
+            let fork = db.catalog().unwrap().forks[0].clone();
+            db.set_fork_decision(fork.fork_id, fork.parent_id, ForkDecision::Linked)
+                .unwrap();
         }
 
         let config = Config {

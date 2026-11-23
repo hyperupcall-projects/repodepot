@@ -24,6 +24,7 @@ const MIGRATIONS: &[M<'static>] = &[
     M::up(include_str!("migrations/003_github_sync.sql")),
     M::up(include_str!("migrations/004_repo_stars.sql")),
     M::up(include_str!("migrations/005_repo_tags.sql")),
+    M::up(include_str!("migrations/006_fork_defaults.sql")),
 ];
 
 /// Stamped into every database this app creates (SQLite's `application_id`), so a file
@@ -60,6 +61,7 @@ const EXPECTED: &[(i64, &str, &[&str])] = &[
     (3, "meta", &["key", "value"]),
     (4, "repos", &["stars"]),
     (5, "repo_tags", &["repo_id", "tag_id"]),
+    (6, "fork_links", &["chosen"]),
 ];
 
 pub fn migrations() -> Migrations<'static> {
@@ -346,6 +348,8 @@ impl Db {
             )?;
         }
         let missing = missing_clones(&tx)?;
+        // Which forks have a clone, and with which remotes, may have changed.
+        github::apply_fork_defaults(&tx)?;
         tx.commit()?;
         Ok(ScanApplied {
             ids,
@@ -556,6 +560,46 @@ mod tests {
             "migrated forward"
         );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn undecided_forks_get_their_default_when_migrated() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        Migrations::from_slice(&MIGRATIONS[..5])
+            .to_latest(&mut conn)
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO repos (id, host, owner, name) VALUES
+                 (1, 'github.com', 'up', 'a'), (2, 'github.com', 'me', 'a'),
+                 (3, 'github.com', 'me', 'b'), (4, 'github.com', 'me', 'c'),
+                 (5, 'github.com', 'me', 'd');
+             INSERT INTO fork_links (fork_repo_id, parent_repo_id, decision) VALUES
+                 (2, 1, 'undecided'), (3, 1, 'undecided'), (4, 1, 'separate'), (5, 1, 'linked');
+             -- me/a is cloned with no remote for its parent; me/b has one.
+             INSERT INTO clones (id, path, repo_id) VALUES (1, 'a/a', 2), (2, 'b/b', 3);
+             INSERT INTO clone_remotes (clone_id, remote_name, url, repo_id) VALUES
+                 (1, 'origin', 'x', 2), (2, 'origin', 'y', 3), (2, 'upstream', 'z', 1);",
+        )
+        .unwrap();
+        let db = Db::prepare(conn).unwrap();
+        let mut stmt = db
+            .conn
+            .prepare("SELECT fork_repo_id, decision, chosen FROM fork_links ORDER BY 1")
+            .unwrap();
+        let rows: Vec<(i64, String, bool)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (2, "separate".into(), false),
+                (3, "linked".into(), false),
+                (4, "separate".into(), true),
+                (5, "linked".into(), true),
+            ]
+        );
     }
 
     #[test]

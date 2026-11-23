@@ -15,7 +15,7 @@ use crate::git::status::Status;
 use crate::tags::query::{self, Query};
 use crate::tags::{Rule, TagIndex};
 use crate::ui::import::ImportPage;
-use crate::ui::remote_list::{self, ListContext, ListKind, ListState};
+use crate::ui::remote_list::{self, ForksState, ListContext, ListKind, ListState};
 use crate::ui::tags::{TagsAction, tag_summary};
 use crate::ui::{sort_header, thousands};
 
@@ -203,7 +203,8 @@ impl ProblemKind {
                  Outside the layout."
             }
             ProblemKind::MissingUpstream => {
-                "You marked these forks as linked, but their clones have no remote for the parent."
+                "These forks are linked, but their clones have no remote for the parent. Add it, \
+                 or make the fork Separate in Forks."
             }
             ProblemKind::NotOnGitHub => {
                 "GitHub says these don't exist, or the token can't see them (deleted, made \
@@ -263,7 +264,7 @@ pub struct ReposPage {
     /// Repo IDs with a clone run in progress.
     cloning: HashSet<i64>,
     add_text: String,
-    only_undecided: bool,
+    forks: ForksState,
     upstream_name: String,
     import: ImportPage,
     /// The "add tag" field in the details panel.
@@ -291,7 +292,7 @@ impl ReposPage {
             ignored: ListState::new(),
             cloning: HashSet::new(),
             add_text: String::new(),
-            only_undecided: false,
+            forks: ForksState::new(),
             upstream_name: "upstream".to_owned(),
             import: ImportPage::new(),
             new_tag: String::new(),
@@ -505,7 +506,7 @@ impl ReposPage {
                 .on_hover_text(counts.join("\n"));
                 if report.new_forks > 0 {
                     ui.weak(format!(
-                        "· {} new to decide on in Forks",
+                        "· {} new in Forks",
                         plural(report.new_forks as u32, "fork", "forks")
                     ));
                 }
@@ -584,9 +585,7 @@ impl ReposPage {
                 &list,
                 action,
             ),
-            _ => {
-                remote_list::forks_view(ui, catalog, &self.filter, &mut self.only_undecided, action)
-            }
+            _ => remote_list::forks_view(ui, catalog, &self.filter, &mut self.forks, action),
         }
     }
 
@@ -616,18 +615,11 @@ impl ReposPage {
                     View::Ignored,
                     format!("Ignored ({})", count(catalog.ignored.len())),
                 );
-                let undecided = catalog
-                    .forks
-                    .iter()
-                    .flat_map(|f| &f.forks)
-                    .filter(|f| f.decision == ForkDecision::Undecided)
-                    .count();
-                let forks = if undecided > 0 {
-                    format!("Forks ({} undecided)", count(undecided))
-                } else {
-                    "Forks".to_owned()
-                };
-                ui.selectable_value(&mut self.view, View::Forks, forks);
+                ui.selectable_value(
+                    &mut self.view,
+                    View::Forks,
+                    format!("Forks ({})", count(catalog.forks.len())),
+                );
             }
             let problems = match result {
                 Some(Ok(scan)) => format!("Problems ({})", count(scan.problem_count())),
@@ -1624,7 +1616,7 @@ mod tests {
 
     use super::*;
     use crate::db::MissingClone;
-    use crate::db::github::{ForkEntry, ForkFamily};
+    use crate::db::github::ForkRow;
     use crate::db::{RepoRow, Source};
     use crate::git::import::ImportItem;
     use crate::git::remote_url;
@@ -1773,7 +1765,7 @@ mod tests {
         website.stars = None; // not synced since stars were added
         let mut fork = repo_row(13, "me/react", "JavaScript", "2026-09-01", &[Source::Owned]);
         fork.is_fork = true;
-        fork.fork_of = Some(("facebook/react".into(), ForkDecision::Undecided));
+        fork.fork_of = Some(("facebook/react".into(), ForkDecision::Linked));
         fork.stars = Some(0);
         let mut api = repo_row(11, "myorg/api", "Rust", "2026-11-01", &[Source::OrgMember]);
         api.stars = Some(1520);
@@ -1793,19 +1785,32 @@ mod tests {
                 "2019-01-01",
                 &[Source::OrgMember],
             )],
-            forks: vec![ForkFamily {
-                parent_id: 20,
-                parent_name: "facebook/react".into(),
-                parent_listed: true,
-                parent_cloned: false,
-                forks: vec![ForkEntry {
+            forks: vec![
+                ForkRow {
                     fork_id: 13,
-                    name: "me/react".into(),
-                    decision: ForkDecision::Undecided,
-                    cloned: false,
-                    suggest_linked: true,
-                }],
-            }],
+                    fork_name: "me/react".into(),
+                    parent_id: 20,
+                    parent_name: "facebook/react".into(),
+                    decision: ForkDecision::Linked,
+                    chosen: false,
+                    fork_cloned: false,
+                    parent_cloned: false,
+                    parent_listed: true,
+                    has_upstream_remote: false,
+                },
+                ForkRow {
+                    fork_id: 15,
+                    fork_name: "me/serde".into(),
+                    parent_id: 21,
+                    parent_name: "serde-rs/serde".into(),
+                    decision: ForkDecision::Separate,
+                    chosen: false,
+                    fork_cloned: true,
+                    parent_cloned: true,
+                    parent_listed: false,
+                    has_upstream_remote: false,
+                },
+            ],
             manual_owners: vec!["rust-lang".into()],
         }
     }
@@ -2448,18 +2453,40 @@ mod tests {
     fn fork_decisions() {
         let mut h = harness(Harness::builder());
         h.run();
-        h.get_by_label("Forks (1 undecided)").click();
+        h.get_by_label("Forks (2)").click();
         h.run();
-        assert!(h.query_by_label_contains("suggested: Linked").is_some());
+        for label in [
+            "Fork Repository",
+            "Upstream Repository",
+            "Linked / Separate",
+            "Notes",
+            "facebook/react",
+            "upstream listed",
+            "upstream not in your sources",
+            "cloned without upstream remote",
+        ] {
+            assert!(h.query_by_label_contains(label).is_some(), "{label}");
+        }
+        assert!(h.query_by_label_contains("ndecided").is_none());
+        // The button shows the decision; clicking it switches to the other one.
         h.get_by_label("Linked").click();
+        h.run();
+        h.get_by_label("Separate").click();
         h.run();
         assert_eq!(
             h.state().1,
-            vec![ReposAction::SetForkDecision {
-                fork_id: 13,
-                parent_id: 20,
-                decision: ForkDecision::Linked
-            }]
+            vec![
+                ReposAction::SetForkDecision {
+                    fork_id: 13,
+                    parent_id: 20,
+                    decision: ForkDecision::Separate
+                },
+                ReposAction::SetForkDecision {
+                    fork_id: 15,
+                    parent_id: 21,
+                    decision: ForkDecision::Linked
+                }
+            ]
         );
     }
 
@@ -2496,7 +2523,7 @@ mod tests {
             .save(dir.join("remote_list_tagged.png"))
             .unwrap();
         h.state_mut().0.tag_filter.clear();
-        h.get_by_label("Forks (1 undecided)").click();
+        h.get_by_label("Forks (2)").click();
         h.run();
         h.render().unwrap().save(dir.join("forks.png")).unwrap();
         h.state_mut().0.import.folder = "/home/someone/old".into();

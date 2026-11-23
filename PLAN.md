@@ -11,7 +11,7 @@ A Rust + egui desktop app (Linux first) for managing the GitHub repositories I c
 | Identity in the database | Host + owner + name (`github.com` + `facebook` + `react`) |
 | Repo sources | Owned, org member, collaborator, contributed, added by hand (one repo or a whole org/user) |
 | Cloning | SSH only. The default remote is named `me` (configurable). |
-| Forks | Listed together. Each fork is either linked to its parent or kept separate; you decide case by case. |
+| Forks | One table of every fork and its upstream. Each fork is either linked to its parent or kept separate: linked by default, and you can switch any of them. |
 | Updating | No automatic fetch or pull. You update through the command runner. |
 | Import | Moves repos into the layout |
 | Tags | On clones, and on repos that aren't cloned yet (a clone keeps its repo's tags). Manual and rule-made tags are tracked separately; rules can have exceptions. |
@@ -87,15 +87,14 @@ Every relevant repo that isn't cloned and isn't ignored waits in the **Remote Li
 
 ### 1.4 Fork families
 
-When a relevant repo is a fork, the app fetches its parent too. The family appears in the **Forks** view, with all known forks of the same parent listed together. Each fork–parent pair gets a decision:
+When a relevant repo is a fork, the app fetches its parent too. The **Forks** view is a table with one row per fork–parent pair: **Fork Repository**, **Upstream Repository**, a **Linked** / **Separate** button (click to switch), and **Notes** (whether the fork is cloned and with an upstream remote, whether the upstream is cloned, whether it's listed or not in your sources, and whether the decision is the default or set by you). Click a column title to sort by it; click again to reverse. Each pair is either:
 
 | Decision | Meaning |
 |---|---|
-| Undecided | The default. Shown as needing a decision. |
 | Linked | A fork for contributing. There is one clone of the fork, with remote `me` → fork and `upstream` → parent. The parent doesn't need its own clone or an Ignore. |
 | Separate | A hard fork. The fork and the parent go through the Remote List independently, and the fork's clone only has the `me` remote. |
 
-If an existing clone already has remotes pointing at both the fork and the parent, the view suggests Linked. You still confirm it.
+There is no undecided state. A pair is **Linked by default**, unless the fork has a clone and none of its clones has a remote for the parent: then it's set up on its own, and the default is **Separate**. The default is recomputed after every sync and scan, so it follows the clones on disk. Clicking the button decides it by hand, and from then on syncs and scans leave it alone.
 
 A repo counts as cloned if it is the main remote of a clone, or if it is the parent of a Linked fork that is cloned.
 
@@ -346,7 +345,8 @@ repos            id, host, owner, name, github_node_id, description, language,
                  UNIQUE (host, owner, name), case-insensitive
 repo_sources     repo_id, source        -- owned | org_member | collaborator | contributed | manual_repo | manual_owner
 manual_owners    login                  -- orgs/users added by hand
-fork_links       fork_repo_id, parent_repo_id, decision   -- undecided | linked | separate
+fork_links       fork_repo_id, parent_repo_id, decision,  -- linked | separate
+                 chosen                                   -- set by hand; else the default
 clones           id, path UNIQUE, repo_id NULL            -- path is relative to the clone root; repo_id is the main remote's repo
 clone_remotes    clone_id, remote_name, url, repo_id NULL
 tags             id, name UNIQUE

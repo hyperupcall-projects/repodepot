@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
+use crate::db::github::ForkRow;
 use crate::db::{Catalog, ForkDecision, RepoRow};
 use crate::tags::query::Query;
 use crate::tags::{self, TagIndex};
@@ -441,17 +442,11 @@ fn name_cell(ui: &mut egui::Ui, repo: &RepoRow, cloning: bool) {
     }
     if let Some((parent, decision)) = &repo.fork_of {
         let text = match decision {
-            ForkDecision::Undecided => "fork".to_owned(),
-            ForkDecision::Linked => "linked fork".to_owned(),
-            ForkDecision::Separate => "hard fork".to_owned(),
+            ForkDecision::Linked => "linked fork",
+            ForkDecision::Separate => "separate fork",
         };
-        let color = if *decision == ForkDecision::Undecided {
-            ui.visuals().warn_fg_color
-        } else {
-            ui.visuals().weak_text_color()
-        };
-        ui.colored_label(color, text).on_hover_text(format!(
-            "Fork of {parent} ({}). Decide in the Forks view.",
+        ui.weak(text).on_hover_text(format!(
+            "Fork of {parent} ({}). Change it in the Forks view.",
             decision.label().to_lowercase()
         ));
     }
@@ -503,87 +498,249 @@ pub fn add_by_hand(
     });
 }
 
-/// Fork families and a decision for each fork.
+/// The columns the Forks table can be sorted by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ForkSort {
+    Fork,
+    Upstream,
+    Decision,
+    Notes,
+}
+
+/// Sort order of the Forks table.
+pub struct ForksState {
+    sort: ForkSort,
+    descending: bool,
+}
+
+impl ForksState {
+    pub fn new() -> Self {
+        Self {
+            sort: ForkSort::Fork,
+            descending: false,
+        }
+    }
+
+    fn header(&mut self, ui: &mut egui::Ui, label: &str, key: ForkSort) {
+        sort_header(ui, label, key, &mut self.sort, &mut self.descending, false);
+    }
+}
+
+/// One entry in a fork's Notes column.
+struct Note {
+    text: &'static str,
+    hover: &'static str,
+    /// Something to fix rather than just to know.
+    warn: bool,
+}
+
+impl Note {
+    fn new(text: &'static str, hover: &'static str) -> Self {
+        Self {
+            text,
+            hover,
+            warn: false,
+        }
+    }
+}
+
+fn fork_notes(fork: &ForkRow) -> Vec<Note> {
+    let mut notes = Vec::new();
+    if fork.has_upstream_remote {
+        notes.push(Note::new(
+            "cloned with upstream remote",
+            "A clone of the fork has a remote for the upstream.",
+        ));
+    } else if fork.fork_cloned {
+        notes.push(match fork.decision {
+            ForkDecision::Linked => Note {
+                text: "cloned without upstream remote",
+                hover: "Linked, but the fork's clone has no remote for the upstream. Add it \
+                        from Problems, or make the fork Separate.",
+                warn: true,
+            },
+            ForkDecision::Separate => Note::new(
+                "cloned without upstream remote",
+                "The fork's clone is set up on its own, with no remote for the upstream.",
+            ),
+        });
+    }
+    if fork.parent_cloned {
+        notes.push(Note::new(
+            "upstream cloned",
+            "The upstream has a clone of its own.",
+        ));
+    }
+    notes.push(if fork.parent_listed {
+        Note::new(
+            "upstream listed",
+            "One of your sources lists the upstream too. While the fork is linked, the \
+             upstream stays out of the Remote List.",
+        )
+    } else {
+        Note::new(
+            "upstream not in your sources",
+            "No source lists the upstream; it's known only as this fork's parent.",
+        )
+    });
+    notes.push(if fork.chosen {
+        Note::new("set by you", "Syncs and scans won't change it.")
+    } else {
+        Note::new(
+            "default",
+            "Linked, unless the fork has a clone and none of its clones has a remote for \
+             the upstream. Syncs and scans keep it current until you click the button.",
+        )
+    });
+    notes
+}
+
+fn notes_text(notes: &[Note]) -> String {
+    notes.iter().map(|n| n.text).collect::<Vec<_>>().join(" · ")
+}
+
+/// Sorts by `key`, ties by fork then upstream name.
+fn sort_forks(rows: &mut [(&ForkRow, String)], key: ForkSort, descending: bool) {
+    rows.sort_by(|(a, a_notes), (b, b_notes)| {
+        let order = match key {
+            ForkSort::Fork => cmp_text(&a.fork_name, &b.fork_name),
+            ForkSort::Upstream => cmp_text(&a.parent_name, &b.parent_name),
+            ForkSort::Decision => a.decision.as_str().cmp(b.decision.as_str()),
+            ForkSort::Notes => cmp_text(a_notes, b_notes),
+        };
+        let order = if descending { order.reverse() } else { order };
+        order
+            .then_with(|| cmp_text(&a.fork_name, &b.fork_name))
+            .then_with(|| cmp_text(&a.parent_name, &b.parent_name))
+    });
+}
+
+/// Every fork with its upstream, and whether the two are linked.
 pub fn forks_view(
     ui: &mut egui::Ui,
     catalog: &Catalog,
     filter: &str,
-    only_undecided: &mut bool,
+    state: &mut ForksState,
     action: &mut Option<ReposAction>,
 ) {
     ui.weak(
-        "Linked: a fork you contribute from. Its clone gets the parent as an upstream remote, \
-         and the parent leaves the Remote List. Separate: a hard fork; fork and parent are handled \
-         on their own, with no upstream remote.",
+        "Linked: a fork you contribute from. Its clone gets the upstream as a remote, and the \
+         upstream leaves the Remote List. Separate: a hard fork; fork and upstream are handled \
+         on their own, with no upstream remote. Forks are linked by default, unless your clone \
+         of the fork has no remote for the upstream. Click a button to switch it.",
     );
-    ui.checkbox(only_undecided, "Only undecided");
     ui.add_space(4.0);
 
     let needle = filter.trim().to_lowercase();
-    let mut shown = 0;
-    egui::ScrollArea::vertical()
+    let mut shown: Vec<(&ForkRow, String)> = catalog
+        .forks
+        .iter()
+        .map(|f| (f, notes_text(&fork_notes(f))))
+        .filter(|(f, notes)| {
+            needle.is_empty()
+                || f.fork_name.to_lowercase().contains(&needle)
+                || f.parent_name.to_lowercase().contains(&needle)
+                || notes.contains(&needle)
+        })
+        .collect();
+    sort_forks(&mut shown, state.sort, state.descending);
+
+    if shown.is_empty() {
+        ui.weak(if catalog.forks.is_empty() {
+            "No forks yet. They show up here after a sync."
+        } else {
+            "Nothing matches the filter."
+        });
+        return;
+    }
+
+    let row_height = ui.spacing().interact_size.y + 6.0;
+    egui::ScrollArea::horizontal()
         .id_salt("forks_scroll")
         .auto_shrink(false)
         .show(ui, |ui| {
-            for family in &catalog.forks {
-                let forks: Vec<_> = family
-                    .forks
-                    .iter()
-                    .filter(|f| !*only_undecided || f.decision == ForkDecision::Undecided)
-                    .filter(|f| {
-                        needle.is_empty()
-                            || f.name.to_lowercase().contains(&needle)
-                            || family.parent_name.to_lowercase().contains(&needle)
-                    })
-                    .collect();
-                if forks.is_empty() {
-                    continue;
-                }
-                shown += 1;
-                ui.horizontal(|ui| {
-                    ui.strong(&family.parent_name);
-                    if family.parent_cloned {
-                        ui.weak("· cloned");
+            TableBuilder::new(ui)
+                .id_salt("forks_table")
+                .striped(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(
+                    Column::initial(260.0)
+                        .at_least(140.0)
+                        .clip(true)
+                        .resizable(true),
+                )
+                .column(
+                    Column::initial(260.0)
+                        .at_least(140.0)
+                        .clip(true)
+                        .resizable(true),
+                )
+                .column(Column::initial(125.0).at_least(115.0))
+                .column(Column::remainder().at_least(160.0).clip(true))
+                .header(24.0, |mut header| {
+                    for (title, key) in [
+                        ("Fork Repository", ForkSort::Fork),
+                        ("Upstream Repository", ForkSort::Upstream),
+                        ("Linked / Separate", ForkSort::Decision),
+                        ("Notes", ForkSort::Notes),
+                    ] {
+                        header.col(|ui| state.header(ui, title, key));
                     }
-                    if family.parent_listed {
-                        ui.weak("· listed");
-                    } else {
-                        ui.weak("· not in your sources");
-                    }
-                });
-                ui.indent(("family", family.parent_id), |ui| {
-                    for fork in forks {
-                        ui.horizontal(|ui| {
-                            ui.label(&fork.name);
-                            if fork.cloned {
-                                ui.weak("cloned");
-                            }
-                            let mut decision = fork.decision;
-                            for option in ForkDecision::ALL {
-                                ui.radio_value(&mut decision, option, option.label());
-                            }
-                            if decision != fork.decision {
+                })
+                .body(|body| {
+                    body.rows(row_height, shown.len(), |mut row| {
+                        let (fork, _) = shown[row.index()];
+                        row.col(|ui| {
+                            ui.label(&fork.fork_name);
+                        });
+                        row.col(|ui| {
+                            ui.label(&fork.parent_name);
+                        });
+                        row.col(|ui| {
+                            let other = fork.decision.toggled();
+                            let hover = match fork.decision {
+                                ForkDecision::Linked => {
+                                    "Linked: the fork's clone gets the upstream as a remote, and \
+                                     the upstream leaves the Remote List."
+                                }
+                                ForkDecision::Separate => {
+                                    "Separate: fork and upstream are handled on their own."
+                                }
+                            };
+                            let button = egui::Button::new(fork.decision.label())
+                                .min_size(egui::vec2(80.0, 0.0));
+                            if ui
+                                .add(button)
+                                .on_hover_text(format!(
+                                    "{hover}\nClick to make it {}.",
+                                    other.label()
+                                ))
+                                .clicked()
+                            {
                                 *action = Some(ReposAction::SetForkDecision {
                                     fork_id: fork.fork_id,
-                                    parent_id: family.parent_id,
-                                    decision,
+                                    parent_id: fork.parent_id,
+                                    decision: other,
                                 });
                             }
-                            if fork.suggest_linked {
-                                ui.weak("· suggested: Linked (a clone already has both remotes)");
+                        });
+                        row.col(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            for (i, note) in fork_notes(fork).into_iter().enumerate() {
+                                if i > 0 {
+                                    ui.weak(" · ");
+                                }
+                                let text = if note.warn {
+                                    egui::RichText::new(note.text).color(ui.visuals().warn_fg_color)
+                                } else {
+                                    egui::RichText::new(note.text)
+                                        .color(ui.visuals().weak_text_color())
+                                };
+                                ui.label(text).on_hover_text(note.hover);
                             }
                         });
-                    }
+                    });
                 });
-                ui.add_space(6.0);
-            }
-            if shown == 0 {
-                ui.weak(if catalog.forks.is_empty() {
-                    "No forks yet. They show up here after a sync."
-                } else {
-                    "Nothing matches."
-                });
-            }
         });
 }
 
@@ -645,6 +802,69 @@ mod tests {
         assert_eq!(order(SortKey::Name, true), [3, 1, 2]);
         // Equal descriptions fall back to the name.
         assert_eq!(order(SortKey::Description, true), [2, 1, 3]);
+    }
+
+    fn fork_row(id: i64, fork: &str, parent: &str, decision: ForkDecision) -> ForkRow {
+        ForkRow {
+            fork_id: id,
+            fork_name: fork.into(),
+            parent_id: 100 + id,
+            parent_name: parent.into(),
+            decision,
+            chosen: false,
+            fork_cloned: false,
+            parent_cloned: false,
+            parent_listed: true,
+            has_upstream_remote: false,
+        }
+    }
+
+    #[test]
+    fn forks_sort_by_each_column_with_ties_by_name() {
+        let mut unlisted = fork_row(1, "me/zed", "Acme/zed", ForkDecision::Linked);
+        unlisted.parent_listed = false;
+        let separate = fork_row(2, "Me/alpha", "other/alpha", ForkDecision::Separate);
+        let mut chosen = fork_row(3, "me/beta", "acme/beta", ForkDecision::Linked);
+        chosen.chosen = true;
+        let rows = [&unlisted, &separate, &chosen];
+        let order = |key, descending| {
+            let mut sorted: Vec<_> = rows
+                .iter()
+                .map(|f| (*f, notes_text(&fork_notes(f))))
+                .collect();
+            sort_forks(&mut sorted, key, descending);
+            sorted.iter().map(|(f, _)| f.fork_id).collect::<Vec<_>>()
+        };
+        assert_eq!(order(ForkSort::Fork, false), [2, 3, 1], "case-insensitive");
+        assert_eq!(order(ForkSort::Fork, true), [1, 3, 2]);
+        assert_eq!(order(ForkSort::Upstream, false), [3, 1, 2]);
+        // Linked before Separate; ties by fork name in either direction.
+        assert_eq!(order(ForkSort::Decision, false), [3, 1, 2]);
+        assert_eq!(order(ForkSort::Decision, true), [2, 3, 1]);
+        // "upstream listed · default" < "upstream listed · set by you" < "upstream not …"
+        assert_eq!(order(ForkSort::Notes, false), [2, 3, 1]);
+    }
+
+    #[test]
+    fn fork_notes_flag_a_linked_fork_whose_clone_lacks_the_upstream() {
+        let mut fork = fork_row(1, "me/a", "up/a", ForkDecision::Linked);
+        fork.fork_cloned = true;
+        fork.chosen = true;
+        let notes = fork_notes(&fork);
+        assert_eq!(
+            notes_text(&notes),
+            "cloned without upstream remote · upstream listed · set by you"
+        );
+        assert!(notes[0].warn);
+        fork.decision = ForkDecision::Separate;
+        assert!(!fork_notes(&fork)[0].warn);
+        fork.has_upstream_remote = true;
+        fork.parent_cloned = true;
+        fork.chosen = false;
+        assert_eq!(
+            notes_text(&fork_notes(&fork)),
+            "cloned with upstream remote · upstream cloned · upstream listed · default"
+        );
     }
 
     #[test]

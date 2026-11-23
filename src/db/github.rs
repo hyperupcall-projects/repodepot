@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::Db;
 
@@ -57,7 +57,6 @@ impl Source {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForkDecision {
-    Undecided,
     /// Fork for contributing: one clone with the parent as an upstream remote.
     Linked,
     /// Hard fork: fork and parent are handled independently.
@@ -65,15 +64,8 @@ pub enum ForkDecision {
 }
 
 impl ForkDecision {
-    pub const ALL: [ForkDecision; 3] = [
-        ForkDecision::Undecided,
-        ForkDecision::Linked,
-        ForkDecision::Separate,
-    ];
-
     pub fn as_str(self) -> &'static str {
         match self {
-            ForkDecision::Undecided => "undecided",
             ForkDecision::Linked => "linked",
             ForkDecision::Separate => "separate",
         }
@@ -81,19 +73,43 @@ impl ForkDecision {
 
     fn parse(text: &str) -> Self {
         match text {
-            "linked" => ForkDecision::Linked,
             "separate" => ForkDecision::Separate,
-            _ => ForkDecision::Undecided,
+            _ => ForkDecision::Linked,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            ForkDecision::Undecided => "Undecided",
             ForkDecision::Linked => "Linked",
             ForkDecision::Separate => "Separate",
         }
     }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            ForkDecision::Linked => ForkDecision::Separate,
+            ForkDecision::Separate => ForkDecision::Linked,
+        }
+    }
+}
+
+/// Gives every fork not decided by hand its default: linked, unless the fork has a clone
+/// and none of its clones has a remote for the parent (it's set up as a separate repo).
+/// Runs after every sync and scan, since both change what that depends on.
+pub(super) fn apply_fork_defaults(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE fork_links SET decision = CASE
+             WHEN EXISTS (SELECT 1 FROM clones c
+                          WHERE c.repo_id = fork_links.fork_repo_id AND c.missing_since IS NULL)
+              AND NOT EXISTS (SELECT 1 FROM clones c JOIN clone_remotes r ON r.clone_id = c.id
+                              WHERE c.repo_id = fork_links.fork_repo_id
+                                AND c.missing_since IS NULL
+                                AND r.repo_id = fork_links.parent_repo_id)
+             THEN 'separate' ELSE 'linked' END
+         WHERE NOT chosen",
+        [],
+    )?;
+    Ok(())
 }
 
 /// A repo as GitHub describes it.
@@ -172,24 +188,22 @@ impl RepoRow {
     }
 }
 
+/// One fork and its parent, for the Forks table.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ForkFamily {
+pub struct ForkRow {
+    pub fork_id: i64,
+    pub fork_name: String,
     pub parent_id: i64,
     pub parent_name: String,
+    pub decision: ForkDecision,
+    /// Decided by hand; otherwise it's the default.
+    pub chosen: bool,
+    pub fork_cloned: bool,
+    pub parent_cloned: bool,
     /// The parent has a source of its own.
     pub parent_listed: bool,
-    pub parent_cloned: bool,
-    pub forks: Vec<ForkEntry>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ForkEntry {
-    pub fork_id: i64,
-    pub name: String,
-    pub decision: ForkDecision,
-    pub cloned: bool,
-    /// A clone already has remotes for both the fork and the parent.
-    pub suggest_linked: bool,
+    /// A clone of the fork has a remote for the parent.
+    pub has_upstream_remote: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -200,7 +214,7 @@ pub struct Catalog {
     /// Listed repos that aren't cloned or ignored, shown as the Remote List.
     pub inbox: Vec<RepoRow>,
     pub ignored: Vec<RepoRow>,
-    pub forks: Vec<ForkFamily>,
+    pub forks: Vec<ForkRow>,
     pub manual_owners: Vec<String>,
 }
 
@@ -275,6 +289,7 @@ impl Db {
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             [],
         )?;
+        apply_fork_defaults(&tx)?;
         let relevant: i64 = tx.query_row(
             "SELECT count(DISTINCT repo_id) FROM repo_sources",
             [],
@@ -383,6 +398,7 @@ impl Db {
         Ok(())
     }
 
+    /// Decides a fork by hand; the default no longer applies to it.
     pub fn set_fork_decision(
         &mut self,
         fork_id: i64,
@@ -390,7 +406,8 @@ impl Db {
         decision: ForkDecision,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE fork_links SET decision = ?3 WHERE fork_repo_id = ?1 AND parent_repo_id = ?2",
+            "UPDATE fork_links SET decision = ?3, chosen = 1
+             WHERE fork_repo_id = ?1 AND parent_repo_id = ?2",
             params![fork_id, parent_id, decision.as_str()],
         )?;
         Ok(())
@@ -530,30 +547,29 @@ impl Db {
             let rows = stmt.query_map([], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        // Repo IDs each clone has remotes for, to suggest linking.
-        let mut remotes_per_clone: HashMap<i64, HashSet<i64>> = HashMap::new();
-        {
+        // (main repo, remote's repo) for each present clone, to tell whether a fork's clone
+        // has a remote for the parent.
+        let clone_remotes: HashSet<(i64, i64)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT cr.clone_id, cr.repo_id FROM clone_remotes cr
+                "SELECT DISTINCT c.repo_id, cr.repo_id FROM clone_remotes cr
                  JOIN clones c ON c.id = cr.clone_id
-                 WHERE cr.repo_id IS NOT NULL AND c.missing_since IS NULL",
+                 WHERE c.repo_id IS NOT NULL AND cr.repo_id IS NOT NULL
+                   AND c.missing_since IS NULL",
             )?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
-            for row in rows {
-                let (clone, repo) = row?;
-                remotes_per_clone.entry(clone).or_default().insert(repo);
-            }
-        }
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
 
-        let links: Vec<(i64, i64, ForkDecision)> = {
+        let links: Vec<(i64, i64, ForkDecision, bool)> = {
             let mut stmt = self
                 .conn
-                .prepare("SELECT fork_repo_id, parent_repo_id, decision FROM fork_links")?;
+                .prepare("SELECT fork_repo_id, parent_repo_id, decision, chosen FROM fork_links")?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get(0)?,
                     r.get(1)?,
                     ForkDecision::parse(&r.get::<_, String>(2)?),
+                    r.get(3)?,
                 ))
             })?;
             rows.collect::<rusqlite::Result<_>>()?
@@ -562,7 +578,7 @@ impl Db {
         // Parents of linked forks are covered by the fork's clone.
         let mut covered: HashSet<i64> = HashSet::new();
         let mut cloned_through_fork: HashSet<i64> = HashSet::new();
-        for (fork, parent, decision) in &links {
+        for (fork, parent, decision, _) in &links {
             if *decision == ForkDecision::Linked && listed(fork) {
                 covered.insert(*parent);
                 if cloned.contains(fork) {
@@ -641,41 +657,28 @@ impl Db {
         inbox.sort_by(by_name);
         ignored.sort_by(by_name);
 
-        let mut families: HashMap<i64, ForkFamily> = HashMap::new();
-        for (fork, parent, decision) in &links {
+        let mut forks = Vec::new();
+        for (fork, parent, decision, chosen) in &links {
             if !listed(fork) {
                 continue;
             }
             let (Some(fork_repo), Some(parent_repo)) = (repos.get(fork), repos.get(parent)) else {
                 continue;
             };
-            let suggest_linked = *decision == ForkDecision::Undecided
-                && remotes_per_clone
-                    .values()
-                    .any(|repos| repos.contains(fork) && repos.contains(parent));
-            families
-                .entry(*parent)
-                .or_insert_with(|| ForkFamily {
-                    parent_id: *parent,
-                    parent_name: parent_repo.row.full_name(),
-                    parent_listed: listed(parent),
-                    parent_cloned: cloned.contains(parent),
-                    forks: Vec::new(),
-                })
-                .forks
-                .push(ForkEntry {
-                    fork_id: *fork,
-                    name: fork_repo.row.full_name(),
-                    decision: *decision,
-                    cloned: cloned.contains(fork),
-                    suggest_linked,
-                });
+            forks.push(ForkRow {
+                fork_id: *fork,
+                fork_name: fork_repo.row.full_name(),
+                parent_id: *parent,
+                parent_name: parent_repo.row.full_name(),
+                decision: *decision,
+                chosen: *chosen,
+                fork_cloned: cloned.contains(fork),
+                parent_cloned: cloned.contains(parent),
+                parent_listed: listed(parent),
+                has_upstream_remote: clone_remotes.contains(&(*fork, *parent)),
+            });
         }
-        let mut forks: Vec<ForkFamily> = families.into_values().collect();
-        for family in &mut forks {
-            family.forks.sort_by_key(|a| a.name.to_lowercase());
-        }
-        forks.sort_by_key(|a| a.parent_name.to_lowercase());
+        forks.sort_by_key(|f| (f.fork_name.to_lowercase(), f.parent_name.to_lowercase()));
 
         Ok(Catalog {
             last_sync: self.last_sync()?,
@@ -930,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn linked_forks_cover_their_parent() {
+    fn forks_default_to_linked_which_covers_the_parent() {
         let mut db = Db::open_in_memory().unwrap();
         let parent = meta("P", "facebook", "react");
         db.apply_sync(&[
@@ -939,27 +942,30 @@ mod tests {
         ])
         .unwrap();
         let catalog = db.catalog().unwrap();
-        assert_eq!(names(&catalog.inbox), ["facebook/react", "me/react"]);
-        let family = &catalog.forks[0];
-        assert_eq!(family.parent_name, "facebook/react");
-        assert!(family.parent_listed);
-        assert_eq!(family.forks[0].decision, ForkDecision::Undecided);
+        assert_eq!(names(&catalog.inbox), ["me/react"], "the parent is covered");
+        let row = &catalog.forks[0];
         assert_eq!(
-            catalog.inbox[1].fork_of,
-            Some(("facebook/react".into(), ForkDecision::Undecided))
+            (row.fork_name.as_str(), row.parent_name.as_str()),
+            ("me/react", "facebook/react")
+        );
+        assert!(row.parent_listed);
+        assert_eq!(row.decision, ForkDecision::Linked);
+        assert!(!row.chosen);
+        assert_eq!(
+            catalog.inbox[0].fork_of,
+            Some(("facebook/react".into(), ForkDecision::Linked))
         );
 
-        let (fork_id, parent_id) = (family.forks[0].fork_id, family.parent_id);
+        let (fork_id, parent_id) = (row.fork_id, row.parent_id);
+        db.set_fork_decision(fork_id, parent_id, ForkDecision::Separate)
+            .unwrap();
+        let catalog = db.catalog().unwrap();
+        assert_eq!(names(&catalog.inbox), ["facebook/react", "me/react"]);
+        assert!(catalog.forks[0].chosen);
+
         db.set_fork_decision(fork_id, parent_id, ForkDecision::Linked)
             .unwrap();
         assert_eq!(names(&db.catalog().unwrap().inbox), ["me/react"]);
-
-        db.set_fork_decision(fork_id, parent_id, ForkDecision::Separate)
-            .unwrap();
-        assert_eq!(
-            names(&db.catalog().unwrap().inbox),
-            ["facebook/react", "me/react"]
-        );
     }
 
     #[test]
@@ -971,25 +977,78 @@ mod tests {
         };
         db.apply_sync(&[fork(meta("F", "me", "react"), parent, &[Source::Owned])])
             .unwrap();
-        let family = db.catalog().unwrap().forks[0].clone();
-        let fork_id = family.forks[0].fork_id;
+        let row = db.catalog().unwrap().forks[0].clone();
 
-        let items = db.clone_items(&[fork_id]).unwrap();
+        let items = db.clone_items(&[row.fork_id]).unwrap();
         assert_eq!(items[0].ssh_url, "git@github.com:me/react.git");
-        assert_eq!(items[0].upstream_url, None);
-
-        db.set_fork_decision(fork_id, family.parent_id, ForkDecision::Linked)
-            .unwrap();
-        let items = db.clone_items(&[fork_id]).unwrap();
         assert_eq!(
             items[0].upstream_url.as_deref(),
             Some("git@github.com:facebook/react.git")
         );
         assert_eq!(items[0].name, "react");
+
+        db.set_fork_decision(row.fork_id, row.parent_id, ForkDecision::Separate)
+            .unwrap();
+        let items = db.clone_items(&[row.fork_id]).unwrap();
+        assert_eq!(items[0].upstream_url, None);
     }
 
     #[test]
-    fn existing_clone_with_both_remotes_suggests_linking() {
+    fn a_clone_without_the_parent_remote_makes_the_default_separate() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (me, parent) = (url("me", "react"), url("facebook", "react"));
+        // Cloned before the first sync: the sync already sees the clone.
+        scan(&mut db, &[("r/react", &me, None)]);
+        db.apply_sync(&[fork(
+            meta("F", "me", "react"),
+            meta("P", "facebook", "react"),
+            &[Source::Owned],
+        )])
+        .unwrap();
+        let decision = |db: &Db| {
+            let row = db.catalog().unwrap().forks[0].clone();
+            (row.decision, row.chosen, row.has_upstream_remote)
+        };
+        assert_eq!(decision(&db), (ForkDecision::Separate, false, false));
+        assert!(
+            db.repo_states()
+                .unwrap()
+                .unwrap()
+                .values()
+                .all(|s| s.linked_upstream.is_none())
+        );
+
+        // Adding the parent as a remote follows on the next scan.
+        scan(&mut db, &[("r/react", &me, Some(&parent))]);
+        assert_eq!(decision(&db), (ForkDecision::Linked, false, true));
+
+        // A second clone set up on its own doesn't undo that.
+        scan(
+            &mut db,
+            &[("r/react", &me, Some(&parent)), ("r/react~2", &me, None)],
+        );
+        assert_eq!(decision(&db).0, ForkDecision::Linked);
+
+        // Only that one clone, with no parent remote: back to separate.
+        scan(&mut db, &[("r/react~2", &me, None)]);
+        assert_eq!(decision(&db).0, ForkDecision::Separate);
+
+        // Decided by hand, it stays put.
+        let row = db.catalog().unwrap().forks[0].clone();
+        db.set_fork_decision(row.fork_id, row.parent_id, ForkDecision::Linked)
+            .unwrap();
+        scan(&mut db, &[("r/react~2", &me, None)]);
+        db.apply_sync(&[fork(
+            meta("F", "me", "react"),
+            meta("P", "facebook", "react"),
+            &[Source::Owned],
+        )])
+        .unwrap();
+        assert_eq!(decision(&db), (ForkDecision::Linked, true, false));
+    }
+
+    #[test]
+    fn a_fork_cloned_after_the_sync_gets_its_default_on_the_scan() {
         let mut db = Db::open_in_memory().unwrap();
         db.apply_sync(&[fork(
             meta("F", "me", "react"),
@@ -997,17 +1056,15 @@ mod tests {
             &[Source::Owned],
         )])
         .unwrap();
-        scan(
-            &mut db,
-            &[(
-                "r/react",
-                &url("me", "react"),
-                Some(&url("facebook", "react")),
-            )],
+        assert_eq!(
+            db.catalog().unwrap().forks[0].decision,
+            ForkDecision::Linked
         );
-        let family = &db.catalog().unwrap().forks[0];
-        assert!(family.forks[0].suggest_linked);
-        assert!(family.forks[0].cloned);
+        scan(&mut db, &[("r/react", &url("me", "react"), None)]);
+        let row = db.catalog().unwrap().forks[0].clone();
+        assert_eq!(row.decision, ForkDecision::Separate);
+        assert!(row.fork_cloned);
+        assert!(!row.parent_cloned);
     }
 
     #[test]
