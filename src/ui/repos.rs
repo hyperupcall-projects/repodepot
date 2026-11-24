@@ -265,6 +265,10 @@ pub struct ReposPage {
     cloning: HashSet<i64>,
     add_text: String,
     forks: ForksState,
+    /// IDs of ignored repos, to tell which clones are of one.
+    ignored_repos: HashSet<i64>,
+    /// Leaves clones of ignored repos out of Local Clones.
+    hide_ignored_clones: bool,
     upstream_name: String,
     import: ImportPage,
     /// The "add tag" field in the details panel.
@@ -293,6 +297,8 @@ impl ReposPage {
             cloning: HashSet::new(),
             add_text: String::new(),
             forks: ForksState::new(),
+            ignored_repos: HashSet::new(),
+            hide_ignored_clones: true,
             upstream_name: "upstream".to_owned(),
             import: ImportPage::new(),
             new_tag: String::new(),
@@ -316,8 +322,10 @@ impl ReposPage {
     }
 
     pub fn set_catalog(&mut self, catalog: Catalog) {
-        self.remote.retain(&catalog.inbox);
+        self.remote
+            .retain(catalog.inbox.iter().chain(&catalog.ignored_remote));
         self.ignored.retain(&catalog.ignored);
+        self.ignored_repos = catalog.ignored.iter().map(|r| r.id).collect();
         self.catalog = Some(catalog);
     }
 
@@ -571,7 +579,7 @@ impl ReposPage {
                 remote_list::repo_list(
                     ui,
                     ListKind::Remote,
-                    &catalog.inbox,
+                    (&catalog.inbox, &catalog.ignored_remote),
                     &mut self.remote,
                     &list,
                     action,
@@ -580,7 +588,7 @@ impl ReposPage {
             View::Ignored => remote_list::repo_list(
                 ui,
                 ListKind::Ignored,
-                &catalog.ignored,
+                (&catalog.ignored, &[]),
                 &mut self.ignored,
                 &list,
                 action,
@@ -679,6 +687,15 @@ impl ReposPage {
                         })
                         .response
                         .labelled_by(label.id);
+                    let hidden = match result {
+                        Some(Ok(scan)) => scan.clones.iter().filter(|c| self.is_ignored(c)).count(),
+                        _ => 0,
+                    };
+                    ui.checkbox(&mut self.hide_ignored_clones, "Hide ignored")
+                        .on_hover_text(format!(
+                            "Leave out clones of repos you ignored ({})",
+                            thousands(hidden as u64)
+                        ));
                 }
             }
 
@@ -779,6 +796,13 @@ impl ReposPage {
         }
     }
 
+    /// The clone's main repo is ignored.
+    fn is_ignored(&self, clone: &CloneInfo) -> bool {
+        clone
+            .repo_id
+            .is_some_and(|id| self.ignored_repos.contains(&id))
+    }
+
     fn clones_view(
         &mut self,
         ui: &mut egui::Ui,
@@ -811,6 +835,7 @@ impl ReposPage {
             .iter()
             .filter(|c| {
                 matches_text(&needle, &c.display_name(), &c.rel_path)
+                    && !(self.hide_ignored_clones && self.is_ignored(c))
                     && self.show.matches(c)
                     && tag_query.is_none_or(|q| q.matches(&tags.tags_of(c.id)))
             })
@@ -889,7 +914,8 @@ impl ReposPage {
                 body.rows(row_height, rows.len(), |mut row| {
                     let clone = rows[row.index()];
                     row.set_selected(self.selected == Some(clone.id));
-                    row.col(|ui| name_cell(ui, clone));
+                    let ignored = !self.hide_ignored_clones && self.is_ignored(clone);
+                    row.col(|ui| name_cell(ui, clone, ignored));
                     row.col(|ui| {
                         ui.weak(&clone.rel_path);
                     });
@@ -1073,12 +1099,17 @@ fn sort_rows(rows: &mut [&CloneInfo], key: SortKey, descending: bool) {
     });
 }
 
-fn name_cell(ui: &mut egui::Ui, clone: &CloneInfo) {
+/// `ignored`: the clone's repo is ignored, and that's worth saying here.
+fn name_cell(ui: &mut egui::Ui, clone: &CloneInfo, ignored: bool) {
     ui.label(clone.display_name());
     if let Some(repo) = clone.repo()
         && !repo.is_github()
     {
         ui.weak(&repo.host);
+    }
+    if ignored {
+        ui.weak("ignored")
+            .on_hover_text("Its repo is in the Ignored list.");
     }
 }
 
@@ -1750,6 +1781,7 @@ mod tests {
             stars: Some(1),
             sources: sources.to_vec(),
             fork_of: None,
+            ignored: false,
         }
     }
 
@@ -1769,6 +1801,16 @@ mod tests {
         fork.stars = Some(0);
         let mut api = repo_row(11, "myorg/api", "Rust", "2026-11-01", &[Source::OrgMember]);
         api.stars = Some(1520);
+        let mut old_thing = repo_row(
+            14,
+            "myorg/old-thing",
+            "Perl",
+            "2019-01-01",
+            &[Source::OrgMember],
+        );
+        old_thing.ignored = true;
+        let mut serde = repo_row(16, "serde-rs/serde", "Rust", "2026-11-02", &[]);
+        serde.ignored = true;
         Catalog {
             last_sync: Some("2026-11-21 18:00:00".into()),
             relevant: 5,
@@ -1778,13 +1820,8 @@ mod tests {
                 website,
                 fork,
             ],
-            ignored: vec![repo_row(
-                14,
-                "myorg/old-thing",
-                "Perl",
-                "2019-01-01",
-                &[Source::OrgMember],
-            )],
+            ignored: vec![old_thing.clone(), serde],
+            ignored_remote: vec![old_thing],
             forks: vec![
                 ForkRow {
                     fork_id: 13,
@@ -1855,6 +1892,41 @@ mod tests {
         h.get_by_label("Close").click();
         h.run();
         assert_eq!(h.state().0.selected, None);
+    }
+
+    #[test]
+    fn ignored_repos_are_hidden_until_unticked() {
+        let mut h = harness(Harness::builder());
+        // x/serde is a clone of serde-rs/serde, which is ignored.
+        if let Some(Ok(scan)) = &mut h.state_mut().0.result {
+            scan.clones[4].repo_id = Some(16);
+        }
+        h.run();
+        assert!(h.query_by_label("serde-rs/serde").is_none());
+        assert!(h.query_by_label("facebook/react").is_some());
+        h.get_by_label("Hide ignored").click();
+        h.run();
+        assert!(h.query_by_label("serde-rs/serde").is_some());
+        assert!(h.query_by_label("ignored").is_some());
+
+        h.get_by_label("Remote List (4)").click();
+        h.run();
+        assert!(h.query_by_label("myorg/old-thing").is_none());
+        assert!(h.query_by_label("ignored").is_none());
+        h.get_by_label("Hide ignored").click();
+        h.run();
+        assert!(h.query_by_label("ignored").is_some());
+        h.get_by_label("myorg/old-thing").click();
+        h.run();
+        h.get_by_label("Un-ignore").click();
+        h.run();
+        assert_eq!(
+            h.state().1,
+            vec![ReposAction::SetIgnored {
+                repo_ids: vec![14],
+                ignored: false
+            }]
+        );
     }
 
     #[test]
@@ -2523,6 +2595,14 @@ mod tests {
             .save(dir.join("remote_list_tagged.png"))
             .unwrap();
         h.state_mut().0.tag_filter.clear();
+        h.get_by_label("Hide ignored").click();
+        h.run();
+        h.render()
+            .unwrap()
+            .save(dir.join("remote_list_ignored.png"))
+            .unwrap();
+        h.get_by_label("Hide ignored").click();
+        h.run();
         h.get_by_label("Forks (2)").click();
         h.run();
         h.render().unwrap().save(dir.join("forks.png")).unwrap();

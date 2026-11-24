@@ -996,6 +996,7 @@ mod tests {
             stars: None,
             sources: Vec::new(),
             fork_of: None,
+            ignored: false,
         };
         (
             vec![

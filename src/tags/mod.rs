@@ -623,6 +623,7 @@ mod tests {
             stars: None,
             sources: Vec::new(),
             fork_of: None,
+            ignored: false,
         };
         let mut lang = rule(10, RuleField::Language, "(.+)", "lang:$1");
         lang.exceptions.insert(1); // clone 1, which isn't repo 1

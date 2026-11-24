@@ -45,6 +45,8 @@ pub struct ListState {
     sort: SortKey,
     descending: bool,
     hide_archived: bool,
+    /// Leaves ignored repos out of the Remote List (they're in the Ignored list).
+    hide_ignored: bool,
     /// The "Tag" field for tagging the selected repos.
     tag_name: String,
 }
@@ -56,6 +58,7 @@ impl ListState {
             sort: SortKey::Name,
             descending: false,
             hide_archived: false,
+            hide_ignored: true,
             tag_name: String::new(),
         }
     }
@@ -72,8 +75,8 @@ impl ListState {
     }
 
     /// Drops selected IDs that are no longer in the list.
-    pub fn retain(&mut self, rows: &[RepoRow]) {
-        let present: HashSet<i64> = rows.iter().map(|r| r.id).collect();
+    pub fn retain<'a>(&mut self, rows: impl IntoIterator<Item = &'a RepoRow>) {
+        let present: HashSet<i64> = rows.into_iter().map(|r| r.id).collect();
         self.selected.retain(|id| present.contains(id));
     }
 }
@@ -196,17 +199,20 @@ pub struct ListContext<'a> {
 }
 
 /// The Remote List or Ignored list: select rows, then Clone / Ignore / Un-ignore or tag them.
+/// `ignored_rows` are the ignored repos the Remote List shows when "Hide ignored" is off.
 pub fn repo_list(
     ui: &mut egui::Ui,
     kind: ListKind,
-    rows: &[RepoRow],
+    (rows, ignored_rows): (&[RepoRow], &[RepoRow]),
     state: &mut ListState,
     cx: &ListContext<'_>,
     action: &mut Option<ReposAction>,
 ) {
+    let show_ignored = kind == ListKind::Remote && !state.hide_ignored;
     let needle = cx.filter.trim().to_lowercase();
     let mut shown: Vec<&RepoRow> = rows
         .iter()
+        .chain(if show_ignored { ignored_rows } else { &[] })
         .filter(|r| {
             matches(r, &needle)
                 && !(state.hide_archived && r.is_archived)
@@ -255,6 +261,19 @@ pub fn repo_list(
                         repo_ids: ids(state),
                         ignored: true,
                     });
+                }
+                if show_ignored {
+                    let any_ignored = ignored_rows.iter().any(|r| state.selected.contains(&r.id));
+                    if ui
+                        .add_enabled(any_ignored, egui::Button::new("Un-ignore"))
+                        .on_disabled_hover_text("Select ignored repos first")
+                        .clicked()
+                    {
+                        *action = Some(ReposAction::SetIgnored {
+                            repo_ids: ids(state),
+                            ignored: false,
+                        });
+                    }
                 }
             }
             ListKind::Ignored => {
@@ -319,6 +338,13 @@ pub fn repo_list(
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.checkbox(&mut state.hide_archived, "Hide archived");
+            if kind == ListKind::Remote {
+                ui.checkbox(&mut state.hide_ignored, "Hide ignored")
+                    .on_hover_text(format!(
+                        "Leave out ignored repos ({}); they're in the Ignored list",
+                        thousands(ignored_rows.len() as u64)
+                    ));
+            }
         });
     });
     ui.add_space(4.0);
@@ -388,7 +414,9 @@ pub fn repo_list(
                         let repo = shown[row.index()];
                         let selected = state.selected.contains(&repo.id);
                         row.set_selected(selected);
-                        row.col(|ui| name_cell(ui, repo, cx.cloning.contains(&repo.id)));
+                        row.col(|ui| {
+                            name_cell(ui, repo, cx.cloning.contains(&repo.id), show_ignored);
+                        });
                         row.col(|ui| {
                             let labels: Vec<&str> =
                                 repo.sources.iter().map(|s| s.label()).collect();
@@ -434,11 +462,16 @@ pub fn repo_list(
         });
 }
 
-fn name_cell(ui: &mut egui::Ui, repo: &RepoRow, cloning: bool) {
+/// `mark_ignored`: say so when the repo is ignored (where that isn't a given).
+fn name_cell(ui: &mut egui::Ui, repo: &RepoRow, cloning: bool, mark_ignored: bool) {
     ui.label(repo.full_name());
     if cloning {
         ui.spinner();
         ui.weak("cloning");
+    }
+    if mark_ignored && repo.ignored {
+        ui.weak("ignored")
+            .on_hover_text("In the Ignored list. Un-ignore to keep it on the Remote List.");
     }
     if let Some((parent, decision)) = &repo.fork_of {
         let text = match decision {
@@ -764,6 +797,7 @@ mod tests {
             stars: Some(10),
             sources: vec![Source::Owned],
             fork_of: None,
+            ignored: false,
         }
     }
 

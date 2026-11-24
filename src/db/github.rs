@@ -180,6 +180,7 @@ pub struct RepoRow {
     pub sources: Vec<Source>,
     /// Parent's full name and the decision for this fork.
     pub fork_of: Option<(String, ForkDecision)>,
+    pub ignored: bool,
 }
 
 impl RepoRow {
@@ -213,7 +214,11 @@ pub struct Catalog {
     pub relevant: usize,
     /// Listed repos that aren't cloned or ignored, shown as the Remote List.
     pub inbox: Vec<RepoRow>,
+    /// Every ignored repo, shown as the Ignored list.
     pub ignored: Vec<RepoRow>,
+    /// The ignored repos that would otherwise be on the Remote List; it shows them when
+    /// "Hide ignored" is off.
+    pub ignored_remote: Vec<RepoRow>,
     pub forks: Vec<ForkRow>,
     pub manual_owners: Vec<String>,
 }
@@ -590,7 +595,6 @@ impl Db {
 
         struct Base {
             row: RepoRow,
-            ignored: bool,
         }
         let mut repos: HashMap<i64, Base> = HashMap::new();
         {
@@ -629,8 +633,8 @@ impl Db {
                                 ForkDecision::parse(decision.as_deref().unwrap_or("")),
                             )
                         }),
+                        ignored: r.get(10)?,
                     },
-                    ignored: r.get(10)?,
                 })
             })?;
             for base in rows {
@@ -642,10 +646,15 @@ impl Db {
 
         let mut inbox = Vec::new();
         let mut ignored = Vec::new();
+        let mut ignored_remote = Vec::new();
         for (id, base) in &repos {
-            if base.ignored {
+            let remote = listed(id) && !is_cloned(id) && !covered.contains(id);
+            if base.row.ignored {
                 ignored.push(base.row.clone());
-            } else if listed(id) && !is_cloned(id) && !covered.contains(id) {
+                if remote {
+                    ignored_remote.push(base.row.clone());
+                }
+            } else if remote {
                 inbox.push(base.row.clone());
             }
         }
@@ -656,6 +665,7 @@ impl Db {
         };
         inbox.sort_by(by_name);
         ignored.sort_by(by_name);
+        ignored_remote.sort_by(by_name);
 
         let mut forks = Vec::new();
         for (fork, parent, decision, chosen) in &links {
@@ -685,6 +695,7 @@ impl Db {
             relevant: sources.len(),
             inbox,
             ignored,
+            ignored_remote,
             forks,
             manual_owners: self.manual_owners()?,
         })
@@ -879,6 +890,33 @@ mod tests {
         );
         assert_eq!(catalog.inbox[0].stars, Some(1234));
         assert_eq!(names(&catalog.ignored), ["me/gamma"]);
+    }
+
+    #[test]
+    fn ignored_repos_that_would_be_listed_are_kept_for_the_remote_list() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.apply_sync(&[
+            fetched(meta("A", "me", "alpha"), &[Source::Owned]),
+            fetched(meta("B", "me", "beta"), &[Source::Owned]),
+            fetched(meta("C", "me", "gamma"), &[Source::Owned]),
+        ])
+        .unwrap();
+        scan(&mut db, &[("a/alpha", &url("me", "alpha"), None)]);
+        let id = |db: &Db, name: &str| -> i64 {
+            db.conn
+                .query_row("SELECT id FROM repos WHERE name = ?1", [name], |r| r.get(0))
+                .unwrap()
+        };
+        let ignore = [id(&db, "alpha"), id(&db, "gamma")];
+        db.set_ignored(&ignore, true).unwrap();
+
+        let catalog = db.catalog().unwrap();
+        assert_eq!(names(&catalog.inbox), ["me/beta"]);
+        assert!(!catalog.inbox[0].ignored);
+        assert_eq!(names(&catalog.ignored), ["me/alpha", "me/gamma"]);
+        // alpha is cloned, so it wouldn't be on the Remote List anyway.
+        assert_eq!(names(&catalog.ignored_remote), ["me/gamma"]);
+        assert!(catalog.ignored_remote[0].ignored);
     }
 
     #[test]

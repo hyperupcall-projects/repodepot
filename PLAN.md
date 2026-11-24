@@ -83,6 +83,7 @@ Every relevant repo that isn't cloned and isn't ignored waits in the **Remote Li
 - **Tag filter** (here, in Ignored and in Local Clones): a tag query such as `work AND NOT old`, or `untagged` for repos with no tags. The ⏷ menu next to it picks a tag, or its opposite.
 - **Actions** (on one repo or many selected): **Clone**, **Ignore**.
 - **Ignored list**: same columns, with an **Un-ignore** action.
+- **Hide ignored** (on by default): the Remote List leaves out ignored repos. Untick it to show the ones that would otherwise be listed, marked "ignored", with an **Un-ignore** action next to Ignore.
 - Every list can be searched and filtered.
 
 ### 1.4 Fork families
@@ -116,6 +117,7 @@ The app scans the clone root (two levels deep) on startup and when you ask. The 
 - **Status column** (no network access): branch, uncommitted changes, ahead/behind (as of the last fetch), detached HEAD, no upstream branch.
   - It comes from one `git status --porcelain=v2 --branch` per clone.
   - It refreshes after every scan and after every run.
+- **Hide ignored** (on by default): Local Clones leaves out clones whose main repo is ignored. Untick it to show them, marked "ignored".
 
 **Problems view**: folders that don't match a relevant repo, grouped by problem.
 
