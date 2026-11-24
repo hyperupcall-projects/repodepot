@@ -64,7 +64,8 @@ pub struct RunnerPage {
     snippet_name: String,
     tabs: Vec<RunTab>,
     active: usize,
-    /// A working set sent from the Tags tab: (label, clone IDs). Replaces the filter.
+    /// Clones sent from a selection in the Repositories tab: (label, clone IDs). Replaces the
+    /// filter.
     working_set: Option<(String, Vec<i64>)>,
     last_request: u64,
     last_tab: u64,
@@ -237,11 +238,11 @@ impl RunnerPage {
         ui.horizontal(|ui| {
             let label = ui.label("Run in");
             if let Some((name, _)) = &self.working_set {
-                ui.strong(format!("working set \"{name}\""));
+                ui.strong(name);
                 ui.weak(plural(targets.len(), "clone", "clones"));
                 if ui
                     .small_button("×")
-                    .on_hover_text("Stop using the working set; run in all clones instead")
+                    .on_hover_text("Run in all clones instead")
                     .clicked()
                 {
                     self.working_set = None;

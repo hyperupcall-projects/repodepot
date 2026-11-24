@@ -11,13 +11,6 @@ use tokio::task::spawn_blocking;
 use super::{Event, Shared, lock};
 use crate::launch::{self, WorkspaceKind};
 
-/// Where a launch was asked for, so a failure is shown there.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Origin {
-    Repos,
-    Tags,
-}
-
 /// What the UI needs to know about an installed launcher.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LauncherInfo {
@@ -35,7 +28,6 @@ pub struct LaunchRequest {
     pub targets: Vec<(String, PathBuf)>,
     /// Names the workspace file, so the same group reuses the same file.
     pub workspace_name: String,
-    pub origin: Origin,
 }
 
 pub(super) async fn detect_launchers(shared: &Shared) {
@@ -87,11 +79,11 @@ pub(super) async fn open(shared: &Arc<Shared>, request: LaunchRequest) -> Result
             }
         };
         let command = launcher.together_command(&paths, workspace.as_deref())?;
-        spawn_detached(shared, command, request.origin)?;
+        spawn_detached(shared, command)?;
     } else {
         for (_, path) in &request.targets {
             let command = launcher.each_command(path)?;
-            spawn_detached(shared, command, request.origin)?;
+            spawn_detached(shared, command)?;
         }
     }
     Ok(())
@@ -99,7 +91,7 @@ pub(super) async fn open(shared: &Arc<Shared>, request: LaunchRequest) -> Result
 
 /// Starts an app in its own session with no input or output, so it outlives depository.
 /// Reports a quick failure (a non-zero exit within a few seconds), and reaps the process.
-fn spawn_detached(shared: &Arc<Shared>, command: Vec<String>, origin: Origin) -> Result<()> {
+fn spawn_detached(shared: &Arc<Shared>, command: Vec<String>) -> Result<()> {
     let (program, args) = command.split_first().context("empty command")?;
     let mut process = tokio::process::Command::new(program);
     process
@@ -115,10 +107,9 @@ fn spawn_detached(shared: &Arc<Shared>, command: Vec<String>, origin: Origin) ->
     let program = program.clone();
     tokio::spawn(async move {
         match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-            Ok(Ok(status)) if !status.success() => shared.emitter.emit(Event::LaunchFailed {
-                origin,
-                message: format!("{program} stopped with {status}"),
-            }),
+            Ok(Ok(status)) if !status.success() => shared.emitter.emit(Event::LaunchFailed(
+                format!("{program} stopped with {status}"),
+            )),
             Ok(_) => {}
             // Still running (most editors): wait for it so it doesn't linger as a zombie.
             Err(_) => {

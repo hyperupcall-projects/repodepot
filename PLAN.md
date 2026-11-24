@@ -24,7 +24,7 @@ A Rust + egui desktop app (Linux first) for managing the GitHub repositories I c
 - **Clone**: a folder under the clone root that holds a git repository.
 - **Source**: why a repo is in the list (owned, contributed, …). A repo can have several.
 - **Fork family**: a parent repo plus the forks of it that the app knows about.
-- **Working set**: the temporary list of clones an action runs on.
+- **Selection**: the rows selected in a Repositories view. Opening and running act on the clones it covers.
 - **Run**: one command run over a set of clones, shown in its own tab.
 
 ## Settings and storage
@@ -81,8 +81,8 @@ Every relevant repo that isn't cloned and isn't ignored waits in the **Remote Li
 - **Remote List columns**: `owner/name`, source badges, fork/archived/private badges, language, GitHub stars, last push, description.
 - Click a column title to sort by it; click again to reverse. Stars and last push start biggest/newest first. Rows missing the value (no language, no tags, stars not fetched yet) stay last either way.
 - **Tags column**, and **Add tag** / **Remove tag** for the selected repos (see Part 2).
-- **Tag filter** (here, in Ignored and in Local Clones): a tag query such as `work AND NOT old`, or `untagged` for repos with no tags. The ⏷ menu next to it picks a tag, or its opposite.
-- **Actions** (on one repo or many selected): **Clone**, **Ignore**.
+- **Tag filter** (here, in Ignored and in Local Clones): a tag query such as `work AND NOT old`, or `untagged` for repos with no tags. The ⏷ menu next to it picks a tag, or its opposite (see 2.4).
+- **Actions** (on one repo or many selected, see 1.10): **Clone**, **Ignore**.
 - **Ignored list**: same columns, with an **Un-ignore** action.
 - **Hide ignored** (on by default): the Remote List leaves out ignored repos. Untick it to show the ones that would otherwise be listed, marked "ignored", with an **Un-ignore** action next to Ignore.
 - Every list can be searched and filtered (see 1.9).
@@ -176,6 +176,25 @@ Every view of the Repositories tab except Import has two rows of filters between
 - **Clear filters** shows up once anything narrows the view. It empties the search, language, branch and tag fields and resets the drop-downs, and leaves the toggles alone.
 - In a narrow window the rows wrap, keeping each label with its field.
 
+### 1.10 Selecting rows and acting on them
+
+Every view of the Repositories tab except Import has rows to select: repos in the Remote List, Ignored and Forks (a fork's row stands for the fork), and clones in Local Clones and Problems. Each view keeps its own selection.
+
+- **Click** selects just that row, even if others were selected. **Ctrl-click** (Cmd-click on macOS) adds a row or takes it out. **Shift-click** selects every row from the last one clicked to this one; with Ctrl (Cmd) held too, it adds that range to the selection.
+- Only rows on screen stay selected. A row the filters hide drops out of the selection, so an action never reaches rows you can't see.
+- Local Clones shows the details panel while exactly one clone is selected. Its **Close** clears the selection.
+- In Problems, a clone with two problems is listed, and selected, twice. Missing folders and folders that aren't git repos can't be selected. **Details** on a row shows the clone in Local Clones, clearing that view's own filters (Show, branch, tags) if they would hide it.
+- Buttons inside a row (Linked / Separate, Use the new URL, …) work without selecting it.
+
+A bar between the filters and the list acts on the selection. It wraps in a narrow window.
+
+| Part | What it does |
+|---|---|
+| **Select all shown**, **Clear selection**, and the count | |
+| The view's own actions | Remote List: **Clone**, **Ignore**, and **Un-ignore** while Hide ignored is off. Ignored: **Un-ignore**. These clear the selection, since the rows leave the list. |
+| **Open each**, **Open together**, **Run command…** | On the selected clones, or the clones of the selected repos (2.5). Repos that aren't cloned are left out, and the bar says how many; with none cloned, the buttons are off and say why. |
+| **Tag** field, **Add tag**, **Remove tag** | On the selected rows (2.1). Tagging keeps the selection, so several tags can go on the same rows. |
+
 ## Part 2 — Tags, groups and actions
 
 Clones can be tagged, and so can repos in the Remote List that aren't cloned yet.
@@ -185,7 +204,7 @@ Clones can be tagged, and so can repos in the Remote List that aren't cloned yet
 
 ### 2.1 Manual tags
 
-Add and remove tags from the repo's detail panel, for the selected repos in the Remote List, or for a whole working set from the Groups view. Any name works, and `:` can be used for namespaces (`org:myorg`, `lang:rust`). Names are lowercased and spaces become `-`; `and`, `or`, `not`, `untagged`, `*` and parentheses are kept for queries.
+Add and remove tags from a clone's details panel, or for the selected rows of any Repositories view (1.10). Tagging a repo tags its clones too. Any name works, and `:` can be used for namespaces (`org:myorg`, `lang:rust`). Names are lowercased and spaces become `-`; `and`, `or`, `not`, `untagged`, `*` and parentheses are kept for queries.
 
 ### 2.2 Rules (automatic tags)
 
@@ -215,22 +234,21 @@ A rule says: **if a field matches a pattern, add a tag**.
   - Each rule lists its exceptions. Removing an exception lets the rule apply again.
   - Exceptions show crossed out in the rule's live preview.
 
-### 2.4 Groups view
+### 2.4 Groups
 
-- **Sidebar**: every tag, with its count split into manual and automatic.
-- **Query bar** for combining tags: `rust AND work`, `rust OR go`, `work AND NOT archived`, with parentheses. Words in a query are tag names, side-by-side words mean AND, `*` means everything, and `untagged` means no tags at all (the sidebar has an **Untagged** entry).
-- **Include repos not cloned**: off by default, so the working set is clones only and every action works on it. When on, repos from the Remote List are listed too (marked "not cloned"); they can be tagged with the rest, but Open and Run command skip them.
-- **Fuzzy name search** on top of the query, using `nucleo`.
-- **Working set**: starts as the query result.
-  - Add any cloned repo with a fuzzy picker, or untick the ones you don't want.
-  - Changes are temporary and never touch tags.
-  - An optional **Save as tag** button adds a manual tag to every clone in the set.
+A group is a tag query in the Repositories tab; there's no separate view for it. The Tags tab only holds the rules (2.2).
 
-### 2.5 Actions on the working set
+- The **Tags** filter in the Remote List, Ignored and Local Clones combines tags: `rust AND work`, `rust OR go`, `work AND NOT archived`, with parentheses. Words in a query are tag names, side-by-side words mean AND, `*` means everything, and `untagged` means no tags at all. A query naming a tag no repo has is flagged.
+- Its ⏷ menu lists every tag with how many of the view's repos or clones have it, and `untagged` with how many have none.
+- **Select all shown** makes the group the selection. Ctrl-click and Shift-click adjust it, and the search narrows it, without touching tags. **Add tag** saves the selection as a tag.
 
-- **Open each**: one window per repo. Lists every launcher that has a per-repo command.
-- **Open together**: one window for the whole set. Lists only launchers that support workspaces.
-- **Run command**: opens a new run tab in the runner with the working set.
+### 2.5 Actions on the selection
+
+From the bar above each list (1.10):
+
+- **Open each**: one window per clone. Lists every launcher that has a per-repo command.
+- **Open together**: one window for all of them. Lists only launchers that support workspaces.
+- **Run command…**: opens the Runner with the selected clones as its targets.
 
 The app asks before opening more windows than the threshold in settings.
 
@@ -257,7 +275,7 @@ The exact flags get checked against each tool during the build.
 **Workspace files**:
 
 - They're stored at a stable path, not in `/tmp`. VSCode remembers open files and layout per workspace path, so reopening the same group brings them back.
-  - If the working set is an unchanged tag or query result: `workspaces/<tag or query>.code-workspace`.
+  - If the selection is every row of a tag query, with nothing else narrowing the view: `workspaces/<query>.code-workspace`.
   - Otherwise: `workspaces/set-<hash of the clones>.code-workspace`.
 - Each folder entry gets `"name": "owner/name"`, so the editor shows the real name instead of `react~2`.
 - Settings has a button to delete workspace files.
@@ -268,8 +286,7 @@ The exact flags get checked against each tool during the build.
 
 - A run is a command plus a set of clones. Each run opens in its own tab.
 - Ways to start a run:
-  - from a working set (Part 2)
-  - from a selection in any repo list
+  - from a selection in any Repositories view (1.10). The run is named after the tag query when the selection is all of it, otherwise after the view (`Local Clones selection`).
   - on all clones
 - Clone jobs from Part 1 also appear here as runs.
 - Commands are saved as history (command, time, number of repos, how many passed and failed) and as named snippets.
@@ -366,10 +383,11 @@ src/
   log.rs              log entries and levels
   time.rs             UTC dates
   jobs/               engine, process groups, output buffers, ANSI parsing
-  tags/               rules, exceptions, query parser, working set
+  tags/               rules, exceptions, query parser
   launchers.rs        presets, detection, workspace files
   ui/                 repos, remote list, ignored, forks, problems, import,
-                      tags, groups, runner, settings, log
+                      selection and its action bar, tags (rules), runner,
+                      settings, log
 ```
 
 ### Database (sketch)

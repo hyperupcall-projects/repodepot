@@ -180,7 +180,7 @@ fn working_set_replaces_the_filter_and_fills_tags() {
         (page, clones, Config::default(), Vec::new()),
     );
     h.run();
-    assert!(h.query_by_label("working set \"rust\"").is_some());
+    assert!(h.query_by_label("rust").is_some());
     assert!(h.query_by_label("2 clones").is_some());
     h.get_by_label("Run").click();
     h.run();

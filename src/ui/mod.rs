@@ -4,6 +4,7 @@ pub mod log;
 pub mod remote_list;
 pub mod repos;
 pub mod runner;
+pub mod selection;
 pub mod settings;
 pub mod tags;
 

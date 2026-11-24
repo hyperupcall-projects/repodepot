@@ -15,12 +15,13 @@ use crate::git::scan::{CloneInfo, MainRemote, Problem, ScanResult};
 use crate::git::status::Status;
 use crate::layout;
 use crate::tags::query::{self, Query};
-use crate::tags::{Rule, TagIndex};
+use crate::tags::{Rule, TagCount, TagIndex};
 use crate::ui::filter::{Filter, Item, keep_together};
 use crate::ui::import::ImportPage;
 use crate::ui::remote_list::{
     self, ForkShow, ForksContext, ForksState, ListContext, ListKind, ListState, SourceFilter,
 };
+use crate::ui::selection::{ActionBar, BarContext, Selection, Targets, selectable_row};
 use crate::ui::tags::{TagsAction, tag_summary};
 use crate::ui::{sort_header, thousands};
 
@@ -60,12 +61,20 @@ pub enum ReposAction {
         paths: Vec<PathBuf>,
     },
     Import(Vec<ImportMove>),
-    /// Tag changes made from a clone's details.
+    /// Tag changes, for a clone from its details or for the selected rows.
     Tags(TagsAction),
-    /// Open one clone in an app.
+    /// Open clones in an app, each in its own window or all together.
     Open {
         launcher: String,
-        clone_id: i64,
+        together: bool,
+        clone_ids: Vec<i64>,
+        /// Names the workspace file when opening together.
+        workspace_name: String,
+    },
+    /// Open the Runner with these clones as the targets.
+    RunOn {
+        label: String,
+        clone_ids: Vec<i64>,
     },
 }
 
@@ -80,6 +89,8 @@ pub struct ReposContext<'a> {
     pub repo_tags: &'a TagIndex,
     pub rules: &'a [Rule],
     pub launchers: &'a [LauncherInfo],
+    /// Ask before opening more windows than this.
+    pub confirm_over: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -310,7 +321,15 @@ pub struct ReposPage {
     languages: Vec<String>,
     sort: SortKey,
     descending: bool,
-    selected: Option<i64>,
+    /// Local Clones' selection, by clone ID. With one clone selected, its details show.
+    clones_selection: Selection,
+    /// Problems' selection, by clone ID.
+    problems_selection: Selection,
+    /// A link chose a clone to show in Local Clones: if the view's own filters hide it, they
+    /// are cleared.
+    reveal: bool,
+    /// Above each list, for acting on the selection.
+    bar: ActionBar,
     /// `Some((done, total))` while a scan runs.
     scanning: Option<(usize, usize)>,
     result: Option<Result<ScanResult, String>>,
@@ -346,7 +365,10 @@ impl ReposPage {
             languages: Vec::new(),
             sort: SortKey::Name,
             descending: false,
-            selected: None,
+            clones_selection: Selection::new(),
+            problems_selection: Selection::new(),
+            reveal: false,
+            bar: ActionBar::new(),
             scanning: None,
             result: None,
             action_error: None,
@@ -384,6 +406,8 @@ impl ReposPage {
         self.remote
             .retain(catalog.inbox.iter().chain(&catalog.ignored_remote));
         self.ignored.retain(&catalog.ignored);
+        let forks: Vec<i64> = catalog.forks.iter().map(|f| f.fork_id).collect();
+        self.forks.selection.retain(&forks);
         self.ignored_repos = catalog.ignored.iter().map(|r| r.id).collect();
         let mut languages: Vec<String> = catalog
             .summaries
@@ -431,10 +455,10 @@ impl ReposPage {
 
     pub fn scan_finished(&mut self, result: Result<ScanResult, String>) {
         self.scanning = None;
-        if let (Ok(scan), Some(id)) = (&result, self.selected)
-            && !scan.clones.iter().any(|c| c.id == id)
-        {
-            self.selected = None;
+        if let Ok(scan) = &result {
+            let ids: Vec<i64> = scan.clones.iter().map(|c| c.id).collect();
+            self.clones_selection.retain(&ids);
+            self.problems_selection.retain(&ids);
         }
         self.result = Some(result);
     }
@@ -485,10 +509,31 @@ impl ReposPage {
         }
 
         let summaries = catalog.as_ref().map(|c| &c.summaries);
+        let tag_group = self.tag_group(valid_query.is_some());
+        let bar_cx = BarContext {
+            launchers: cx.launchers,
+            confirm_over: cx.confirm_over,
+            rows: match self.view {
+                View::LocalClones | View::Problems => "clones",
+                _ => "repos",
+            },
+            tag_group: tag_group.as_deref(),
+            view: self.view.title(),
+        };
+        let clones = match &result {
+            Some(Ok(scan)) => &scan.clones[..],
+            _ => &[],
+        };
         match self.view {
             View::Import => self.import.show(ui, cx.default_remote, &mut action),
             View::RemoteList | View::Ignored | View::Forks => {
-                self.github_view(ui, catalog.as_ref(), cx.repo_tags, valid_query, &mut action);
+                self.github_view(
+                    ui,
+                    (catalog.as_ref(), clones),
+                    (cx.repo_tags, valid_query),
+                    &bar_cx,
+                    &mut action,
+                );
             }
             View::LocalClones | View::Problems => match &result {
                 None if self.scanning.is_some() => {
@@ -505,12 +550,14 @@ impl ReposPage {
                     }
                 }
                 Some(Ok(scan)) => match self.view {
-                    View::Problems => self.problems_view(ui, scan, summaries, &mut action),
+                    View::Problems => {
+                        self.problems_view(ui, (scan, summaries), &bar_cx, &mut action);
+                    }
                     _ => self.clones_view(
                         ui,
                         (scan, summaries),
                         (cx.tags, cx.rules, valid_query),
-                        cx.launchers,
+                        (cx.launchers, &bar_cx),
                         &mut action,
                     ),
                 },
@@ -572,12 +619,24 @@ impl ReposPage {
         }
     }
 
+    /// The tag query, when it's the only filter narrowing the view (the toggles aside).
+    fn tag_group(&self, query_valid: bool) -> Option<String> {
+        let tag = self.tag_filter.trim();
+        let only_tags = match self.view {
+            View::RemoteList | View::Ignored => self.source == SourceFilter::Any,
+            View::LocalClones => self.show == Show::All && self.branch.trim().is_empty(),
+            View::Forks | View::Problems | View::Import => false,
+        };
+        (only_tags && query_valid && !tag.is_empty() && !self.filter.has_text())
+            .then(|| tag.to_owned())
+    }
+
     fn github_view(
         &mut self,
         ui: &mut egui::Ui,
-        catalog: Option<&Catalog>,
-        tags: &TagIndex,
-        tag_query: Option<&Query>,
+        (catalog, clones): (Option<&Catalog>, &[CloneInfo]),
+        (tags, tag_query): (&TagIndex, Option<&Query>),
+        bar_cx: &BarContext<'_>,
         action: &mut Option<ReposAction>,
     ) {
         let Some(catalog) = catalog else {
@@ -610,7 +669,9 @@ impl ReposPage {
             show_ignored: !self.filter.hide_ignored,
             tags,
             cloning: &self.cloning,
+            clones,
         };
+        let bar = (&mut self.bar, bar_cx);
         match self.view {
             View::RemoteList => {
                 remote_list::manual_owners(ui, &catalog.manual_owners, action);
@@ -620,6 +681,7 @@ impl ReposPage {
                     (&catalog.inbox, &catalog.ignored_remote),
                     &mut self.remote,
                     &list,
+                    bar,
                     action,
                 );
             }
@@ -629,6 +691,7 @@ impl ReposPage {
                 (&catalog.ignored, &[]),
                 &mut self.ignored,
                 &list,
+                bar,
                 action,
             ),
             _ => {
@@ -636,8 +699,9 @@ impl ReposPage {
                     matcher: &matcher,
                     show: self.fork_show,
                     ignored: &self.ignored_repos,
+                    clones,
                 };
-                remote_list::forks_view(ui, catalog, &forks, &mut self.forks, action);
+                remote_list::forks_view(ui, catalog, &forks, &mut self.forks, bar, action);
             }
         }
     }
@@ -773,7 +837,7 @@ impl ReposPage {
                             );
                             ui.separator();
                             keep_together(ui, 280.0);
-                            self.tag_filter_field(ui, cx, tag_query);
+                            self.tag_filter_field(ui, cx, (scan, catalog), tag_query);
                         }
                         View::LocalClones => {
                             combo(
@@ -787,7 +851,7 @@ impl ReposPage {
                             self.branch_field(ui, scan);
                             ui.separator();
                             keep_together(ui, 280.0);
-                            self.tag_filter_field(ui, cx, tag_query);
+                            self.tag_filter_field(ui, cx, (scan, catalog), tag_query);
                         }
                         View::Forks => {
                             combo(
@@ -915,11 +979,45 @@ impl ReposPage {
         .on_hover_text("Pick a branch");
     }
 
+    /// How many of this view's repos or clones have each tag, and how many have none, before
+    /// the search and filters narrow it down ("Hide ignored" aside).
+    fn tag_counts(
+        &self,
+        cx: &ReposContext<'_>,
+        scan: Option<&ScanResult>,
+        catalog: Option<&Catalog>,
+    ) -> (BTreeMap<String, TagCount>, usize) {
+        let ids = |rows: &[crate::db::RepoRow]| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+        let (index, ids): (&TagIndex, Vec<i64>) = match (self.view, catalog) {
+            (View::RemoteList, Some(catalog)) => {
+                let mut rows = ids(&catalog.inbox);
+                if !self.filter.hide_ignored {
+                    rows.extend(ids(&catalog.ignored_remote));
+                }
+                (cx.repo_tags, rows)
+            }
+            (View::Ignored, Some(catalog)) => (cx.repo_tags, ids(&catalog.ignored)),
+            _ => (
+                cx.tags,
+                scan.map_or(&[][..], |s| &s.clones)
+                    .iter()
+                    .filter(|c| !(self.filter.hide_ignored && self.is_ignored(c)))
+                    .map(|c| c.id)
+                    .collect(),
+            ),
+        };
+        let mut counts = BTreeMap::new();
+        index.count_into(ids.iter().copied(), &mut counts);
+        let untagged = ids.iter().filter(|id| index.is_untagged(**id)).count();
+        (counts, untagged)
+    }
+
     /// The tag query field, with a menu of known tags.
     fn tag_filter_field(
         &mut self,
         ui: &mut egui::Ui,
         cx: &ReposContext<'_>,
+        (scan, catalog): (Option<&ScanResult>, Option<&Catalog>),
         parsed: Option<&Result<Query, String>>,
     ) {
         let label = ui.label("Tags");
@@ -941,14 +1039,18 @@ impl ReposPage {
             .map(String::as_str)
             .collect();
         ui.menu_button("⏷", |ui| {
-            if ui
-                .button("untagged")
-                .on_hover_text("Repos with no tags at all")
-                .clicked()
-            {
-                self.tag_filter = "untagged".to_owned();
-                ui.close();
-            }
+            let (counts, untagged) = self.tag_counts(cx, scan, catalog);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("untagged")
+                    .on_hover_text("Repos with no tags at all")
+                    .clicked()
+                {
+                    self.tag_filter = "untagged".to_owned();
+                    ui.close();
+                }
+                ui.weak(thousands(untagged as u64));
+            });
             ui.separator();
             if known.is_empty() {
                 ui.weak("No tags yet");
@@ -974,14 +1076,38 @@ impl ReposPage {
                                 self.tag_filter = format!("NOT {tag}");
                                 ui.close();
                             }
+                            let count = counts.get(*tag).copied().unwrap_or_default();
+                            ui.weak(thousands(count.total as u64))
+                                .on_hover_text(format!(
+                                    "{} here: {} manual, {} from rules",
+                                    thousands(count.total as u64),
+                                    count.manual,
+                                    count.auto
+                                ));
                         });
                     }
                 });
         })
         .response
         .on_hover_text("Pick a tag");
-        if let Some(Err(error)) = parsed {
-            ui.colored_label(ui.visuals().warn_fg_color, error);
+        match parsed {
+            Some(Err(error)) => {
+                ui.colored_label(ui.visuals().warn_fg_color, error);
+            }
+            Some(Ok(query)) => {
+                let unknown: Vec<&str> = query
+                    .tags()
+                    .into_iter()
+                    .filter(|t| !known.contains(t))
+                    .collect();
+                if !unknown.is_empty() {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("No repo has the tag {}", unknown.join(", ")),
+                    );
+                }
+            }
+            None => {}
         }
     }
 
@@ -992,32 +1118,13 @@ impl ReposPage {
             .is_some_and(|id| self.ignored_repos.contains(&id))
     }
 
-    fn clones_view(
-        &mut self,
-        ui: &mut egui::Ui,
-        (scan, summaries): (&ScanResult, Option<&HashMap<i64, RepoSummary>>),
-        (tags, rules, tag_query): (&TagIndex, &[Rule], Option<&Query>),
-        launchers: &[LauncherInfo],
-        action: &mut Option<ReposAction>,
-    ) {
-        if let Some(id) = self.selected
-            && let Some(clone) = scan.clones.iter().find(|c| c.id == id)
-        {
-            let mut close = false;
-            egui::Panel::right("clone_details")
-                .resizable(true)
-                .default_size(400.0)
-                .min_size(280.0)
-                .show(ui, |ui| {
-                    close = details(ui, clone, launchers, action);
-                    ui.add_space(10.0);
-                    tags_section(ui, clone.id, tags, rules, &mut self.new_tag, action);
-                });
-            if close {
-                self.selected = None;
-            }
-        }
-
+    /// The clones Local Clones lists, sorted.
+    fn clone_rows<'s>(
+        &self,
+        (scan, summaries): (&'s ScanResult, Option<&HashMap<i64, RepoSummary>>),
+        tags: &TagIndex,
+        tag_query: Option<&Query>,
+    ) -> Vec<&'s CloneInfo> {
         let matcher = self.filter.matcher(true);
         let mut rows: Vec<&CloneInfo> = scan
             .clones
@@ -1033,6 +1140,58 @@ impl ReposPage {
             })
             .collect();
         sort_rows(&mut rows, self.sort, self.descending);
+        rows
+    }
+
+    fn clones_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        (scan, summaries): (&ScanResult, Option<&HashMap<i64, RepoSummary>>),
+        (tags, rules, tag_query): (&TagIndex, &[Rule], Option<&Query>),
+        (launchers, bar_cx): (&[LauncherInfo], &BarContext<'_>),
+        action: &mut Option<ReposAction>,
+    ) {
+        let mut rows = self.clone_rows((scan, summaries), tags, tag_query);
+        if std::mem::take(&mut self.reveal)
+            && let Some(id) = self.clones_selection.single()
+            && !rows.iter().any(|c| c.id == id)
+        {
+            // Problems' shared filters already let it through; this view's own ones didn't.
+            self.show = Show::All;
+            self.branch.clear();
+            self.tag_filter.clear();
+            rows = self.clone_rows((scan, summaries), tags, None);
+        }
+        let order: Vec<i64> = rows.iter().map(|c| c.id).collect();
+        self.clones_selection.retain(&order);
+        let targets = Targets::clones(self.clones_selection.in_order(&order));
+        self.bar.show(
+            ui,
+            (&mut self.clones_selection, &order),
+            &targets,
+            bar_cx,
+            |_| None,
+            action,
+        );
+        ui.add_space(4.0);
+
+        if let Some(id) = self.clones_selection.single()
+            && let Some(clone) = scan.clones.iter().find(|c| c.id == id)
+        {
+            let mut close = false;
+            egui::Panel::right("clone_details")
+                .resizable(true)
+                .default_size(400.0)
+                .min_size(280.0)
+                .show(ui, |ui| {
+                    close = details(ui, clone, launchers, action);
+                    ui.add_space(10.0);
+                    tags_section(ui, clone.id, tags, rules, &mut self.new_tag, action);
+                });
+            if close {
+                self.clones_selection.clear();
+            }
+        }
 
         if rows.is_empty() {
             ui.add_space(8.0);
@@ -1049,10 +1208,15 @@ impl ReposPage {
         // When the details panel leaves too little room, scroll sideways instead of overlapping it.
         egui::ScrollArea::horizontal()
             .auto_shrink(false)
-            .show(ui, |ui| self.clones_table(ui, &rows, tags));
+            .show(ui, |ui| self.clones_table(ui, (&rows, &order), tags));
     }
 
-    fn clones_table(&mut self, ui: &mut egui::Ui, rows: &[&CloneInfo], tags: &TagIndex) {
+    fn clones_table(
+        &mut self,
+        ui: &mut egui::Ui,
+        (rows, order): (&[&CloneInfo], &[i64]),
+        tags: &TagIndex,
+    ) {
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + 8.0;
         TableBuilder::new(ui)
             .striped(true)
@@ -1105,7 +1269,7 @@ impl ReposPage {
             .body(|body| {
                 body.rows(row_height, rows.len(), |mut row| {
                     let clone = rows[row.index()];
-                    row.set_selected(self.selected == Some(clone.id));
+                    row.set_selected(self.clones_selection.contains(clone.id));
                     let ignored = !self.filter.hide_ignored && self.is_ignored(clone);
                     row.col(|ui| name_cell(ui, clone, ignored));
                     row.col(|ui| {
@@ -1121,13 +1285,8 @@ impl ReposPage {
                         }
                     });
                     row.col(|ui| problems_cell(ui, clone));
-                    if row.response().clicked() {
-                        self.selected = if self.selected == Some(clone.id) {
-                            None
-                        } else {
-                            Some(clone.id)
-                        };
-                    }
+                    self.clones_selection
+                        .handle(&row.response(), order, row.index());
                 });
             });
     }
@@ -1139,8 +1298,8 @@ impl ReposPage {
     fn problems_view(
         &mut self,
         ui: &mut egui::Ui,
-        scan: &ScanResult,
-        summaries: Option<&HashMap<i64, RepoSummary>>,
+        (scan, summaries): (&ScanResult, Option<&HashMap<i64, RepoSummary>>),
+        bar_cx: &BarContext<'_>,
         action: &mut Option<ReposAction>,
     ) {
         if scan.problem_count() == 0 {
@@ -1165,19 +1324,59 @@ impl ReposPage {
                 ..Item::default()
             })
         };
-        let mut listed = 0;
+        let missing: Vec<_> = scan
+            .missing
+            .iter()
+            .filter(|m| show.shows(ProblemShow::Missing) && bare(m.name.as_deref(), &m.path))
+            .collect();
+        let sections: Vec<(ProblemKind, Vec<(&CloneInfo, &Problem)>)> = ProblemKind::ALL
+            .into_iter()
+            .filter(|kind| show.shows(ProblemShow::Kind(*kind)))
+            .map(|kind| {
+                let entries = scan
+                    .clones
+                    .iter()
+                    .filter(|c| matcher.matches(&clone_item(c, summaries, &self.ignored_repos)))
+                    .flat_map(|c| {
+                        c.problems
+                            .iter()
+                            .filter(|p| ProblemKind::of(p) == kind)
+                            .map(move |p| (c, p))
+                    })
+                    .collect();
+                (kind, entries)
+            })
+            .collect();
+        let strays: Vec<&String> = scan
+            .strays
+            .iter()
+            .filter(|s| show.shows(ProblemShow::Strays) && bare(None, s))
+            .collect();
 
+        // Rows of clones can be selected; a clone with two problems is listed (and selected)
+        // twice. Missing folders and stray folders aren't clones, so they can't be.
+        let order: Vec<i64> = sections
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().map(|(c, _)| c.id))
+            .collect();
+        self.problems_selection.retain(&order);
+        let targets = Targets::clones(self.problems_selection.in_order(&order));
+        self.bar.show(
+            ui,
+            (&mut self.problems_selection, &order),
+            &targets,
+            bar_cx,
+            |_| None,
+            action,
+        );
+        ui.add_space(4.0);
+
+        let listed =
+            missing.len() + strays.len() + sections.iter().map(|(_, e)| e.len()).sum::<usize>();
+        ui.style_mut().interaction.selectable_labels = false;
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
-                let missing: Vec<_> = scan
-                    .missing
-                    .iter()
-                    .filter(|m| {
-                        show.shows(ProblemShow::Missing) && bare(m.name.as_deref(), &m.path)
-                    })
-                    .collect();
-                listed += missing.len();
                 problem_section(ui, "Missing folders", MISSING_HELP, missing.len(), |ui| {
                     for gone in missing {
                         ui.horizontal(|ui| {
@@ -1195,22 +1394,9 @@ impl ReposPage {
                     }
                 });
 
-                for kind in ProblemKind::ALL {
-                    if !show.shows(ProblemShow::Kind(kind)) {
-                        continue;
-                    }
-                    let entries: Vec<(&CloneInfo, &Problem)> = scan
-                        .clones
-                        .iter()
-                        .filter(|c| matcher.matches(&clone_item(c, summaries, &self.ignored_repos)))
-                        .flat_map(|c| {
-                            c.problems
-                                .iter()
-                                .filter(|p| ProblemKind::of(p) == kind)
-                                .map(move |p| (c, p))
-                        })
-                        .collect();
-                    listed += entries.len();
+                let mut index = 0;
+                for (kind, entries) in &sections {
+                    let kind = *kind;
                     problem_section(ui, kind.title(), kind.help(), entries.len(), |ui| {
                         if kind == ProblemKind::OutOfLayout
                             && entries.len() > 1
@@ -1224,28 +1410,28 @@ impl ReposPage {
                             });
                         }
                         for (clone, problem) in entries {
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .link(clone.display_name())
-                                    .on_hover_text("Show in Local Clones")
-                                    .clicked()
-                                {
-                                    self.selected = Some(clone.id);
-                                    self.view = View::LocalClones;
-                                }
+                            let selected = self.problems_selection.contains(clone.id);
+                            let mut reveal = false;
+                            let row = selectable_row(ui, selected, |ui| {
+                                ui.label(clone.display_name());
                                 ui.weak(&clone.rel_path);
                                 problem_detail(ui, clone, problem, &self.upstream_name, action);
+                                reveal = ui
+                                    .small_button("Details")
+                                    .on_hover_text("Show it in Local Clones, with its details")
+                                    .clicked();
                             });
+                            self.problems_selection.handle(&row, &order, index);
+                            index += 1;
+                            if reveal {
+                                self.clones_selection.select_only(clone.id);
+                                self.reveal = true;
+                                self.view = View::LocalClones;
+                            }
                         }
                     });
                 }
 
-                let strays: Vec<&String> = scan
-                    .strays
-                    .iter()
-                    .filter(|s| show.shows(ProblemShow::Strays) && bare(None, s))
-                    .collect();
-                listed += strays.len();
                 problem_section(ui, "Not git repos", STRAYS_HELP, strays.len(), |ui| {
                     for stray in strays {
                         ui.horizontal(|ui| {
@@ -1597,7 +1783,9 @@ fn details(
                         if ui.button(&app.name).clicked() {
                             *action = Some(ReposAction::Open {
                                 launcher: app.name.clone(),
-                                clone_id: clone.id,
+                                together: false,
+                                clone_ids: vec![clone.id],
+                                workspace_name: String::new(),
                             });
                             ui.close();
                         }
@@ -2156,12 +2344,23 @@ mod tests {
 
     type State = (ReposPage, Vec<ReposAction>);
 
+    /// VS Code opens each or together; Kate only opens each.
+    fn launchers() -> Vec<LauncherInfo> {
+        let launcher = |name: &str, together: bool| LauncherInfo {
+            name: name.into(),
+            each: true,
+            together,
+        };
+        vec![launcher("VS Code", true), launcher("Kate", false)]
+    }
+
     fn harness<'a>(builder: egui_kittest::HarnessBuilder<State>) -> Harness<'a, State> {
         let mut page = ReposPage::new();
         page.scan_finished(Ok(synced_scan()));
         page.set_catalog(sample_catalog());
+        let launchers = launchers();
         builder.with_size([1280.0, 560.0]).build_ui_state(
-            |ui, (page, actions): &mut State| {
+            move |ui, (page, actions): &mut State| {
                 egui::CentralPanel::default_margins().show(ui, |ui| {
                     let tags = TagIndex::default();
                     let cx = ReposContext {
@@ -2171,7 +2370,8 @@ mod tests {
                         tags: &tags,
                         repo_tags: &tags,
                         rules: &[],
-                        launchers: &[],
+                        launchers: &launchers,
+                        confirm_over: 2,
                     };
                     if let Some(action) = page.show(ui, cx) {
                         actions.push(action);
@@ -2190,10 +2390,164 @@ mod tests {
         h.get_by_label("facebook/react").click();
         h.run();
         assert!(h.query_by_label("Remotes").is_some());
-        assert_eq!(h.state().0.selected, Some(1));
+        assert_eq!(h.state().0.clones_selection.single(), Some(1));
         h.get_by_label("Close").click();
         h.run();
-        assert_eq!(h.state().0.selected, None);
+        assert_eq!(h.state().0.clones_selection.single(), None);
+        assert!(h.query_by_label("Remotes").is_none());
+    }
+
+    /// Local Clones, top to bottom.
+    const CLONE_ORDER: [i64; 5] = [1, 4, 5, 2, 3];
+
+    fn selected_clones(h: &Harness<'_, State>) -> Vec<i64> {
+        h.state().0.clones_selection.in_order(&CLONE_ORDER)
+    }
+
+    #[test]
+    fn clicks_select_one_shift_selects_a_range_and_ctrl_adds_or_removes() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        h.get_by_label("notes").click();
+        h.run();
+        assert_eq!(selected_clones(&h), [4]);
+        assert!(
+            h.query_by_label("Remotes").is_some(),
+            "one selected: details"
+        );
+        // A click always selects just what was clicked.
+        h.get_by_label("someone/react").click();
+        h.run();
+        assert_eq!(selected_clones(&h), [2]);
+
+        h.get_by_label("facebook/react")
+            .click_modifiers(egui::Modifiers::SHIFT);
+        h.run();
+        assert_eq!(selected_clones(&h), [1, 4, 5, 2]);
+        assert!(h.query_by_label("4 selected").is_some());
+        assert!(h.query_by_label("Remotes").is_none(), "several: no details");
+
+        h.get_by_label("notes")
+            .click_modifiers(egui::Modifiers::COMMAND);
+        h.run();
+        assert_eq!(selected_clones(&h), [1, 5, 2]);
+        h.get_by_label("thing")
+            .click_modifiers(egui::Modifiers::COMMAND);
+        h.run();
+        assert_eq!(selected_clones(&h), [1, 5, 2, 3]);
+
+        h.get_by_label("thing").click();
+        h.run();
+        assert_eq!(selected_clones(&h), [3]);
+        h.get_by_label("Select all shown (5)").click();
+        h.run();
+        assert_eq!(selected_clones(&h), CLONE_ORDER);
+        h.get_by_label("Clear selection").click();
+        h.run();
+        assert!(selected_clones(&h).is_empty());
+    }
+
+    #[test]
+    fn filtering_drops_hidden_rows_from_the_selection() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        h.get_by_label("Select all shown (5)").click();
+        h.run();
+        h.state_mut().0.filter.text = "react".into();
+        h.run();
+        assert!(h.query_by_label("2 selected").is_some());
+        h.state_mut().0.filter.text.clear();
+        h.run();
+        assert_eq!(selected_clones(&h), [1, 2], "hidden rows don't come back");
+    }
+
+    #[test]
+    fn the_bar_opens_and_runs_the_selected_clones() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        h.get_by_label("facebook/react").click();
+        h.run();
+        h.get_by_label("serde-rs/serde")
+            .click_modifiers(egui::Modifiers::COMMAND);
+        h.run();
+        h.get_by_label("Open each").click();
+        h.run();
+        h.get_by_label("Kate").click();
+        h.run();
+        h.get_by_label("Open together").click();
+        h.run();
+        assert!(
+            h.query_by_label("Kate").is_none(),
+            "Kate can't open several in one window"
+        );
+        h.get_by_label("VS Code").click();
+        h.run();
+        h.get_by_label("Run command…").click();
+        h.run();
+
+        // Over the limit (2 in these tests) asks first.
+        h.get_by_label("Select all shown (5)").click();
+        h.run();
+        h.get_by_label("Open each").click();
+        h.run();
+        h.get_by_label("VS Code").click();
+        h.run();
+        assert!(h.query_by_label("Open 5 windows in VS Code?").is_some());
+        h.get_by_label("Open them").click();
+        h.run();
+        assert_eq!(
+            h.state().1,
+            vec![
+                ReposAction::Open {
+                    launcher: "Kate".into(),
+                    together: false,
+                    clone_ids: vec![1, 5],
+                    workspace_name: String::new(),
+                },
+                ReposAction::Open {
+                    launcher: "VS Code".into(),
+                    together: true,
+                    clone_ids: vec![1, 5],
+                    workspace_name: crate::launch::set_name(&[1, 5]),
+                },
+                ReposAction::RunOn {
+                    label: "Local Clones selection".into(),
+                    clone_ids: vec![1, 5],
+                },
+                ReposAction::Open {
+                    launcher: "VS Code".into(),
+                    together: false,
+                    clone_ids: CLONE_ORDER.to_vec(),
+                    workspace_name: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_bar_tags_the_selected_clones() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        h.get_by_label("Select all shown (5)").click();
+        h.run();
+        h.get_by_label("Tag").focus();
+        h.run();
+        h.get_by_label("Tag").type_text("later");
+        h.run();
+        h.get_by_label("Add tag").click();
+        h.run();
+        assert!(
+            h.query_by_label("5 selected").is_some(),
+            "tagging keeps the selection"
+        );
+        assert_eq!(
+            h.state().1,
+            vec![ReposAction::Tags(TagsAction::AddTag {
+                clone_ids: CLONE_ORDER.to_vec(),
+                repo_ids: vec![],
+                tag: "later".into()
+            })]
+        );
     }
 
     #[test]
@@ -2239,6 +2593,139 @@ mod tests {
                 ignored: false
             }]
         );
+    }
+
+    #[test]
+    fn ignored_repos_with_clones_can_be_opened_run_on_and_tagged() {
+        let mut h = harness(Harness::builder());
+        // x/serde is a clone of serde-rs/serde, which is ignored.
+        if let Some(Ok(scan)) = &mut h.state_mut().0.result {
+            scan.clones[4].repo_id = Some(16);
+        }
+        h.state_mut().0.view = View::Ignored;
+        h.run();
+        h.get_by_label("myorg/old-thing").click();
+        h.run();
+        h.get_by_label("Run command…").click();
+        h.run();
+        assert!(h.state().1.is_empty(), "myorg/old-thing isn't cloned");
+
+        h.get_by_label("serde-rs/serde")
+            .click_modifiers(egui::Modifiers::COMMAND);
+        h.run();
+        assert!(h.query_by_label("· 1 not cloned").is_some());
+        h.get_by_label("Run command…").click();
+        h.run();
+        h.get_by_label("Tag").focus();
+        h.run();
+        h.get_by_label("Tag").type_text("old");
+        h.run();
+        h.get_by_label("Remove tag").click();
+        h.run();
+        assert_eq!(
+            h.state().1,
+            vec![
+                ReposAction::RunOn {
+                    label: "Ignored selection".into(),
+                    clone_ids: vec![5],
+                },
+                ReposAction::Tags(TagsAction::RemoveTag {
+                    clone_ids: vec![5],
+                    repo_ids: vec![14, 16],
+                    tag: "old".into()
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_list_repos_arent_cloned_so_they_cant_be_opened() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.view = View::RemoteList;
+        h.run();
+        h.get_by_label("me/dotfiles").click();
+        h.run();
+        h.get_by_label("Run command…").click();
+        h.run();
+        h.get_by_label("Open each").click();
+        h.run();
+        assert!(h.query_by_label("Kate").is_none(), "the menu is disabled");
+        assert!(h.state().1.is_empty());
+    }
+
+    #[test]
+    fn forks_select_and_act_on_the_forks_clones() {
+        let mut h = harness(Harness::builder());
+        // x/serde is a clone of the fork me/serde.
+        if let Some(Ok(scan)) = &mut h.state_mut().0.result {
+            scan.clones[4].repo_id = Some(15);
+        }
+        h.state_mut().0.view = View::Forks;
+        h.run();
+        // The button in a row switches the decision without selecting the row.
+        h.get_by_label("Separate").click();
+        h.run();
+        assert!(h.state().0.forks.selection.is_empty());
+        h.get_by_label("me/react").click();
+        h.run();
+        h.get_by_label("me/serde")
+            .click_modifiers(egui::Modifiers::SHIFT);
+        h.run();
+        assert!(h.query_by_label("2 selected").is_some());
+        h.get_by_label("Run command…").click();
+        h.run();
+        assert_eq!(
+            h.state().1,
+            vec![
+                ReposAction::SetForkDecision {
+                    fork_id: 15,
+                    parent_id: 21,
+                    decision: ForkDecision::Linked
+                },
+                ReposAction::RunOn {
+                    label: "Forks selection".into(),
+                    clone_ids: vec![5],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn problems_rows_select_and_link_to_local_clones() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.branch = "nothing-like-it".into();
+        h.state_mut().0.view = View::Problems;
+        h.run();
+        // Main remote not chosen, Renamed, Linked forks without upstream, Outside the layout,
+        // No remotes.
+        let order = [3, 1, 2, 5, 4];
+        h.get_by_label("thing").click();
+        h.run();
+        h.get_by_label("serde-rs/serde")
+            .click_modifiers(egui::Modifiers::SHIFT);
+        h.run();
+        assert_eq!(
+            h.state().0.problems_selection.in_order(&order),
+            [3, 1, 2, 5]
+        );
+        h.get_by_label("Run command…").click();
+        h.run();
+        assert_eq!(
+            h.state().1,
+            vec![ReposAction::RunOn {
+                label: "Problems selection".into(),
+                clone_ids: vec![3, 1, 2, 5],
+            }]
+        );
+
+        // Details shows the clone in Local Clones, even though the branch filter hid it.
+        h.get_all_by_label("Details").nth(1).unwrap().click();
+        h.run();
+        h.run();
+        assert!(h.state().0.view == View::LocalClones);
+        assert_eq!(h.state().0.clones_selection.single(), Some(1));
+        assert!(h.state().0.branch.is_empty());
+        assert!(h.query_by_label("Remotes").is_some());
     }
 
     #[test]
@@ -2343,6 +2830,7 @@ mod tests {
                                 each: true,
                                 together: true,
                             }],
+                            confirm_over: 10,
                         };
                         if let Some(action) = page.show(ui, cx) {
                             actions.push(action);
@@ -2367,7 +2855,9 @@ mod tests {
             h.state().1,
             vec![ReposAction::Open {
                 launcher: "VS Code".into(),
-                clone_id: 1
+                together: false,
+                clone_ids: vec![1],
+                workspace_name: String::new(),
             }]
         );
     }
@@ -2487,7 +2977,8 @@ mod tests {
         h.run();
         h.get_by_label("me/dotfiles").click();
         h.run();
-        h.get_by_label("myorg/api").click();
+        h.get_by_label("myorg/api")
+            .click_modifiers(egui::Modifiers::COMMAND);
         h.run();
         assert!(h.query_by_label("2 selected").is_some());
         h.get_by_label("Clone").click();
@@ -2582,6 +3073,7 @@ mod tests {
             &HashMap::from([(10, set(&["later"])), (11, set(&["later", "work"]))]),
             &[],
         );
+        let launchers = launchers();
         builder.with_size([1280.0, 560.0]).build_ui_state(
             move |ui, (page, actions): &mut State| {
                 egui::CentralPanel::default_margins().show(ui, |ui| {
@@ -2592,7 +3084,8 @@ mod tests {
                         tags: &tags,
                         repo_tags: &repo_tags,
                         rules: &[],
-                        launchers: &[],
+                        launchers: &launchers,
+                        confirm_over: 10,
                     };
                     if let Some(action) = page.show(ui, cx) {
                         actions.push(action);
@@ -2680,13 +3173,77 @@ mod tests {
     }
 
     #[test]
+    fn tag_menu_counts_this_views_rows() {
+        let mut h = tags_harness(Harness::builder());
+        h.state_mut().0.view = View::RemoteList;
+        h.run();
+        // (The Stars column has a 1 of its own.)
+        let ones = h.query_all_by_label("1").count();
+        assert_eq!(h.query_all_by_label("2").count(), 0);
+        menu_after(&h, "Tags").click();
+        h.run();
+        // Untagged: myorg/website and me/react. later: me/dotfiles and myorg/api. work:
+        // myorg/api (the clone tagged work isn't in this view).
+        assert_eq!(h.query_all_by_label("2").count(), 2, "untagged and later");
+        assert_eq!(h.query_all_by_label("1").count(), ones + 1, "work");
+    }
+
+    #[test]
+    fn unknown_tags_in_the_filter_are_flagged() {
+        let mut h = tags_harness(Harness::builder());
+        h.state_mut().0.tag_filter = "work OR nosuch".into();
+        h.run();
+        assert!(h.query_by_label("No repo has the tag nosuch").is_some());
+    }
+
+    #[test]
+    fn a_whole_tag_group_names_the_run_and_the_workspace() {
+        let mut h = tags_harness(Harness::builder());
+        h.state_mut().0.tag_filter = "work".into();
+        h.run();
+        h.get_by_label("Select all shown (1)").click();
+        h.run();
+        h.get_by_label("Run command…").click();
+        h.run();
+        h.get_by_label("Open together").click();
+        h.run();
+        h.get_by_label("VS Code").click();
+        h.run();
+        // With a search on top, it's no longer just the tag group.
+        h.state_mut().0.filter.text = "react".into();
+        h.run();
+        h.get_by_label("Run command…").click();
+        h.run();
+        assert_eq!(
+            h.state().1,
+            vec![
+                ReposAction::RunOn {
+                    label: "work".into(),
+                    clone_ids: vec![1],
+                },
+                ReposAction::Open {
+                    launcher: "VS Code".into(),
+                    together: true,
+                    clone_ids: vec![1],
+                    workspace_name: "work".into(),
+                },
+                ReposAction::RunOn {
+                    label: "Local Clones selection".into(),
+                    clone_ids: vec![1],
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn remote_list_tags_the_selected_repos() {
         let mut h = tags_harness(Harness::builder());
         h.state_mut().0.view = View::RemoteList;
         h.run();
         h.get_by_label("me/dotfiles").click();
         h.run();
-        h.get_by_label("myorg/website").click();
+        h.get_by_label("myorg/website")
+            .click_modifiers(egui::Modifiers::COMMAND);
         h.run();
         h.get_by_label("Tag").focus();
         h.run();
@@ -3158,6 +3715,13 @@ mod tests {
         h.get_by_label("someone/react").click();
         h.run();
         h.render().unwrap().save(dir.join("clones.png")).unwrap();
+        h.get_by_label("facebook/react")
+            .click_modifiers(egui::Modifiers::SHIFT);
+        h.run();
+        h.render()
+            .unwrap()
+            .save(dir.join("clones_selected.png"))
+            .unwrap();
         h.state_mut().0.branch = "!main".into();
         h.state_mut().0.filter.language = "Cobol".into();
         h.set_size(egui::vec2(700.0, 560.0));
@@ -3170,6 +3734,11 @@ mod tests {
         h.set_size(egui::vec2(1280.0, 560.0));
         h.run();
         h.get_by_label("Problems (7)").click();
+        h.run();
+        h.get_by_label("thing").click();
+        h.run();
+        h.get_by_label("someone/react")
+            .click_modifiers(egui::Modifiers::SHIFT);
         h.run();
         h.render().unwrap().save(dir.join("problems.png")).unwrap();
         h.get_by_label("Remote List (4)").click();

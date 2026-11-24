@@ -8,12 +8,14 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::db::github::ForkRow;
 use crate::db::{Catalog, ForkDecision, RepoRow, Source};
+use crate::git::scan::CloneInfo;
+use crate::tags::TagIndex;
 use crate::tags::query::Query;
-use crate::tags::{self, TagIndex};
 use crate::ui::filter::{Item, Matcher};
 use crate::ui::repos::ReposAction;
+use crate::ui::selection::{ActionBar, BarContext, Selection, Targets};
 use crate::ui::sort_header;
-use crate::ui::tags::{TagsAction, tag_summary};
+use crate::ui::tags::tag_summary;
 use crate::ui::thousands;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -101,20 +103,17 @@ fn repo_item(row: &RepoRow) -> Item<'_> {
 
 /// Selection and sort order for one list (Remote List or Ignored).
 pub struct ListState {
-    pub selected: HashSet<i64>,
+    pub selection: Selection,
     sort: SortKey,
     descending: bool,
-    /// The "Tag" field for tagging the selected repos.
-    tag_name: String,
 }
 
 impl ListState {
     pub fn new() -> Self {
         Self {
-            selected: HashSet::new(),
+            selection: Selection::new(),
             sort: SortKey::Name,
             descending: false,
-            tag_name: String::new(),
         }
     }
 
@@ -131,8 +130,8 @@ impl ListState {
 
     /// Drops selected IDs that are no longer in the list.
     pub fn retain<'a>(&mut self, rows: impl IntoIterator<Item = &'a RepoRow>) {
-        let present: HashSet<i64> = rows.into_iter().map(|r| r.id).collect();
-        self.selected.retain(|id| present.contains(id));
+        let present: Vec<i64> = rows.into_iter().map(|r| r.id).collect();
+        self.selection.retain(&present);
     }
 }
 
@@ -239,16 +238,20 @@ pub struct ListContext<'a> {
     pub tags: &'a TagIndex,
     /// Repo IDs with a clone run in progress.
     pub cloning: &'a HashSet<i64>,
+    /// The scanned clones, to open or run on the clones of the selected repos.
+    pub clones: &'a [CloneInfo],
 }
 
-/// The Remote List or Ignored list: select rows, then Clone / Ignore / Un-ignore or tag them.
-/// `ignored_rows` are the ignored repos the Remote List shows when "Hide ignored" is off.
+/// The Remote List or Ignored list: select rows, then Clone / Ignore / Un-ignore, open, run on
+/// or tag them. `ignored_rows` are the ignored repos the Remote List shows when "Hide ignored"
+/// is off.
 pub fn repo_list(
     ui: &mut egui::Ui,
     kind: ListKind,
     (rows, ignored_rows): (&[RepoRow], &[RepoRow]),
     state: &mut ListState,
     cx: &ListContext<'_>,
+    (bar, bar_cx): (&mut ActionBar, &BarContext<'_>),
     action: &mut Option<ReposAction>,
 ) {
     let show_ignored = kind == ListKind::Remote && cx.show_ignored;
@@ -264,120 +267,20 @@ pub fn repo_list(
         })
         .collect();
     sort_rows(&mut shown, state.sort, state.descending, cx.tags);
+    let order: Vec<i64> = shown.iter().map(|r| r.id).collect();
+    state.selection.retain(&order);
 
-    ui.horizontal(|ui| {
-        if ui
-            .button(format!("Select all shown ({})", shown.len()))
-            .clicked()
-        {
-            state.selected.extend(shown.iter().map(|r| r.id));
-        }
-        if ui
-            .add_enabled(
-                !state.selected.is_empty(),
-                egui::Button::new("Clear selection"),
-            )
-            .clicked()
-        {
-            state.selected.clear();
-        }
-        ui.separator();
-        let count = state.selected.len();
-        ui.label(format!("{count} selected"));
-        let ids = |state: &ListState| state.selected.iter().copied().collect::<Vec<i64>>();
-        match kind {
-            ListKind::Remote => {
-                if ui
-                    .add_enabled(count > 0, egui::Button::new("Clone"))
-                    .on_hover_text("Clone over SSH into the clone root's layout")
-                    .clicked()
-                {
-                    *action = Some(ReposAction::Clone(ids(state)));
-                }
-                if ui
-                    .add_enabled(count > 0, egui::Button::new("Ignore"))
-                    .on_hover_text("Move to the Ignored list; you can bring them back later")
-                    .clicked()
-                {
-                    *action = Some(ReposAction::SetIgnored {
-                        repo_ids: ids(state),
-                        ignored: true,
-                    });
-                }
-                if show_ignored {
-                    let any_ignored = ignored_rows.iter().any(|r| state.selected.contains(&r.id));
-                    if ui
-                        .add_enabled(any_ignored, egui::Button::new("Un-ignore"))
-                        .on_disabled_hover_text("Select ignored repos first")
-                        .clicked()
-                    {
-                        *action = Some(ReposAction::SetIgnored {
-                            repo_ids: ids(state),
-                            ignored: false,
-                        });
-                    }
-                }
-            }
-            ListKind::Ignored => {
-                if ui
-                    .add_enabled(count > 0, egui::Button::new("Un-ignore"))
-                    .clicked()
-                {
-                    *action = Some(ReposAction::SetIgnored {
-                        repo_ids: ids(state),
-                        ignored: false,
-                    });
-                }
-            }
-        }
-        // These rows leave the list, so nothing stays selected.
-        if action.is_some() {
-            state.selected.clear();
-        }
-
-        // Tagging keeps the selection, so several tags can go on the same repos.
-        ui.separator();
-        let label = ui.label("Tag");
-        let field = ui
-            .add(
-                egui::TextEdit::singleline(&mut state.tag_name)
-                    .hint_text("tag name")
-                    .desired_width(120.0),
-            )
-            .labelled_by(label.id);
-        let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let valid = tags::normalize_tag(&state.tag_name);
-        let enabled = count > 0 && valid.is_ok();
-        let why_not = match &valid {
-            _ if count == 0 => "Select repos first".to_owned(),
-            Err(e) => e.clone(),
-            Ok(_) => String::new(),
-        };
-        let add = ui
-            .add_enabled(enabled, egui::Button::new("Add tag"))
-            .on_hover_text("Tag the selected repos; a repo keeps its tags once it's cloned")
-            .on_disabled_hover_text(&why_not)
-            .clicked();
-        if (add || entered) && enabled {
-            *action = Some(ReposAction::Tags(TagsAction::AddTag {
-                clone_ids: Vec::new(),
-                repo_ids: ids(state),
-                tag: std::mem::take(&mut state.tag_name),
-            }));
-        }
-        if ui
-            .add_enabled(enabled, egui::Button::new("Remove tag"))
-            .on_hover_text("Removes manual tags only; tags from rules stay")
-            .on_disabled_hover_text(&why_not)
-            .clicked()
-        {
-            *action = Some(ReposAction::Tags(TagsAction::RemoveTag {
-                clone_ids: Vec::new(),
-                repo_ids: ids(state),
-                tag: std::mem::take(&mut state.tag_name),
-            }));
-        }
-    });
+    let ids = state.selection.in_order(&order);
+    let targets = Targets::repos(ids.clone(), cx.clones);
+    let any_ignored = ignored_rows.iter().any(|r| state.selection.contains(r.id));
+    bar.show(
+        ui,
+        (&mut state.selection, &order),
+        &targets,
+        bar_cx,
+        |ui| list_buttons(ui, kind, &ids, (show_ignored, any_ignored)),
+        action,
+    );
     ui.add_space(4.0);
 
     if shown.is_empty() {
@@ -443,8 +346,7 @@ pub fn repo_list(
                 .body(|body| {
                     body.rows(row_height, shown.len(), |mut row| {
                         let repo = shown[row.index()];
-                        let selected = state.selected.contains(&repo.id);
-                        row.set_selected(selected);
+                        row.set_selected(state.selection.contains(repo.id));
                         row.col(|ui| {
                             name_cell(ui, repo, cx.cloning.contains(&repo.id), show_ignored);
                         });
@@ -481,16 +383,61 @@ pub fn repo_list(
                             let description = repo.description.as_deref().unwrap_or("");
                             ui.weak(description).on_hover_text(description);
                         });
-                        if row.response().clicked() {
-                            if selected {
-                                state.selected.remove(&repo.id);
-                            } else {
-                                state.selected.insert(repo.id);
-                            }
-                        }
+                        state.selection.handle(&row.response(), &order, row.index());
                     });
                 });
         });
+}
+
+/// Clone, Ignore and Un-ignore for the selected repos (`ids`). `show_ignored`: the Remote List
+/// lists ignored repos too; `any_ignored`: some of the selected ones are.
+fn list_buttons(
+    ui: &mut egui::Ui,
+    kind: ListKind,
+    ids: &[i64],
+    (show_ignored, any_ignored): (bool, bool),
+) -> Option<ReposAction> {
+    let count = ids.len();
+    let set_ignored = |ignored| ReposAction::SetIgnored {
+        repo_ids: ids.to_vec(),
+        ignored,
+    };
+    let mut action = None;
+    match kind {
+        ListKind::Remote => {
+            if ui
+                .add_enabled(count > 0, egui::Button::new("Clone"))
+                .on_hover_text("Clone over SSH into the clone root's layout")
+                .clicked()
+            {
+                action = Some(ReposAction::Clone(ids.to_vec()));
+            }
+            if ui
+                .add_enabled(count > 0, egui::Button::new("Ignore"))
+                .on_hover_text("Move to the Ignored list; you can bring them back later")
+                .clicked()
+            {
+                action = Some(set_ignored(true));
+            }
+            if show_ignored
+                && ui
+                    .add_enabled(any_ignored, egui::Button::new("Un-ignore"))
+                    .on_disabled_hover_text("Select ignored repos first")
+                    .clicked()
+            {
+                action = Some(set_ignored(false));
+            }
+        }
+        ListKind::Ignored => {
+            if ui
+                .add_enabled(count > 0, egui::Button::new("Un-ignore"))
+                .clicked()
+            {
+                action = Some(set_ignored(false));
+            }
+        }
+    }
+    action
 }
 
 /// `mark_ignored`: say so when the repo is ignored (where that isn't a given).
@@ -607,6 +554,8 @@ pub struct ForksContext<'a> {
     pub show: ForkShow,
     /// IDs of ignored repos.
     pub ignored: &'a HashSet<i64>,
+    /// The scanned clones, to open or run on the clones of the selected forks.
+    pub clones: &'a [CloneInfo],
 }
 
 /// The fork's side of a row: hiding and the language go by the fork. The search looks at the
@@ -638,8 +587,9 @@ fn fork_items<'a>(
     ]
 }
 
-/// Sort order of the Forks table.
+/// Selection (by fork ID) and sort order of the Forks table.
 pub struct ForksState {
+    pub selection: Selection,
     sort: ForkSort,
     descending: bool,
 }
@@ -647,6 +597,7 @@ pub struct ForksState {
 impl ForksState {
     pub fn new() -> Self {
         Self {
+            selection: Selection::new(),
             sort: ForkSort::Fork,
             descending: false,
         }
@@ -746,22 +697,16 @@ fn sort_forks(rows: &mut [(&ForkRow, String)], key: ForkSort, descending: bool) 
     });
 }
 
-/// Every fork with its upstream, and whether the two are linked.
+/// Every fork with its upstream, and whether the two are linked. Selecting rows selects the
+/// forks, to open, run on or tag their clones.
 pub fn forks_view(
     ui: &mut egui::Ui,
     catalog: &Catalog,
     cx: &ForksContext<'_>,
     state: &mut ForksState,
+    (bar, bar_cx): (&mut ActionBar, &BarContext<'_>),
     action: &mut Option<ReposAction>,
 ) {
-    ui.weak(
-        "Linked: a fork you contribute from. Its clone gets the upstream as a remote, and the \
-         upstream leaves the Remote List. Separate: a hard fork; fork and upstream are handled \
-         on their own, with no upstream remote. Forks are linked by default, unless your clone \
-         of the fork has no remote for the upstream. Click a button to switch it.",
-    );
-    ui.add_space(4.0);
-
     let mut shown: Vec<(&ForkRow, String)> = catalog
         .forks
         .iter()
@@ -774,6 +719,26 @@ pub fn forks_view(
         .map(|f| (f, notes_text(&fork_notes(f))))
         .collect();
     sort_forks(&mut shown, state.sort, state.descending);
+    let order: Vec<i64> = shown.iter().map(|(f, _)| f.fork_id).collect();
+    state.selection.retain(&order);
+    let targets = Targets::repos(state.selection.in_order(&order), cx.clones);
+    bar.show(
+        ui,
+        (&mut state.selection, &order),
+        &targets,
+        bar_cx,
+        |_| None,
+        action,
+    );
+    ui.add_space(4.0);
+
+    ui.weak(
+        "Linked: a fork you contribute from. Its clone gets the upstream as a remote, and the \
+         upstream leaves the Remote List. Separate: a hard fork; fork and upstream are handled \
+         on their own, with no upstream remote. Forks are linked by default, unless your clone \
+         of the fork has no remote for the upstream. Click a button to switch it.",
+    );
+    ui.add_space(4.0);
 
     if shown.is_empty() {
         ui.weak(if catalog.forks.is_empty() {
@@ -784,6 +749,7 @@ pub fn forks_view(
         return;
     }
 
+    ui.style_mut().interaction.selectable_labels = false;
     let row_height = ui.spacing().interact_size.y + 6.0;
     egui::ScrollArea::horizontal()
         .id_salt("forks_scroll")
@@ -792,6 +758,7 @@ pub fn forks_view(
             TableBuilder::new(ui)
                 .id_salt("forks_table")
                 .striped(true)
+                .sense(egui::Sense::click())
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .column(
                     Column::initial(260.0)
@@ -820,6 +787,7 @@ pub fn forks_view(
                 .body(|body| {
                     body.rows(row_height, shown.len(), |mut row| {
                         let (fork, _) = shown[row.index()];
+                        row.set_selected(state.selection.contains(fork.fork_id));
                         row.col(|ui| {
                             ui.label(&fork.fork_name);
                         });
@@ -869,6 +837,7 @@ pub fn forks_view(
                                 ui.label(text).on_hover_text(note.hover);
                             }
                         });
+                        state.selection.handle(&row.response(), &order, row.index());
                     });
                 });
         });
@@ -1035,8 +1004,8 @@ mod tests {
     #[test]
     fn retain_drops_vanished_selections() {
         let mut state = ListState::new();
-        state.selected.extend([1, 2, 3]);
+        state.selection.select_all(&[1, 2, 3]);
         state.retain(&[row(2, "a", "b")]);
-        assert_eq!(state.selected, HashSet::from([2]));
+        assert_eq!(state.selection.in_order(&[1, 2, 3]), [2]);
     }
 }

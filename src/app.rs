@@ -4,7 +4,7 @@
 use eframe::egui;
 
 use crate::backend::{
-    AuthState, Backend, Command, DbInfo, Event, FolderPurpose, LaunchRequest, LauncherInfo, Origin,
+    AuthState, Backend, Command, DbInfo, Event, FolderPurpose, LaunchRequest, LauncherInfo,
 };
 use crate::config::{Config, Paths, ThemeChoice};
 use crate::db::TagStore;
@@ -172,12 +172,13 @@ impl App {
                 self.tag_store = store;
                 self.rebuild_tags();
             }
+            // Tags are added and removed in Repositories, and rules are edited in Tags.
+            Event::TagActionFailed(message) if self.tab == Tab::Repositories => {
+                self.repos.action_failed(message);
+            }
             Event::TagActionFailed(message) => self.tags.action_failed(message),
             Event::Launchers(launchers) => self.launchers = launchers,
-            Event::LaunchFailed { origin, message } => match origin {
-                Origin::Repos => self.repos.action_failed(message),
-                Origin::Tags => self.tags.action_failed(message),
-            },
+            Event::LaunchFailed(message) => self.repos.action_failed(message),
             Event::RepoActionFailed(message) => self.repos.action_failed(message),
             Event::Snippets(snippets) => self.runner.set_snippets(snippets),
             Event::RunStarted { run, request } => self.runner.run_started(run, request),
@@ -244,8 +245,15 @@ impl App {
             }
             ReposAction::Import(moves) => self.backend.send(Command::Import(moves)),
             ReposAction::Tags(action) => self.handle_tags_action(action),
-            ReposAction::Open { launcher, clone_id } => {
-                self.launch(launcher, false, &[clone_id], String::new(), Origin::Repos);
+            ReposAction::Open {
+                launcher,
+                together,
+                clone_ids,
+                workspace_name,
+            } => self.launch(launcher, together, &clone_ids, workspace_name),
+            ReposAction::RunOn { label, clone_ids } => {
+                self.runner.set_working_set(label, clone_ids);
+                self.tab = Tab::Runner;
             }
             ReposAction::SetRemote {
                 path,
@@ -295,32 +303,11 @@ impl App {
                 clone_id,
                 excepted,
             },
-            TagsAction::RunOn { label, clone_ids } => {
-                self.runner.set_working_set(label, clone_ids);
-                self.tab = Tab::Runner;
-                return;
-            }
-            TagsAction::Open {
-                launcher,
-                together,
-                clone_ids,
-                workspace_name,
-            } => {
-                self.launch(launcher, together, &clone_ids, workspace_name, Origin::Tags);
-                return;
-            }
         };
         self.backend.send(command);
     }
 
-    fn launch(
-        &self,
-        launcher: String,
-        together: bool,
-        clone_ids: &[i64],
-        workspace_name: String,
-        origin: Origin,
-    ) {
+    fn launch(&self, launcher: String, together: bool, clone_ids: &[i64], workspace_name: String) {
         let clones = self.repos.clones().unwrap_or_default();
         let targets = clone_ids
             .iter()
@@ -332,7 +319,6 @@ impl App {
             together,
             targets,
             workspace_name,
-            origin,
         }));
     }
 
@@ -451,7 +437,7 @@ fn log_entries(event: &Event, logged_last_sync: &mut bool) -> Vec<Entry> {
         Event::RepoNotice(message) => Entry::info(message),
         Event::RepoActionFailed(message)
         | Event::TagActionFailed(message)
-        | Event::LaunchFailed { message, .. } => Entry::error(message),
+        | Event::LaunchFailed(message) => Entry::error(message),
         Event::ImportPreview(Err(e)) => Entry::error("Couldn't plan the import").detail(e),
         _ => return entries,
     };
@@ -505,6 +491,7 @@ impl eframe::App for App {
                     repo_tags: &self.repo_tag_index,
                     rules: &self.tag_store.rules,
                     launchers: &self.launchers,
+                    confirm_over: self.config.launch.confirm_over as usize,
                 };
                 if let Some(action) = self.repos.show(ui, cx) {
                     self.handle_repos_action(action);
@@ -512,14 +499,11 @@ impl eframe::App for App {
             }
             Tab::Tags => {
                 let cx = TagsContext {
-                    clones: self.repos.clones().unwrap_or_default(),
                     repos: self.repos.catalog().map_or(&[][..], |c| &c.inbox),
                     facts: &self.facts,
                     index: &self.tag_index,
                     repo_index: &self.repo_tag_index,
                     rules: &self.tag_store.rules,
-                    launchers: &self.launchers,
-                    confirm_over: self.config.launch.confirm_over as usize,
                 };
                 if let Some(action) = self.tags.show(ui, cx) {
                     self.handle_tags_action(action);

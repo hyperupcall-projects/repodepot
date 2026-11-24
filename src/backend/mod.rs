@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, spawn_blocking};
 
 pub use import::ImportMove;
-pub use open::{LaunchRequest, LauncherInfo, Origin};
+pub use open::{LaunchRequest, LauncherInfo};
 pub use repos::SyncReport;
 
 use crate::config::{Config, Paths};
@@ -167,14 +167,12 @@ pub enum Event {
     ImportPreview(Result<ImportPreview, String>),
     /// Manual tags, rules and repo facts, after any change.
     Tags(TagStore),
-    /// Something the user asked for on the Tags tab failed.
+    /// Tagging, or a change to rules, failed.
     TagActionFailed(String),
     /// The apps that can open repos on this computer.
     Launchers(Vec<LauncherInfo>),
-    LaunchFailed {
-        origin: Origin,
-        message: String,
-    },
+    /// Opening repos in an app failed.
+    LaunchFailed(String),
     /// Something for the log that no other event covers.
     Log(log::Entry),
 }
@@ -424,12 +422,8 @@ async fn run(
                 }
             }
             Command::Launch(request) => {
-                let origin = request.origin;
                 if let Err(e) = open::open(&shared, request).await {
-                    shared.emitter.emit(Event::LaunchFailed {
-                        origin,
-                        message: format!("{e:#}"),
-                    });
+                    shared.emitter.emit(Event::LaunchFailed(format!("{e:#}")));
                 }
             }
             Command::Scan => {
@@ -1450,7 +1444,6 @@ mod tests {
                 together,
                 targets: targets.clone(),
                 workspace_name: "lang:rust".into(),
-                origin: Origin::Tags,
             })
         };
         backend.send(request("Fake", false));
@@ -1479,24 +1472,18 @@ mod tests {
 
         backend.send(request("Broken", false));
         let failure = wait_for(&backend, "the failure", |event| match event {
-            Event::LaunchFailed { origin, message } => Some((origin, message)),
+            Event::LaunchFailed(message) => Some(message),
             _ => None,
         });
-        assert_eq!(failure.0, Origin::Tags);
         assert!(
-            failure
-                .1
-                .contains("broken-editor stopped with exit status: 3"),
-            "{}",
-            failure.1
+            failure.contains("broken-editor stopped with exit status: 3"),
+            "{failure}"
         );
 
         backend.send(request("Nope", false));
         // (The broken editor fails once per repo, so skip its second report.)
         let missing = wait_for(&backend, "the missing launcher", |event| match event {
-            Event::LaunchFailed { message, .. } if message.contains("isn't installed") => {
-                Some(message)
-            }
+            Event::LaunchFailed(message) if message.contains("isn't installed") => Some(message),
             _ => None,
         });
         assert!(missing.contains("isn't installed"));
