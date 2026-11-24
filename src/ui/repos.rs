@@ -323,7 +323,6 @@ pub struct ReposPage {
     ignored: ListState,
     /// Repo IDs with a clone run in progress.
     cloning: HashSet<i64>,
-    add_text: String,
     forks: ForksState,
     /// IDs of ignored repos, to tell which clones are of one.
     ignored_repos: HashSet<i64>,
@@ -357,7 +356,6 @@ impl ReposPage {
             remote: ListState::new(),
             ignored: ListState::new(),
             cloning: HashSet::new(),
-            add_text: String::new(),
             forks: ForksState::new(),
             ignored_repos: HashSet::new(),
             upstream_name: "upstream".to_owned(),
@@ -615,8 +613,7 @@ impl ReposPage {
         };
         match self.view {
             View::RemoteList => {
-                remote_list::add_by_hand(ui, &mut self.add_text, &catalog.manual_owners, action);
-                ui.add_space(4.0);
+                remote_list::manual_owners(ui, &catalog.manual_owners, action);
                 remote_list::repo_list(
                     ui,
                     ListKind::Remote,
@@ -2538,21 +2535,16 @@ mod tests {
     }
 
     #[test]
-    fn add_by_hand_and_remove_an_owner() {
+    fn remote_list_has_no_add_by_hand_but_owners_can_be_removed() {
         let mut h = harness(Harness::builder());
         h.state_mut().0.view = View::RemoteList;
-        h.state_mut().0.add_text = " rust-lang/rust ".into();
         h.run();
-        h.get_by_label("Add").click();
-        h.run();
+        assert!(h.query_by_label("Add by hand").is_none());
         h.get_by_label("×").click();
         h.run();
         assert_eq!(
             h.state().1,
-            vec![
-                ReposAction::AddManual("rust-lang/rust".into()),
-                ReposAction::RemoveManualOwner("rust-lang".into()),
-            ]
+            vec![ReposAction::RemoveManualOwner("rust-lang".into())]
         );
     }
 

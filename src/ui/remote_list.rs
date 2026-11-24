@@ -522,44 +522,26 @@ fn name_cell(ui: &mut egui::Ui, repo: &RepoRow, cloning: bool, mark_ignored: boo
     }
 }
 
-/// "Add by hand" and the list of owners added that way.
-pub fn add_by_hand(
-    ui: &mut egui::Ui,
-    text: &mut String,
-    owners: &[String],
-    action: &mut Option<ReposAction>,
-) {
+/// The owners added by hand, each with a button to stop listing their repos. Shows nothing
+/// when there are none.
+pub fn manual_owners(ui: &mut egui::Ui, owners: &[String], action: &mut Option<ReposAction>) {
+    if owners.is_empty() {
+        return;
+    }
     ui.horizontal_wrapped(|ui| {
-        let label = ui.label("Add by hand");
-        let field = ui
-            .add(
-                egui::TextEdit::singleline(text)
-                    .hint_text("owner/name, a GitHub URL, or an org or user")
-                    .desired_width(300.0),
-            )
-            .labelled_by(label.id);
-        let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let can_add = !text.trim().is_empty();
-        if (ui.add_enabled(can_add, egui::Button::new("Add")).clicked() || entered) && can_add {
-            *action = Some(ReposAction::AddManual(
-                std::mem::take(text).trim().to_owned(),
-            ));
-        }
-        if !owners.is_empty() {
-            ui.separator();
-            ui.weak("Owners added:");
-            for owner in owners {
-                ui.label(owner);
-                if ui
-                    .small_button("×")
-                    .on_hover_text(format!("Stop listing every repo of {owner}"))
-                    .clicked()
-                {
-                    *action = Some(ReposAction::RemoveManualOwner(owner.clone()));
-                }
+        ui.weak("Owners added:");
+        for owner in owners {
+            ui.label(owner);
+            if ui
+                .small_button("×")
+                .on_hover_text(format!("Stop listing every repo of {owner}"))
+                .clicked()
+            {
+                *action = Some(ReposAction::RemoveManualOwner(owner.clone()));
             }
         }
     });
+    ui.add_space(4.0);
 }
 
 /// The columns the Forks table can be sorted by.
