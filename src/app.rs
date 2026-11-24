@@ -15,24 +15,22 @@ use crate::ui::log::LogView;
 use crate::ui::repos::{ReposAction, ReposContext, ReposPage};
 use crate::ui::runner::{RunnerAction, RunnerContext, RunnerPage};
 use crate::ui::settings::{SettingsContext, SettingsPage};
-use crate::ui::tags::{TagsAction, TagsContext, TagsPage};
+use crate::ui::tags::TagsAction;
 use crate::ui::{plural, short_duration, thousands};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Repositories,
-    Tags,
     Runner,
     Settings,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Repositories, Tab::Tags, Tab::Runner, Tab::Settings];
+    const ALL: [Tab; 3] = [Tab::Repositories, Tab::Runner, Tab::Settings];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Repositories => "Repositories",
-            Tab::Tags => "Tags",
             Tab::Runner => "Runner",
             Tab::Settings => "Settings",
         }
@@ -48,7 +46,6 @@ pub struct App {
     repos: ReposPage,
     runner: RunnerPage,
     settings: SettingsPage,
-    tags: TagsPage,
     tag_store: TagStore,
     /// What rules see about each scanned clone.
     facts: Vec<CloneFacts>,
@@ -83,7 +80,6 @@ impl App {
             repos: ReposPage::new(),
             runner: RunnerPage::new(),
             settings: SettingsPage::new(&config),
-            tags: TagsPage::new(),
             tag_store: TagStore::default(),
             facts: Vec::new(),
             tag_index: TagIndex::default(),
@@ -172,14 +168,11 @@ impl App {
                 self.tag_store = store;
                 self.rebuild_tags();
             }
-            // Tags are added and removed in Repositories, and rules are edited in Tags.
-            Event::TagActionFailed(message) if self.tab == Tab::Repositories => {
-                self.repos.action_failed(message);
-            }
-            Event::TagActionFailed(message) => self.tags.action_failed(message),
             Event::Launchers(launchers) => self.launchers = launchers,
-            Event::LaunchFailed(message) => self.repos.action_failed(message),
-            Event::RepoActionFailed(message) => self.repos.action_failed(message),
+            // Tags, rules, launches and repo actions all start from Repositories.
+            Event::TagActionFailed(message)
+            | Event::LaunchFailed(message)
+            | Event::RepoActionFailed(message) => self.repos.action_failed(message),
             Event::Snippets(snippets) => self.runner.set_snippets(snippets),
             Event::RunStarted { run, request } => self.runner.run_started(run, request),
             Event::History(history) => self.runner.set_history(history),
@@ -490,23 +483,12 @@ impl eframe::App for App {
                     tags: &self.tag_index,
                     repo_tags: &self.repo_tag_index,
                     rules: &self.tag_store.rules,
+                    facts: &self.facts,
                     launchers: &self.launchers,
                     confirm_over: self.config.launch.confirm_over as usize,
                 };
                 if let Some(action) = self.repos.show(ui, cx) {
                     self.handle_repos_action(action);
-                }
-            }
-            Tab::Tags => {
-                let cx = TagsContext {
-                    repos: self.repos.catalog().map_or(&[][..], |c| &c.inbox),
-                    facts: &self.facts,
-                    index: &self.tag_index,
-                    repo_index: &self.repo_tag_index,
-                    rules: &self.tag_store.rules,
-                };
-                if let Some(action) = self.tags.show(ui, cx) {
-                    self.handle_tags_action(action);
                 }
             }
             Tab::Runner => {

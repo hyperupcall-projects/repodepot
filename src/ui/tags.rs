@@ -1,11 +1,15 @@
-//! The Tags tab: rules that tag clones and repos automatically. Tags are added by hand, and
-//! groups picked by tag, in the Repositories tab.
+//! The Tags view of the Repositories tab: a table of the rules that tag clones and repos
+//! automatically, a search over them, and the rule editor. Tags are added by hand, and groups
+//! picked by tag, in the other views.
+
+use std::collections::{BTreeSet, HashMap};
 
 use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 
 use crate::db::RepoRow;
 use crate::tags::{self, CloneFacts, Rule, RuleField, TagIndex, Tagging};
-use crate::ui::plural;
+use crate::ui::{cmp_text, plural, present_first, sort_header, thousands};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum TagsAction {
@@ -44,56 +48,201 @@ pub struct TagsContext<'a> {
     pub rules: &'a [Rule],
 }
 
+/// The columns the rules table can be sorted by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortKey {
+    Enabled,
+    When,
+    Pattern,
+    Tag,
+    Clones,
+    Repos,
+    Exceptions,
+}
+
+impl SortKey {
+    /// Counts read best biggest first.
+    fn starts_descending(self) -> bool {
+        matches!(self, SortKey::Clones | SortKey::Repos | SortKey::Exceptions)
+    }
+}
+
+/// A rule, with what it does right now.
+struct RuleRow<'a> {
+    rule: &'a Rule,
+    /// Clones it tags.
+    clones: usize,
+    /// Repos in the Remote List it tags.
+    repos: usize,
+    /// The tags it gives them.
+    adds: BTreeSet<&'a str>,
+}
+
+impl RuleRow<'_> {
+    /// `search` is lowercase. Yes/no rules have no pattern to search.
+    fn matches(&self, search: &str) -> bool {
+        let has = |text: &str| text.to_lowercase().contains(search);
+        (!self.rule.field.is_flag() && has(&self.rule.pattern))
+            || has(&self.rule.tag_template)
+            || self.adds.iter().any(|tag| has(tag))
+    }
+}
+
+/// Every rule, with the clones and Remote List repos it tags and the tags it gives them.
+fn rule_rows<'a>(cx: &TagsContext<'a>) -> Vec<RuleRow<'a>> {
+    let (index, repo_index): (&'a TagIndex, &'a TagIndex) = (cx.index, cx.repo_index);
+    let mut rows: Vec<RuleRow<'a>> = cx
+        .rules
+        .iter()
+        .map(|rule| RuleRow {
+            rule,
+            clones: 0,
+            repos: 0,
+            adds: BTreeSet::new(),
+        })
+        .collect();
+    let position: HashMap<i64, usize> = cx
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(i, rule)| (rule.id, i))
+        .collect();
+    let mut add = |tagging: &'a Tagging, is_clone: bool| {
+        // A rule that gives one clone several tags still tags one clone.
+        let mut counted = BTreeSet::new();
+        for (tag, rule_ids) in &tagging.auto {
+            for id in rule_ids {
+                let Some(&i) = position.get(id) else {
+                    continue;
+                };
+                let row = &mut rows[i];
+                row.adds.insert(tag.as_str());
+                if counted.insert(*id) {
+                    if is_clone {
+                        row.clones += 1;
+                    } else {
+                        row.repos += 1;
+                    }
+                }
+            }
+        }
+    };
+    for tagging in index.by_clone.values() {
+        add(tagging, true);
+    }
+    for repo in cx.repos {
+        if let Some(tagging) = repo_index.by_clone.get(&repo.id) {
+            add(tagging, false);
+        }
+    }
+    rows
+}
+
+/// Sorts by `key`. Yes/no rules have no pattern, so they go last either way when sorting by
+/// it. Ties go by tag.
+fn sort_rows(rows: &mut [RuleRow<'_>], key: SortKey, descending: bool) {
+    // The order the editor's drop-down lists the fields in: text fields, then yes/no ones.
+    let field = |row: &RuleRow<'_>| RuleField::ALL.iter().position(|f| *f == row.rule.field);
+    fn pattern<'a>(row: &RuleRow<'a>) -> Option<&'a str> {
+        (!row.rule.field.is_flag()).then_some(row.rule.pattern.as_str())
+    }
+    rows.sort_by(|a, b| {
+        let count = |x: usize, y: usize| present_first(Some(x), Some(y), descending, Ord::cmp);
+        let order = match key {
+            // Rules that are on come first.
+            SortKey::Enabled => present_first(
+                Some(!a.rule.enabled),
+                Some(!b.rule.enabled),
+                descending,
+                Ord::cmp,
+            ),
+            SortKey::When => present_first(field(a), field(b), descending, Ord::cmp),
+            SortKey::Pattern => {
+                present_first(pattern(a), pattern(b), descending, |x, y| cmp_text(x, y))
+            }
+            SortKey::Tag => present_first(
+                Some(&a.rule.tag_template),
+                Some(&b.rule.tag_template),
+                descending,
+                |x, y| cmp_text(x, y),
+            ),
+            SortKey::Clones => count(a.clones, b.clones),
+            SortKey::Repos => count(a.repos, b.repos),
+            SortKey::Exceptions => count(a.rule.exceptions.len(), b.rule.exceptions.len()),
+        };
+        order
+            .then_with(|| cmp_text(&a.rule.tag_template, &b.rule.tag_template))
+            .then_with(|| a.rule.id.cmp(&b.rule.id))
+    });
+}
+
 pub struct TagsPage {
+    /// The rule being written or edited, shown above the table.
     editor: Option<Rule>,
-    error: Option<String>,
+    /// Part of a rule's pattern, its tag, or a tag it gives.
+    search: String,
+    sort: SortKey,
+    descending: bool,
 }
 
 impl TagsPage {
     pub fn new() -> Self {
         Self {
             editor: None,
-            error: None,
+            search: String::new(),
+            sort: SortKey::Tag,
+            descending: false,
         }
     }
 
-    pub fn action_failed(&mut self, message: String) {
-        self.error = Some(message);
+    pub fn has_search(&self) -> bool {
+        !self.search.trim().is_empty()
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search.clear();
+    }
+
+    /// The search field, for the view's own filter row.
+    pub fn search_field(&mut self, ui: &mut egui::Ui) {
+        let label = ui.label("Search");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.search)
+                .hint_text("Pattern or tag")
+                .desired_width(220.0),
+        )
+        .labelled_by(label.id)
+        .on_hover_text(
+            "Part of a rule's pattern, of the tag it adds, or of a tag it gives right now \
+             (lang:rust finds lang:$1). Ignores case.",
+        );
+    }
+
+    /// The rules the table lists: those the search matches, sorted.
+    fn shown_rows<'a>(&self, cx: &TagsContext<'a>) -> Vec<RuleRow<'a>> {
+        let search = self.search.trim().to_lowercase();
+        let mut rows: Vec<RuleRow<'a>> = rule_rows(cx)
+            .into_iter()
+            .filter(|row| row.matches(&search))
+            .collect();
+        sort_rows(&mut rows, self.sort, self.descending);
+        rows
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, cx: TagsContext<'_>) -> Option<TagsAction> {
         let mut action = None;
-        if let Some(error) = &self.error {
-            let mut dismiss = false;
-            ui.horizontal(|ui| {
-                ui.colored_label(ui.visuals().error_fg_color, error);
-                dismiss = ui.small_button("Dismiss").clicked();
-            });
-            if dismiss {
-                self.error = None;
-            }
-        }
-        self.rules(ui, &cx, &mut action);
-        if action.is_some() {
-            self.error = None;
-        }
-        action
-    }
-
-    fn rules(&mut self, ui: &mut egui::Ui, cx: &TagsContext<'_>, action: &mut Option<TagsAction>) {
-        ui.horizontal(|ui| {
-            ui.heading(format!("Rules ({})", cx.rules.len()));
+        ui.horizontal_wrapped(|ui| {
             if ui.button("New rule").clicked() {
                 self.editor = Some(Rule::new(RuleField::FullName));
             }
+            ui.weak(
+                "Rules add tags automatically and apply live: changing one updates every clone \
+                 and repo. Add tags by hand, and pick repos by tag, in the other views.",
+            );
         });
-        ui.weak(
-            "Rules add tags automatically and apply live: changing one updates every clone. \
-             Add tags by hand, and pick repos by tag, in the Repositories tab.",
-        );
         ui.add_space(4.0);
         if self.editor.is_some() {
-            self.rule_editor(ui, cx, action);
+            self.rule_editor(ui, &cx, &mut action);
             ui.add_space(8.0);
         }
 
@@ -102,58 +251,127 @@ impl TagsPage {
                 "No rules yet. For example: language matches ^rust$ adds rust, or \
                  owner/name matches ^([^/]+)/ adds org:$1.",
             );
-            return;
+            return action;
         }
-        for rule in cx.rules {
-            ui.horizontal(|ui| {
-                let mut enabled = rule.enabled;
-                if ui.checkbox(&mut enabled, rule.describe()).changed() {
-                    *action = Some(TagsAction::SetRuleEnabled {
-                        rule_id: rule.id,
-                        enabled,
+        let rows = self.shown_rows(&cx);
+        if rows.is_empty() {
+            ui.weak("Nothing matches the search.");
+            return action;
+        }
+        // In a narrow window, scroll sideways rather than squeezing the columns.
+        egui::ScrollArea::horizontal()
+            .id_salt("rules_scroll")
+            .auto_shrink(false)
+            .show(ui, |ui| self.table(ui, &rows, &cx, &mut action));
+        action
+    }
+
+    fn table(
+        &mut self,
+        ui: &mut egui::Ui,
+        rows: &[RuleRow<'_>],
+        cx: &TagsContext<'_>,
+        action: &mut Option<TagsAction>,
+    ) {
+        let row_height = ui.text_style_height(&egui::TextStyle::Body) + 8.0;
+        let editing = self.editor.as_ref().map(|rule| rule.id);
+        TableBuilder::new(ui)
+            .id_salt("rules")
+            .striped(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(45.0).at_least(40.0))
+            .column(
+                Column::initial(130.0)
+                    .at_least(80.0)
+                    .clip(true)
+                    .resizable(true),
+            )
+            .column(
+                Column::initial(240.0)
+                    .at_least(80.0)
+                    .clip(true)
+                    .resizable(true),
+            )
+            .column(
+                Column::initial(260.0)
+                    .at_least(80.0)
+                    .clip(true)
+                    .resizable(true),
+            )
+            .column(Column::initial(75.0).at_least(65.0))
+            .column(Column::initial(105.0).at_least(95.0))
+            .column(Column::initial(95.0).at_least(90.0))
+            .column(Column::remainder().at_least(110.0))
+            .header(24.0, |mut header| {
+                for (title, key) in [
+                    ("On", SortKey::Enabled),
+                    ("When", SortKey::When),
+                    ("Pattern", SortKey::Pattern),
+                    ("Tag", SortKey::Tag),
+                    ("Clones", SortKey::Clones),
+                    ("Remote List", SortKey::Repos),
+                    ("Exceptions", SortKey::Exceptions),
+                ] {
+                    header.col(|ui| {
+                        sort_header(
+                            ui,
+                            title,
+                            key,
+                            &mut self.sort,
+                            &mut self.descending,
+                            key.starts_descending(),
+                        );
                     });
                 }
-                let tagged = cx
-                    .index
-                    .by_clone
-                    .values()
-                    .filter(|t| t.auto.values().any(|rules| rules.contains(&rule.id)))
-                    .count();
-                let repos_tagged = cx
-                    .repos
-                    .iter()
-                    .filter_map(|r| cx.repo_index.by_clone.get(&r.id))
-                    .filter(|t| t.auto.values().any(|rules| rules.contains(&rule.id)))
-                    .count();
-                if repos_tagged > 0 {
-                    ui.weak(format!(
-                        "· tags {} and {} not cloned",
-                        plural(tagged, "clone", "clones"),
-                        plural(repos_tagged, "repo", "repos")
-                    ));
-                } else {
-                    ui.weak(format!("· tags {}", plural(tagged, "clone", "clones")));
-                }
-                if !rule.exceptions.is_empty() {
-                    ui.weak(format!(
-                        "· {}",
-                        plural(rule.exceptions.len(), "exception", "exceptions")
-                    ));
-                }
-                if let Some(error) = cx.index.rule_errors.get(&rule.id) {
-                    ui.colored_label(ui.visuals().error_fg_color, error);
-                }
-                if ui.small_button("Edit").clicked() {
-                    self.editor = Some(rule.clone());
-                }
-                if ui.small_button("Delete").clicked() {
-                    *action = Some(TagsAction::DeleteRule(rule.id));
-                    if self.editor.as_ref().is_some_and(|e| e.id == rule.id) {
-                        self.editor = None;
-                    }
-                }
+                header.col(|_| {});
+            })
+            .body(|body| {
+                body.rows(row_height, rows.len(), |mut row| {
+                    let RuleRow {
+                        rule,
+                        clones,
+                        repos,
+                        adds,
+                    } = &rows[row.index()];
+                    row.set_selected(editing == Some(rule.id));
+                    row.col(|ui| {
+                        let mut enabled = rule.enabled;
+                        if ui
+                            .add(egui::Checkbox::without_text(&mut enabled))
+                            .on_hover_text(if rule.enabled {
+                                "On: it adds its tags. Untick to turn it off."
+                            } else {
+                                "Off: it adds nothing. Tick to turn it on."
+                            })
+                            .changed()
+                        {
+                            *action = Some(TagsAction::SetRuleEnabled {
+                                rule_id: rule.id,
+                                enabled,
+                            });
+                        }
+                    });
+                    row.col(|ui| {
+                        ui.label(rule.flag_condition().unwrap_or(rule.field.label()));
+                    });
+                    row.col(|ui| pattern_cell(ui, rule, cx.index.rule_errors.get(&rule.id)));
+                    row.col(|ui| tag_cell(ui, rule, adds));
+                    row.col(|ui| count_cell(ui, *clones));
+                    row.col(|ui| count_cell(ui, *repos));
+                    row.col(|ui| count_cell(ui, rule.exceptions.len()));
+                    row.col(|ui| {
+                        if ui.small_button("Edit").clicked() {
+                            self.editor = Some((*rule).clone());
+                        }
+                        if ui.small_button("Delete").clicked() {
+                            *action = Some(TagsAction::DeleteRule(rule.id));
+                            if editing == Some(rule.id) {
+                                self.editor = None;
+                            }
+                        }
+                    });
+                });
             });
-        }
     }
 
     fn rule_editor(
@@ -310,6 +528,44 @@ impl TagsPage {
     }
 }
 
+/// The regex, monospaced. Yes/no rules have none. A rule that doesn't compile (only possible
+/// if the database was edited by hand) is flagged.
+fn pattern_cell(ui: &mut egui::Ui, rule: &Rule, error: Option<&String>) {
+    if let Some(error) = error {
+        ui.colored_label(ui.visuals().error_fg_color, "Invalid")
+            .on_hover_text(error);
+    }
+    if !rule.field.is_flag() {
+        ui.label(egui::RichText::new(&rule.pattern).monospace())
+            .on_hover_text(if rule.case_insensitive {
+                "Ignores case"
+            } else {
+                "Matches case"
+            });
+    }
+}
+
+/// The tag the rule adds, followed by the tags it gives right now when those differ (a
+/// capture group like `lang:$1` gives one per language).
+fn tag_cell(ui: &mut egui::Ui, rule: &Rule, adds: &BTreeSet<&str>) {
+    ui.label(&rule.tag_template);
+    let plain = tags::normalize_tag(&rule.tag_template).ok();
+    if adds.iter().any(|tag| Some(*tag) != plain.as_deref()) {
+        let list = adds.iter().copied().collect::<Vec<_>>().join(", ");
+        ui.weak(format!("gives {list}"))
+            .on_hover_text(format!("Gives {list} right now"));
+    }
+}
+
+fn count_cell(ui: &mut egui::Ui, n: usize) {
+    let text = thousands(n as u64);
+    if n == 0 {
+        ui.weak(text);
+    } else {
+        ui.label(text);
+    }
+}
+
 /// Manual tags in plain text, automatic ones in italics.
 pub fn tag_summary(ui: &mut egui::Ui, tagging: &Tagging) {
     for tag in &tagging.manual {
@@ -326,6 +582,7 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
 
+    use egui::accesskit::Role;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
 
@@ -337,6 +594,18 @@ mod tests {
         rules: Vec<Rule>,
         index: TagIndex,
         repo_index: TagIndex,
+    }
+
+    impl Fixture {
+        fn cx(&self) -> TagsContext<'_> {
+            TagsContext {
+                repos: &self.repos,
+                facts: &self.facts,
+                index: &self.index,
+                repo_index: &self.repo_index,
+                rules: &self.rules,
+            }
+        }
     }
 
     /// Repos in the Remote List: one tagged `work` and `someday` (and lang:rust by the rule),
@@ -370,6 +639,10 @@ mod tests {
         )
     }
 
+    /// Three rules:
+    /// - 10: language `(.+)` adds `lang:$1`: 3 clones (lang:rust, lang:typescript), 1 repo
+    /// - 11: name `^notes$` adds `personal`: 1 clone
+    /// - 12: isn't archived adds `active`: no clones (they weren't synced), 2 repos
     fn fixture() -> Fixture {
         let repos = [
             (1, "me/api", Some("Rust")),
@@ -402,7 +675,14 @@ mod tests {
                 id: 11,
                 pattern: "^notes$".into(),
                 tag_template: "personal".into(),
+                exceptions: BTreeSet::from([2, 3]),
                 ..Rule::new(RuleField::Name)
+            },
+            Rule {
+                id: 12,
+                pattern: "no".into(),
+                tag_template: "active".into(),
+                ..Rule::new(RuleField::Archived)
             },
         ];
         let manual = HashMap::from([
@@ -428,20 +708,139 @@ mod tests {
         builder.with_size([1200.0, 600.0]).build_ui_state(
             |ui, (page, fixture, actions): &mut State| {
                 egui::CentralPanel::default_margins().show(ui, |ui| {
-                    let cx = TagsContext {
-                        repos: &fixture.repos,
-                        facts: &fixture.facts,
-                        index: &fixture.index,
-                        repo_index: &fixture.repo_index,
-                        rules: &fixture.rules,
-                    };
-                    if let Some(action) = page.show(ui, cx) {
+                    ui.horizontal(|ui| page.search_field(ui));
+                    if let Some(action) = page.show(ui, fixture.cx()) {
                         actions.push(action);
                     }
                 });
             },
             (TagsPage::new(), fixture(), Vec::new()),
         )
+    }
+
+    /// The IDs of the rules the table lists, top to bottom.
+    fn shown(page: &TagsPage, fixture: &Fixture) -> Vec<i64> {
+        page.shown_rows(&fixture.cx())
+            .iter()
+            .map(|row| row.rule.id)
+            .collect()
+    }
+
+    #[test]
+    fn rows_count_what_each_rule_tags() {
+        let fixture = fixture();
+        let rows = rule_rows(&fixture.cx());
+        let summary: Vec<(i64, usize, usize, Vec<&str>)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.rule.id,
+                    row.clones,
+                    row.repos,
+                    row.adds.iter().copied().collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (10, 3, 1, vec!["lang:rust", "lang:typescript"]),
+                (11, 1, 0, vec!["personal"]),
+                (12, 0, 2, vec!["active"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn rules_sort_by_each_column() {
+        let fixture = fixture();
+        let mut page = TagsPage::new();
+        let mut order = |key: SortKey, descending: bool| {
+            page.sort = key;
+            page.descending = descending;
+            shown(&page, &fixture)
+        };
+        assert_eq!(order(SortKey::Tag, false), [12, 10, 11], "by tag at first");
+        assert_eq!(order(SortKey::Tag, true), [11, 10, 12]);
+        assert_eq!(
+            order(SortKey::When, false),
+            [11, 10, 12],
+            "in the editor's order"
+        );
+        // Yes/no rules have no pattern: last both ways.
+        assert_eq!(order(SortKey::Pattern, false), [10, 11, 12]);
+        assert_eq!(order(SortKey::Pattern, true), [11, 10, 12]);
+        assert_eq!(order(SortKey::Clones, true), [10, 11, 12]);
+        assert_eq!(order(SortKey::Repos, true), [12, 10, 11]);
+        // Ties go by tag, whichever way the column is sorted.
+        assert_eq!(order(SortKey::Exceptions, true), [11, 12, 10]);
+        assert_eq!(order(SortKey::Exceptions, false), [12, 10, 11]);
+        assert_eq!(order(SortKey::Enabled, false), [12, 10, 11]);
+    }
+
+    #[test]
+    fn clicking_a_column_title_sorts_and_reverses() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        assert!(h.query_by_label("Tag ⏶").is_some());
+        // Counts start biggest first.
+        h.get_by_label("Clones").click();
+        h.run();
+        assert_eq!(shown(&h.state().0, &h.state().1), [10, 11, 12]);
+        h.get_by_label("Clones ⏷").click();
+        h.run();
+        assert_eq!(shown(&h.state().0, &h.state().1), [12, 11, 10]);
+        h.get_by_label("Pattern").click();
+        h.run();
+        assert_eq!(shown(&h.state().0, &h.state().1), [10, 11, 12]);
+    }
+
+    #[test]
+    fn search_finds_patterns_tags_and_the_tags_rules_give() {
+        let fixture = fixture();
+        let mut page = TagsPage::new();
+        let mut found = |text: &str| {
+            page.search = text.into();
+            shown(&page, &fixture)
+        };
+        assert_eq!(found(""), [12, 10, 11]);
+        assert_eq!(found("notes"), [11], "the pattern");
+        assert_eq!(
+            found(" PERSONAL "),
+            [11],
+            "the tag, ignoring case and spaces"
+        );
+        assert_eq!(found("lang:$"), [10], "the tag as written");
+        assert_eq!(found("typescript"), [10], "a tag the rule gives");
+        assert_eq!(found("act"), [12]);
+        // Yes/no rules' "yes" and "no" aren't patterns.
+        assert_eq!(found("no"), [11]);
+        assert_eq!(found("zzz"), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn typing_a_search_narrows_the_table() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        assert!(h.query_by_label("personal").is_some());
+        h.get_by_role_and_label(Role::TextInput, "Search").focus();
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Search")
+            .type_text("rust");
+        h.run();
+        assert_eq!(h.state().0.search, "rust");
+        assert!(h.query_by_label("lang:$1").is_some());
+        assert!(
+            h.query_by_label("gives lang:rust, lang:typescript")
+                .is_some()
+        );
+        assert!(h.query_by_label("personal").is_none());
+        h.state_mut().0.search = "nothing".into();
+        h.run();
+        assert!(h.query_by_label("Nothing matches the search.").is_some());
+        assert!(h.state().0.has_search());
+        h.state_mut().0.clear_search();
+        assert!(!h.state().0.has_search());
     }
 
     #[test]
@@ -479,16 +878,17 @@ mod tests {
     fn exceptions_toggles_and_deletes() {
         let mut h = harness(Harness::builder());
         h.run();
-        assert!(h.query_by_label_contains("tags 3 clones").is_some());
-        h.get_by_label("language matches (.+): lang:$1").click();
+        // Sorted by tag: active (12), lang:$1 (10), personal (11).
+        h.get_all_by_role(Role::CheckBox).nth(1).unwrap().click();
         h.run();
-        h.get_all_by_label("Edit").next().unwrap().click();
+        h.get_all_by_label("Edit").nth(1).unwrap().click();
         h.run();
+        assert_eq!(h.state().0.editor.as_ref().map(|r| r.id), Some(10));
         assert!(h.query_by_label("Tags 3 clones of 4").is_some());
         h.get_all_by_label("Add exception").next().unwrap().click();
         h.run();
         assert!(h.query_by_label("Remove exception").is_some());
-        h.get_all_by_label("Delete").nth(1).unwrap().click();
+        h.get_all_by_label("Delete").nth(2).unwrap().click();
         h.run();
         assert_eq!(
             h.state().2,
@@ -507,7 +907,16 @@ mod tests {
         );
     }
 
-    /// Renders the Tags tab when `DEPOSITORY_UI_SHOTS` names a folder.
+    #[test]
+    fn no_rules_says_how_to_start() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().1.rules.clear();
+        h.run();
+        assert!(h.query_by_label_contains("No rules yet").is_some());
+        assert!(h.query_by_label("Tag ⏶").is_none());
+    }
+
+    /// Renders the Tags view when `DEPOSITORY_UI_SHOTS` names a folder.
     #[test]
     fn ui_shots() {
         let Some(dir) = std::env::var_os("DEPOSITORY_UI_SHOTS").map(PathBuf::from) else {
@@ -516,7 +925,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut h = harness(Harness::builder().wgpu());
         h.run();
-        h.get_all_by_label("Edit").next().unwrap().click();
+        h.render().unwrap().save(dir.join("tags.png")).unwrap();
+        h.get_all_by_label("Edit").nth(1).unwrap().click();
         h.run();
         h.render()
             .unwrap()

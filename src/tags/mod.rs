@@ -110,16 +110,25 @@ impl Rule {
         }
     }
 
+    /// The whole condition of a yes/no rule: "is a fork", "isn't archived". `None` for rules
+    /// with a pattern.
+    pub fn flag_condition(&self) -> Option<&'static str> {
+        Some(match (self.field, self.pattern == "yes") {
+            (RuleField::Fork, true) => "is a fork",
+            (RuleField::Fork, false) => "isn't a fork",
+            (RuleField::Archived, true) => "is archived",
+            (RuleField::Archived, false) => "isn't archived",
+            (RuleField::Private, true) => "is private",
+            (RuleField::Private, false) => "isn't private",
+            _ => return None,
+        })
+    }
+
     /// "language matches ^rust$: rust", "is archived: archived"
     pub fn describe(&self) -> String {
-        let condition = match (self.field, self.pattern == "yes") {
-            (RuleField::Fork, true) => "is a fork".to_owned(),
-            (RuleField::Fork, false) => "isn't a fork".to_owned(),
-            (RuleField::Archived, true) => "is archived".to_owned(),
-            (RuleField::Archived, false) => "isn't archived".to_owned(),
-            (RuleField::Private, true) => "is private".to_owned(),
-            (RuleField::Private, false) => "isn't private".to_owned(),
-            (field, _) => format!("{} matches {}", field.label(), self.pattern),
+        let condition = match self.flag_condition() {
+            Some(condition) => condition.to_owned(),
+            None => format!("{} matches {}", self.field.label(), self.pattern),
         };
         format!("{condition}: {}", self.tag_template)
     }

@@ -14,9 +14,9 @@ use crate::tags::query::Query;
 use crate::ui::filter::{Item, Matcher};
 use crate::ui::repos::ReposAction;
 use crate::ui::selection::{ActionBar, BarContext, Selection, Targets};
-use crate::ui::sort_header;
 use crate::ui::tags::tag_summary;
 use crate::ui::thousands;
+use crate::ui::{cmp_text, present_first, sort_header};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ListKind {
@@ -135,13 +135,6 @@ impl ListState {
     }
 }
 
-/// Case-insensitive, without allocating.
-fn cmp_text(a: &str, b: &str) -> Ordering {
-    a.chars()
-        .flat_map(char::to_lowercase)
-        .cmp(b.chars().flat_map(char::to_lowercase))
-}
-
 fn by_name(a: &RepoRow, b: &RepoRow) -> Ordering {
     cmp_text(&a.owner, &b.owner).then_with(|| cmp_text(&a.name, &b.name))
 }
@@ -149,25 +142,6 @@ fn by_name(a: &RepoRow, b: &RepoRow) -> Ordering {
 /// Text worth sorting on: not missing and not blank.
 fn text(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|v| !v.trim().is_empty())
-}
-
-/// Orders present values with `cmp` (reversed when `descending`) and puts missing ones last
-/// either way.
-fn present_first<T>(
-    a: Option<T>,
-    b: Option<T>,
-    descending: bool,
-    cmp: impl FnOnce(&T, &T) -> Ordering,
-) -> Ordering {
-    match (a, b) {
-        (Some(a), Some(b)) => {
-            let order = cmp(&a, &b);
-            if descending { order.reverse() } else { order }
-        }
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
 }
 
 /// Sorts by `key`. Rows without that value (no language, no tags, stars not fetched yet, …)

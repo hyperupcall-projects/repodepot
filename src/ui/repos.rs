@@ -1,5 +1,5 @@
 //! The Repositories tab: the Remote List, Ignored and Forks lists from GitHub, local clones
-//! with their status, and a Problems view.
+//! with their status, a Problems view, the tag rules, and Import.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -15,14 +15,14 @@ use crate::git::scan::{CloneInfo, MainRemote, Problem, ScanResult};
 use crate::git::status::Status;
 use crate::layout;
 use crate::tags::query::{self, Query};
-use crate::tags::{Rule, TagCount, TagIndex};
+use crate::tags::{CloneFacts, Rule, TagCount, TagIndex};
 use crate::ui::filter::{Filter, Item, keep_together};
 use crate::ui::import::ImportPage;
 use crate::ui::remote_list::{
     self, ForkShow, ForksContext, ForksState, ListContext, ListKind, ListState, SourceFilter,
 };
 use crate::ui::selection::{ActionBar, BarContext, Selection, Targets, selectable_row};
-use crate::ui::tags::{TagsAction, tag_summary};
+use crate::ui::tags::{TagsAction, TagsContext, TagsPage, tag_summary};
 use crate::ui::{sort_header, thousands};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -88,6 +88,8 @@ pub struct ReposContext<'a> {
     /// Tags of repos that aren't cloned (Remote List and Ignored), by repo ID.
     pub repo_tags: &'a TagIndex,
     pub rules: &'a [Rule],
+    /// What rules see about each clone, for the rule editor's preview.
+    pub facts: &'a [CloneFacts],
     pub launchers: &'a [LauncherInfo],
     /// Ask before opening more windows than this.
     pub confirm_over: usize,
@@ -100,6 +102,7 @@ enum View {
     Ignored,
     Forks,
     Problems,
+    Tags,
     Import,
 }
 
@@ -111,6 +114,7 @@ impl View {
             View::Ignored => "Ignored",
             View::Forks => "Forks",
             View::Problems => "Problems",
+            View::Tags => "Tags",
             View::Import => "Import",
         }
     }
@@ -303,7 +307,7 @@ const STRAYS_HELP: &str = "Folders under the clone root that aren't git repos. O
 
 pub struct ReposPage {
     view: View,
-    /// The search, language and hide toggles every view but Import shares.
+    /// The search, language and hide toggles every view but Tags and Import shares.
     filter: Filter,
     /// A tag query for the Remote List, Ignored and Local Clones, like `work AND NOT old`.
     tag_filter: String,
@@ -347,6 +351,8 @@ pub struct ReposPage {
     ignored_repos: HashSet<i64>,
     upstream_name: String,
     import: ImportPage,
+    /// The Tags view: the rules, their search and the rule editor.
+    tags: TagsPage,
     /// The "add tag" field in the details panel.
     new_tag: String,
 }
@@ -382,6 +388,7 @@ impl ReposPage {
             ignored_repos: HashSet::new(),
             upstream_name: "upstream".to_owned(),
             import: ImportPage::new(),
+            tags: TagsPage::new(),
             new_tag: String::new(),
         }
     }
@@ -526,6 +533,18 @@ impl ReposPage {
         };
         match self.view {
             View::Import => self.import.show(ui, cx.default_remote, &mut action),
+            View::Tags => {
+                let tags_cx = TagsContext {
+                    repos: catalog.as_ref().map_or(&[][..], |c| &c.inbox),
+                    facts: cx.facts,
+                    index: cx.tags,
+                    repo_index: cx.repo_tags,
+                    rules: cx.rules,
+                };
+                if let Some(tags_action) = self.tags.show(ui, tags_cx) {
+                    action = Some(ReposAction::Tags(tags_action));
+                }
+            }
             View::RemoteList | View::Ignored | View::Forks => {
                 self.github_view(
                     ui,
@@ -625,7 +644,7 @@ impl ReposPage {
         let only_tags = match self.view {
             View::RemoteList | View::Ignored => self.source == SourceFilter::Any,
             View::LocalClones => self.show == Show::All && self.branch.trim().is_empty(),
-            View::Forks | View::Problems | View::Import => false,
+            View::Forks | View::Problems | View::Tags | View::Import => false,
         };
         (only_tags && query_valid && !tag.is_empty() && !self.filter.has_text())
             .then(|| tag.to_owned())
@@ -743,6 +762,7 @@ impl ReposPage {
                 _ => "Problems".to_owned(),
             };
             ui.selectable_value(&mut self.view, View::Problems, problems);
+            ui.selectable_value(&mut self.view, View::Tags, "Tags");
             ui.selectable_value(&mut self.view, View::Import, "Import");
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -782,7 +802,7 @@ impl ReposPage {
     }
 
     /// Two rows under the tabs: the filters every view shares, then the ones only this view
-    /// has.
+    /// has. Tags has only its own: the shared ones are about repos, not rules.
     fn filters(
         &mut self,
         ui: &mut egui::Ui,
@@ -809,13 +829,15 @@ impl ReposPage {
                 thousands(ignored_clones() as u64)
             )),
             View::Forks => Some("Leave out forks you ignored".to_owned()),
-            View::Ignored | View::Import => None,
+            View::Ignored | View::Tags | View::Import => None,
         };
-        // Wraps onto more lines in a narrow window.
-        ui.horizontal_wrapped(|ui| {
-            self.filter
-                .controls(ui, &self.languages, ignored_hover.as_deref());
-        });
+        if self.view != View::Tags {
+            // Wraps onto more lines in a narrow window.
+            ui.horizontal_wrapped(|ui| {
+                self.filter
+                    .controls(ui, &self.languages, ignored_hover.as_deref());
+            });
+        }
 
         egui::Frame::new()
             .fill(ui.visuals().faint_bg_color)
@@ -869,6 +891,10 @@ impl ReposPage {
                                 ProblemShow::options().map(|s| (s, s.label())),
                             );
                         }
+                        View::Tags => {
+                            keep_together(ui, 280.0);
+                            self.tags.search_field(ui);
+                        }
                         View::Import => {}
                     }
 
@@ -876,10 +902,12 @@ impl ReposPage {
                         ui.separator();
                         if ui
                             .button("Clear filters")
-                            .on_hover_text(
+                            .on_hover_text(if self.view == View::Tags {
+                                "Empty the search and show every rule"
+                            } else {
                                 "Empty the search, language, branch and tag fields and show \
-                                 everything; the toggles stay as they are",
-                            )
+                                 everything; the toggles stay as they are"
+                            })
                             .clicked()
                         {
                             self.clear_filters();
@@ -891,6 +919,11 @@ impl ReposPage {
 
     /// Something narrows the current view, besides the toggles.
     fn any_filter(&self) -> bool {
+        match self.view {
+            View::Tags => return self.tags.has_search(),
+            View::Import => return false,
+            _ => {}
+        }
         self.filter.has_text()
             || match self.view {
                 View::RemoteList | View::Ignored => {
@@ -903,11 +936,17 @@ impl ReposPage {
                 }
                 View::Forks => self.fork_show != ForkShow::All,
                 View::Problems => self.problem_show != ProblemShow::All,
-                View::Import => false,
+                View::Tags | View::Import => false,
             }
     }
 
+    /// Clears what narrows the current view: in Tags its search, elsewhere the shared fields
+    /// and every view's own filters.
     fn clear_filters(&mut self) {
+        if self.view == View::Tags {
+            self.tags.clear_search();
+            return;
+        }
         self.filter.clear_text();
         self.tag_filter.clear();
         self.source = SourceFilter::Any;
@@ -2370,6 +2409,7 @@ mod tests {
                         tags: &tags,
                         repo_tags: &tags,
                         rules: &[],
+                        facts: &[],
                         launchers: &launchers,
                         confirm_over: 2,
                     };
@@ -2825,6 +2865,7 @@ mod tests {
                             tags: &tags,
                             repo_tags: &repo_tags,
                             rules: &rules,
+                            facts: &facts,
                             launchers: &[LauncherInfo {
                                 name: "VS Code".into(),
                                 each: true,
@@ -3084,6 +3125,7 @@ mod tests {
                         tags: &tags,
                         repo_tags: &repo_tags,
                         rules: &[],
+                        facts: &facts,
                         launchers: &launchers,
                         confirm_over: 10,
                     };
@@ -3691,6 +3733,41 @@ mod tests {
     }
 
     #[test]
+    fn tags_sits_left_of_import_with_only_its_own_search() {
+        use egui::accesskit::Role;
+
+        let mut h = harness(Harness::builder());
+        h.run();
+        let problems = h.get_by_label("Problems (7)").rect();
+        let tags = h.get_by_role_and_label(Role::Button, "Tags").rect();
+        let import = h.get_by_label("Import").rect();
+        assert!(problems.right() < tags.left() && tags.right() < import.left());
+
+        h.state_mut().0.filter.text = "react".into();
+        h.get_by_role_and_label(Role::Button, "Tags").click();
+        h.run();
+        // The shared filters are about repos; the search here is the rules' own.
+        assert!(h.query_by_label("Language").is_none());
+        assert!(h.query_by_label("Hide archived").is_none());
+        assert!(h.query_by_label("Clear filters").is_none());
+        assert!(h.query_by_label_contains("No rules yet").is_some());
+        h.get_by_role_and_label(Role::TextInput, "Search").focus();
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Search")
+            .type_text("lang");
+        h.run();
+        assert!(h.state().0.tags.has_search());
+        h.get_by_label("Clear filters").click();
+        h.run();
+        assert!(h.query_by_label("Clear filters").is_none());
+        assert_eq!(
+            h.state().0.filter.text,
+            "react",
+            "the shared search is left alone"
+        );
+    }
+
+    #[test]
     fn branch_specs() {
         assert!(branch_matches("", None));
         assert!(branch_matches(" , ! ", Some("main")));
@@ -3769,6 +3846,10 @@ mod tests {
         h.get_by_label("Forks (2)").click();
         h.run();
         h.render().unwrap().save(dir.join("forks.png")).unwrap();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Tags")
+            .click();
+        h.run();
+        h.render().unwrap().save(dir.join("tags_view.png")).unwrap();
         h.state_mut().0.import.folder = "/home/someone/old".into();
         h.state_mut().0.import_preview(Ok(sample_import()));
         h.get_by_label("Import").click();

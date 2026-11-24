@@ -154,7 +154,7 @@ Breaking absolute paths inside a repo (Python venvs and similar) is accepted.
 
 ### 1.9 Searching and filtering
 
-Every view of the Repositories tab except Import has two rows of filters between the tabs and the list, set off from the tabs by a line.
+Every view of the Repositories tab except Tags and Import has two rows of filters between the tabs and the list, set off from the tabs by a line. Tags only has its own row: the shared filters are about repos, not rules.
 
 **The shared row** stays the same as you switch views:
 
@@ -171,9 +171,10 @@ Every view of the Repositories tab except Import has two rows of filters between
 | Local Clones | Show (all, uncommitted changes, ahead/behind, stashes, problems), branch, tag query |
 | Forks | Show (all, linked, separate, cloned, linked but no upstream remote, set by you) |
 | Problems | Show (all, or one problem group) |
+| Tags | Search: part of a rule's pattern, of the tag it adds, or of a tag it gives right now (`lang:rust` finds `lang:$1`), ignoring case. Yes/no rules have no pattern to search. |
 
 - **Branch**: part of a branch name, ignoring case. Separate several with commas to match any of them; start one with `!` to leave out branches that have it (`!main, !master` lists clones on neither). The ⏷ menu lists the branches clones are on, most used first.
-- **Clear filters** shows up once anything narrows the view. It empties the search, language, branch and tag fields and resets the drop-downs, and leaves the toggles alone.
+- **Clear filters** shows up once anything narrows the view. It empties the search, language, branch and tag fields and resets the drop-downs, and leaves the toggles alone. In Tags it only empties the rules' search.
 - In a narrow window the rows wrap, keeping each label with its field.
 
 ### 1.10 Selecting rows and acting on them
@@ -210,6 +211,8 @@ Add and remove tags from a clone's details panel, or for the selected rows of an
 
 A rule says: **if a field matches a pattern, add a tag**.
 
+Rules live in the **Tags** view of the Repositories tab, between Problems and Import. It's a table with one row per rule: **On** (a tickbox), **When** (the field, or the whole condition for yes/no fields), **Pattern**, **Tag** (followed by the tags it gives right now when a capture group makes them differ), how many **Clones** and **Remote List** repos it tags, and its **Exceptions**, with **Edit** and **Delete**. Click a column title to sort by it; click again to reverse. It starts sorted by tag; counts start biggest first, and yes/no rules (no pattern) stay last when sorting by pattern. **New rule** and Edit open the editor above the table, and the row being edited is highlighted.
+
 | Field | Match type |
 |---|---|
 | `owner/name` (one string, so one regex can target either part) | regex |
@@ -236,7 +239,7 @@ A rule says: **if a field matches a pattern, add a tag**.
 
 ### 2.4 Groups
 
-A group is a tag query in the Repositories tab; there's no separate view for it. The Tags tab only holds the rules (2.2).
+A group is a tag query in the Repositories tab; there's no separate view for it. The Tags view only holds the rules (2.2).
 
 - The **Tags** filter in the Remote List, Ignored and Local Clones combines tags: `rust AND work`, `rust OR go`, `work AND NOT archived`, with parentheses. Words in a query are tag names, side-by-side words mean AND, `*` means everything, and `untagged` means no tags at all. A query naming a tag no repo has is flagged.
 - Its ⏷ menu lists every tag with how many of the view's repos or clones have it, and `untagged` with how many have none.

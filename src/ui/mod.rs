@@ -8,6 +8,8 @@ pub mod selection;
 pub mod settings;
 pub mod tags;
 
+use std::cmp::Ordering;
+
 use eframe::egui;
 
 /// A column title that sorts its table. The first click sorts by this column (ascending, or
@@ -34,6 +36,32 @@ pub fn sort_header<K: PartialEq + Copy>(
             *sort = key;
             *descending = starts_descending;
         }
+    }
+}
+
+/// Case-insensitive, without allocating.
+pub fn cmp_text(a: &str, b: &str) -> Ordering {
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(b.chars().flat_map(char::to_lowercase))
+}
+
+/// Orders present values with `cmp` (reversed when `descending`) and puts missing ones last
+/// either way.
+pub fn present_first<T>(
+    a: Option<T>,
+    b: Option<T>,
+    descending: bool,
+    cmp: impl FnOnce(&T, &T) -> Ordering,
+) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let order = cmp(&a, &b);
+            if descending { order.reverse() } else { order }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
     }
 }
 
