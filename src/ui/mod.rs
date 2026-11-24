@@ -1,3 +1,4 @@
+pub mod filter;
 pub mod import;
 pub mod log;
 pub mod remote_list;

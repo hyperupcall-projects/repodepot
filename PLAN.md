@@ -85,7 +85,7 @@ Every relevant repo that isn't cloned and isn't ignored waits in the **Remote Li
 - **Actions** (on one repo or many selected): **Clone**, **Ignore**.
 - **Ignored list**: same columns, with an **Un-ignore** action.
 - **Hide ignored** (on by default): the Remote List leaves out ignored repos. Untick it to show the ones that would otherwise be listed, marked "ignored", with an **Un-ignore** action next to Ignore.
-- Every list can be searched and filtered.
+- Every list can be searched and filtered (see 1.9).
 
 ### 1.4 Fork families
 
@@ -118,7 +118,7 @@ The app scans the clone root (two levels deep) on startup and when you ask. The 
 - **Status column** (no network access): branch, uncommitted changes, ahead/behind (as of the last fetch), detached HEAD, no upstream branch.
   - It comes from one `git status --porcelain=v2 --branch` per clone.
   - It refreshes after every scan and after every run.
-- **Hide ignored** (on by default): Local Clones leaves out clones whose main repo is ignored. Untick it to show them, marked "ignored".
+- **Hide ignored** (on by default, shared with the other views): Local Clones leaves out clones whose main repo is ignored. Untick it to show them, marked "ignored".
 
 **Problems view**: folders that don't match a relevant repo, grouped by problem.
 
@@ -151,6 +151,30 @@ Breaking absolute paths inside a repo (Python venvs and similar) is accepted.
 - Before deleting, the app warns about uncommitted changes, unpushed commits and stashes, and needs you to confirm past them.
 - The folder goes to the trash (`trash` crate), never `rm -rf`.
 - The repo goes back to the Remote List. Its manual tags are removed, and the confirmation says so.
+
+### 1.9 Searching and filtering
+
+Every view of the Repositories tab except Import has two rows of filters between the tabs and the list, set off from the tabs by a line.
+
+**The shared row** stays the same as you switch views:
+
+- **Search**: words separated by spaces, all of which must match. It looks in the owner and the name by default; the **Owner**, **Name** and **Description** toggles pick any combination (at least one stays on). With owner and name both on, `facebook/re` matches across the slash. For clones, Name also matches the folder name (`react~2`).
+- **Language**: GitHub's main language, exactly, ignoring case. Separate several with commas (`Rust, Go`). The ⏷ menu ticks languages from every synced repo; a name no repo has is flagged.
+- **Hide ignored** (on by default; not shown in Ignored, where everything is ignored) and **Hide archived** (off by default).
+- Clones, forks and problems are matched through their repo, using what the last sync said about it. Forks go by the fork, but the search also looks at the upstream.
+
+**The view's own row** is a tinted strip that starts with the view's name:
+
+| View | Filters |
+|---|---|
+| Remote List, Ignored | Source (any, owned, org member, collaborator, contributed, added by hand), tag query |
+| Local Clones | Show (all, uncommitted changes, ahead/behind, stashes, problems), branch, tag query |
+| Forks | Show (all, linked, separate, cloned, linked but no upstream remote, set by you) |
+| Problems | Show (all, or one problem group) |
+
+- **Branch**: part of a branch name, ignoring case. Separate several with commas to match any of them; start one with `!` to leave out branches that have it (`!main, !master` lists clones on neither). The ⏷ menu lists the branches clones are on, most used first.
+- **Clear filters** shows up once anything narrows the view. It empties the search, language, branch and tag fields and resets the drop-downs, and leaves the toggles alone.
+- In a narrow window the rows wrap, keeping each label with its field.
 
 ## Part 2 — Tags, groups and actions
 

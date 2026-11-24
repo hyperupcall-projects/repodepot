@@ -207,6 +207,14 @@ pub struct ForkRow {
     pub has_upstream_remote: bool,
 }
 
+/// What the Repositories filters need to know about any repo, cloned or not.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepoSummary {
+    pub description: Option<String>,
+    pub language: Option<String>,
+    pub is_archived: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Catalog {
     /// UTC `YYYY-MM-DD HH:MM:SS`, or `None` before the first sync.
@@ -221,6 +229,8 @@ pub struct Catalog {
     pub ignored_remote: Vec<RepoRow>,
     pub forks: Vec<ForkRow>,
     pub manual_owners: Vec<String>,
+    /// Every GitHub repo by ID, so clones and forks can be filtered like the lists.
+    pub summaries: HashMap<i64, RepoSummary>,
 }
 
 /// What's needed to clone one repo.
@@ -690,6 +700,20 @@ impl Db {
         }
         forks.sort_by_key(|f| (f.fork_name.to_lowercase(), f.parent_name.to_lowercase()));
 
+        let summaries = repos
+            .iter()
+            .map(|(id, base)| {
+                (
+                    *id,
+                    RepoSummary {
+                        description: base.row.description.clone(),
+                        language: base.row.language.clone(),
+                        is_archived: base.row.is_archived,
+                    },
+                )
+            })
+            .collect();
+
         Ok(Catalog {
             last_sync: self.last_sync()?,
             relevant: sources.len(),
@@ -698,6 +722,7 @@ impl Db {
             ignored_remote,
             forks,
             manual_owners: self.manual_owners()?,
+            summaries,
         })
     }
 }

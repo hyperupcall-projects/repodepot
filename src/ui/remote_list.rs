@@ -7,12 +7,14 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use crate::db::github::ForkRow;
-use crate::db::{Catalog, ForkDecision, RepoRow};
+use crate::db::{Catalog, ForkDecision, RepoRow, Source};
 use crate::tags::query::Query;
 use crate::tags::{self, TagIndex};
+use crate::ui::filter::{Item, Matcher};
 use crate::ui::repos::ReposAction;
+use crate::ui::sort_header;
 use crate::ui::tags::{TagsAction, tag_summary};
-use crate::ui::{sort_header, thousands};
+use crate::ui::thousands;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ListKind {
@@ -39,14 +41,69 @@ impl SortKey {
     }
 }
 
-/// Selection and options for one list (Remote List or Ignored).
+/// Which source a repo needs to show in the Remote List or Ignored.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SourceFilter {
+    Any,
+    Owned,
+    OrgMember,
+    Collaborator,
+    Contributed,
+    ByHand,
+}
+
+impl SourceFilter {
+    pub const ALL: [SourceFilter; 6] = [
+        SourceFilter::Any,
+        SourceFilter::Owned,
+        SourceFilter::OrgMember,
+        SourceFilter::Collaborator,
+        SourceFilter::Contributed,
+        SourceFilter::ByHand,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SourceFilter::Any => "Any source",
+            SourceFilter::Owned => "Owned",
+            SourceFilter::OrgMember => "Org member",
+            SourceFilter::Collaborator => "Collaborator",
+            SourceFilter::Contributed => "Contributed",
+            SourceFilter::ByHand => "Added by hand",
+        }
+    }
+
+    fn matches(self, sources: &[Source]) -> bool {
+        let has = |source| sources.contains(&source);
+        match self {
+            SourceFilter::Any => true,
+            SourceFilter::Owned => has(Source::Owned),
+            SourceFilter::OrgMember => has(Source::OrgMember),
+            SourceFilter::Collaborator => has(Source::Collaborator),
+            SourceFilter::Contributed => has(Source::Contributed),
+            SourceFilter::ByHand => has(Source::ManualRepo) || has(Source::ManualOwner),
+        }
+    }
+}
+
+/// What the filter sees of a repo in the Remote List or Ignored.
+fn repo_item(row: &RepoRow) -> Item<'_> {
+    Item {
+        owner: Some(&row.owner),
+        name: &row.name,
+        folder: None,
+        description: row.description.as_deref(),
+        language: row.language.as_deref(),
+        ignored: row.ignored,
+        archived: row.is_archived,
+    }
+}
+
+/// Selection and sort order for one list (Remote List or Ignored).
 pub struct ListState {
     pub selected: HashSet<i64>,
     sort: SortKey,
     descending: bool,
-    hide_archived: bool,
-    /// Leaves ignored repos out of the Remote List (they're in the Ignored list).
-    hide_ignored: bool,
     /// The "Tag" field for tagging the selected repos.
     tag_name: String,
 }
@@ -57,8 +114,6 @@ impl ListState {
             selected: HashSet::new(),
             sort: SortKey::Name,
             descending: false,
-            hide_archived: false,
-            hide_ignored: true,
             tag_name: String::new(),
         }
     }
@@ -79,21 +134,6 @@ impl ListState {
         let present: HashSet<i64> = rows.into_iter().map(|r| r.id).collect();
         self.selected.retain(|id| present.contains(id));
     }
-}
-
-fn matches(row: &RepoRow, needle: &str) -> bool {
-    needle.is_empty()
-        || row.full_name().to_lowercase().contains(needle)
-        || row
-            .description
-            .as_deref()
-            .is_some_and(|d| d.to_lowercase().contains(needle))
-        || row
-            .language
-            .as_deref()
-            .is_some_and(|l| l.to_lowercase() == needle)
-        || row.topics.iter().any(|t| t.to_lowercase() == needle)
-        || row.sources.iter().any(|s| s.label() == needle)
 }
 
 /// Case-insensitive, without allocating.
@@ -188,10 +228,13 @@ fn sort_rows(rows: &mut [&RepoRow], key: SortKey, descending: bool, tags: &TagIn
 
 /// What the Remote List and Ignored lists need besides their rows.
 pub struct ListContext<'a> {
-    /// The text filter.
-    pub filter: &'a str,
+    /// The shared filters.
+    pub matcher: &'a Matcher,
+    pub source: SourceFilter,
     /// The tag filter, when one is typed and valid.
     pub tag_query: Option<&'a Query>,
+    /// The Remote List lists ignored repos too ("Hide ignored" is off).
+    pub show_ignored: bool,
     /// Tags of repos that aren't cloned, by repo ID.
     pub tags: &'a TagIndex,
     /// Repo IDs with a clone run in progress.
@@ -208,14 +251,13 @@ pub fn repo_list(
     cx: &ListContext<'_>,
     action: &mut Option<ReposAction>,
 ) {
-    let show_ignored = kind == ListKind::Remote && !state.hide_ignored;
-    let needle = cx.filter.trim().to_lowercase();
+    let show_ignored = kind == ListKind::Remote && cx.show_ignored;
     let mut shown: Vec<&RepoRow> = rows
         .iter()
         .chain(if show_ignored { ignored_rows } else { &[] })
         .filter(|r| {
-            matches(r, &needle)
-                && !(state.hide_archived && r.is_archived)
+            cx.matcher.matches(&repo_item(r))
+                && cx.source.matches(&r.sources)
                 && cx
                     .tag_query
                     .is_none_or(|q| q.matches(&cx.tags.tags_of(r.id)))
@@ -335,17 +377,6 @@ pub fn repo_list(
                 tag: std::mem::take(&mut state.tag_name),
             }));
         }
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.checkbox(&mut state.hide_archived, "Hide archived");
-            if kind == ListKind::Remote {
-                ui.checkbox(&mut state.hide_ignored, "Hide ignored")
-                    .on_hover_text(format!(
-                        "Leave out ignored repos ({}); they're in the Ignored list",
-                        thousands(ignored_rows.len() as u64)
-                    ));
-            }
-        });
     });
     ui.add_space(4.0);
 
@@ -540,6 +571,91 @@ enum ForkSort {
     Notes,
 }
 
+/// Which forks the Forks view lists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ForkShow {
+    All,
+    Linked,
+    Separate,
+    Cloned,
+    MissingUpstream,
+    Chosen,
+}
+
+impl ForkShow {
+    pub const ALL: [ForkShow; 6] = [
+        ForkShow::All,
+        ForkShow::Linked,
+        ForkShow::Separate,
+        ForkShow::Cloned,
+        ForkShow::MissingUpstream,
+        ForkShow::Chosen,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ForkShow::All => "All forks",
+            ForkShow::Linked => "Linked forks",
+            ForkShow::Separate => "Separate forks",
+            ForkShow::Cloned => "Cloned forks",
+            ForkShow::MissingUpstream => "Linked, but no upstream remote",
+            ForkShow::Chosen => "Set by you",
+        }
+    }
+
+    fn matches(self, fork: &ForkRow) -> bool {
+        match self {
+            ForkShow::All => true,
+            ForkShow::Linked => fork.decision == ForkDecision::Linked,
+            ForkShow::Separate => fork.decision == ForkDecision::Separate,
+            ForkShow::Cloned => fork.fork_cloned,
+            ForkShow::MissingUpstream => {
+                fork.decision == ForkDecision::Linked
+                    && fork.fork_cloned
+                    && !fork.has_upstream_remote
+            }
+            ForkShow::Chosen => fork.chosen,
+        }
+    }
+}
+
+/// What the Forks view needs besides the catalog.
+pub struct ForksContext<'a> {
+    pub matcher: &'a Matcher,
+    pub show: ForkShow,
+    /// IDs of ignored repos.
+    pub ignored: &'a HashSet<i64>,
+}
+
+/// The fork's side of a row: hiding and the language go by the fork. The search looks at the
+/// upstream too.
+fn fork_items<'a>(
+    fork: &'a ForkRow,
+    catalog: &'a Catalog,
+    ignored: &HashSet<i64>,
+) -> [Item<'a>; 2] {
+    let item = |id: i64, full_name: &'a str| {
+        let (owner, name) = match full_name.split_once('/') {
+            Some((owner, name)) => (Some(owner), name),
+            None => (None, full_name),
+        };
+        let summary = catalog.summaries.get(&id);
+        Item {
+            owner,
+            name,
+            folder: None,
+            description: summary.and_then(|s| s.description.as_deref()),
+            language: summary.and_then(|s| s.language.as_deref()),
+            ignored: ignored.contains(&id),
+            archived: summary.is_some_and(|s| s.is_archived),
+        }
+    };
+    [
+        item(fork.fork_id, &fork.fork_name),
+        item(fork.parent_id, &fork.parent_name),
+    ]
+}
+
 /// Sort order of the Forks table.
 pub struct ForksState {
     sort: ForkSort,
@@ -652,7 +768,7 @@ fn sort_forks(rows: &mut [(&ForkRow, String)], key: ForkSort, descending: bool) 
 pub fn forks_view(
     ui: &mut egui::Ui,
     catalog: &Catalog,
-    filter: &str,
+    cx: &ForksContext<'_>,
     state: &mut ForksState,
     action: &mut Option<ReposAction>,
 ) {
@@ -664,17 +780,16 @@ pub fn forks_view(
     );
     ui.add_space(4.0);
 
-    let needle = filter.trim().to_lowercase();
     let mut shown: Vec<(&ForkRow, String)> = catalog
         .forks
         .iter()
-        .map(|f| (f, notes_text(&fork_notes(f))))
-        .filter(|(f, notes)| {
-            needle.is_empty()
-                || f.fork_name.to_lowercase().contains(&needle)
-                || f.parent_name.to_lowercase().contains(&needle)
-                || notes.contains(&needle)
+        .filter(|f| {
+            let [fork, parent] = fork_items(f, catalog, cx.ignored);
+            cx.show.matches(f)
+                && cx.matcher.keeps(&fork)
+                && cx.matcher.text_matches(&[fork, parent])
         })
+        .map(|f| (f, notes_text(&fork_notes(f))))
         .collect();
     sort_forks(&mut shown, state.sort, state.descending);
 
@@ -780,7 +895,6 @@ pub fn forks_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Source;
 
     fn row(id: i64, owner: &str, name: &str) -> RepoRow {
         RepoRow {
@@ -802,14 +916,49 @@ mod tests {
     }
 
     #[test]
-    fn filter_matches_name_description_language_topic_and_source() {
-        let repo = row(1, "me", "thing");
-        for needle in ["", "me/th", "javascript", "rust", "cli", "owned"] {
-            assert!(matches(&repo, needle), "{needle}");
+    fn source_filter_groups_the_by_hand_sources() {
+        let sources = [Source::Contributed, Source::ManualOwner];
+        for (filter, expected) in [
+            (SourceFilter::Any, true),
+            (SourceFilter::Contributed, true),
+            (SourceFilter::ByHand, true),
+            (SourceFilter::Owned, false),
+        ] {
+            assert_eq!(filter.matches(&sources), expected, "{filter:?}");
         }
-        for needle in ["rus", "cl", "org"] {
-            assert!(!matches(&repo, needle), "{needle}");
-        }
+        assert!(SourceFilter::Any.matches(&[]));
+        assert!(!SourceFilter::ByHand.matches(&[]));
+    }
+
+    #[test]
+    fn fork_show_options() {
+        let mut fork = fork_row(1, "me/a", "up/a", ForkDecision::Linked);
+        let shown = |fork: &ForkRow| {
+            ForkShow::ALL
+                .into_iter()
+                .filter(|show| show.matches(fork))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown(&fork), [ForkShow::All, ForkShow::Linked]);
+        fork.fork_cloned = true;
+        fork.chosen = true;
+        assert_eq!(
+            shown(&fork),
+            [
+                ForkShow::All,
+                ForkShow::Linked,
+                ForkShow::Cloned,
+                ForkShow::MissingUpstream,
+                ForkShow::Chosen
+            ]
+        );
+        fork.has_upstream_remote = true;
+        fork.decision = ForkDecision::Separate;
+        fork.chosen = false;
+        assert_eq!(
+            shown(&fork),
+            [ForkShow::All, ForkShow::Separate, ForkShow::Cloned]
+        );
     }
 
     #[test]

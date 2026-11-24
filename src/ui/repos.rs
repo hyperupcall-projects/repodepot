@@ -1,21 +1,26 @@
 //! The Repositories tab: the Remote List, Ignored and Forks lists from GitHub, local clones
 //! with their status, and a Problems view.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use crate::backend::{ImportMove, LauncherInfo, SyncReport};
+use crate::db::github::RepoSummary;
 use crate::db::{Catalog, ForkDecision};
 use crate::git::import::ImportPreview;
 use crate::git::scan::{CloneInfo, MainRemote, Problem, ScanResult};
 use crate::git::status::Status;
+use crate::layout;
 use crate::tags::query::{self, Query};
 use crate::tags::{Rule, TagIndex};
+use crate::ui::filter::{Filter, Item, keep_together};
 use crate::ui::import::ImportPage;
-use crate::ui::remote_list::{self, ForksState, ListContext, ListKind, ListState};
+use crate::ui::remote_list::{
+    self, ForkShow, ForksContext, ForksState, ListContext, ListKind, ListState, SourceFilter,
+};
 use crate::ui::tags::{TagsAction, tag_summary};
 use crate::ui::{sort_header, thousands};
 
@@ -85,6 +90,19 @@ enum View {
     Forks,
     Problems,
     Import,
+}
+
+impl View {
+    fn title(self) -> &'static str {
+        match self {
+            View::RemoteList => "Remote List",
+            View::LocalClones => "Local Clones",
+            View::Ignored => "Ignored",
+            View::Forks => "Forks",
+            View::Problems => "Problems",
+            View::Import => "Import",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -235,6 +253,37 @@ impl ProblemKind {
     }
 }
 
+/// Which sections the Problems view shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProblemShow {
+    All,
+    Missing,
+    Kind(ProblemKind),
+    Strays,
+}
+
+impl ProblemShow {
+    fn options() -> impl Iterator<Item = ProblemShow> {
+        [ProblemShow::All, ProblemShow::Missing]
+            .into_iter()
+            .chain(ProblemKind::ALL.map(ProblemShow::Kind))
+            .chain([ProblemShow::Strays])
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ProblemShow::All => "All problems",
+            ProblemShow::Missing => "Missing folders",
+            ProblemShow::Kind(kind) => kind.title(),
+            ProblemShow::Strays => "Not git repos",
+        }
+    }
+
+    fn shows(self, section: ProblemShow) -> bool {
+        self == ProblemShow::All || self == section
+    }
+}
+
 const MISSING_HELP: &str = "An earlier scan found these, but their folder is gone. A folder moved \
     within the clone root is matched back to its old entry by its main remote. Forget removes the \
     entry and its tags.";
@@ -243,10 +292,22 @@ const STRAYS_HELP: &str = "Folders under the clone root that aren't git repos. O
 
 pub struct ReposPage {
     view: View,
-    filter: String,
+    /// The search, language and hide toggles every view but Import shares.
+    filter: Filter,
     /// A tag query for the Remote List, Ignored and Local Clones, like `work AND NOT old`.
     tag_filter: String,
+    /// Remote List and Ignored: only repos from this source.
+    source: SourceFilter,
+    /// Local Clones: which clones to list.
     show: Show,
+    /// Local Clones: branch names, like `main, dev` or `!main`.
+    branch: String,
+    /// Forks: which forks to list.
+    fork_show: ForkShow,
+    /// Problems: which sections to list.
+    problem_show: ProblemShow,
+    /// Every language a synced repo has, for the language menu.
+    languages: Vec<String>,
     sort: SortKey,
     descending: bool,
     selected: Option<i64>,
@@ -266,8 +327,6 @@ pub struct ReposPage {
     forks: ForksState,
     /// IDs of ignored repos, to tell which clones are of one.
     ignored_repos: HashSet<i64>,
-    /// Leaves clones of ignored repos out of Local Clones.
-    hide_ignored_clones: bool,
     upstream_name: String,
     import: ImportPage,
     /// The "add tag" field in the details panel.
@@ -278,9 +337,14 @@ impl ReposPage {
     pub fn new() -> Self {
         Self {
             view: View::LocalClones,
-            filter: String::new(),
+            filter: Filter::new(),
             tag_filter: String::new(),
+            source: SourceFilter::Any,
             show: Show::All,
+            branch: String::new(),
+            fork_show: ForkShow::All,
+            problem_show: ProblemShow::All,
+            languages: Vec::new(),
             sort: SortKey::Name,
             descending: false,
             selected: None,
@@ -296,7 +360,6 @@ impl ReposPage {
             add_text: String::new(),
             forks: ForksState::new(),
             ignored_repos: HashSet::new(),
-            hide_ignored_clones: true,
             upstream_name: "upstream".to_owned(),
             import: ImportPage::new(),
             new_tag: String::new(),
@@ -324,6 +387,15 @@ impl ReposPage {
             .retain(catalog.inbox.iter().chain(&catalog.ignored_remote));
         self.ignored.retain(&catalog.ignored);
         self.ignored_repos = catalog.ignored.iter().map(|r| r.id).collect();
+        let mut languages: Vec<String> = catalog
+            .summaries
+            .values()
+            .filter_map(|s| s.language.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        languages.sort_by_key(|l| l.to_lowercase());
+        self.languages = languages;
         self.catalog = Some(catalog);
     }
 
@@ -399,16 +471,22 @@ impl ReposPage {
         // A query that's still being typed (or is wrong) doesn't filter; the toolbar says why.
         let valid_query = tag_query.as_ref().and_then(|q| q.as_ref().ok());
 
-        self.toolbar(
-            ui,
-            result.as_ref(),
-            catalog.as_ref(),
-            (&cx, tag_query.as_ref()),
-            &mut action,
-        );
-        self.messages(ui, &mut action);
+        self.tabs(ui, result.as_ref(), catalog.as_ref(), &mut action);
         ui.separator();
+        if self.view != View::Import {
+            self.filters(
+                ui,
+                result.as_ref(),
+                catalog.as_ref(),
+                (&cx, tag_query.as_ref()),
+            );
+        }
+        self.messages(ui, &mut action);
+        if self.view != View::Import {
+            ui.separator();
+        }
 
+        let summaries = catalog.as_ref().map(|c| &c.summaries);
         match self.view {
             View::Import => self.import.show(ui, cx.default_remote, &mut action),
             View::RemoteList | View::Ignored | View::Forks => {
@@ -429,10 +507,10 @@ impl ReposPage {
                     }
                 }
                 Some(Ok(scan)) => match self.view {
-                    View::Problems => self.problems_view(ui, scan, &mut action),
+                    View::Problems => self.problems_view(ui, scan, summaries, &mut action),
                     _ => self.clones_view(
                         ui,
-                        scan,
+                        (scan, summaries),
                         (cx.tags, cx.rules, valid_query),
                         cx.launchers,
                         &mut action,
@@ -526,9 +604,12 @@ impl ReposPage {
             });
             return;
         }
+        let matcher = self.filter.matcher(self.view != View::Ignored);
         let list = ListContext {
-            filter: &self.filter,
+            matcher: &matcher,
+            source: self.source,
             tag_query,
+            show_ignored: !self.filter.hide_ignored,
             tags,
             cloning: &self.cloning,
         };
@@ -553,16 +634,23 @@ impl ReposPage {
                 &list,
                 action,
             ),
-            _ => remote_list::forks_view(ui, catalog, &self.filter, &mut self.forks, action),
+            _ => {
+                let forks = ForksContext {
+                    matcher: &matcher,
+                    show: self.fork_show,
+                    ignored: &self.ignored_repos,
+                };
+                remote_list::forks_view(ui, catalog, &forks, &mut self.forks, action);
+            }
         }
     }
 
-    fn toolbar(
+    /// The view tabs, with Sync and Rescan (and their progress) on the right.
+    fn tabs(
         &mut self,
         ui: &mut egui::Ui,
         result: Option<&Result<ScanResult, String>>,
         catalog: Option<&Catalog>,
-        (cx, tag_query): (&ReposContext<'_>, Option<&Result<Query, String>>),
         action: &mut Option<ReposAction>,
     ) {
         ui.horizontal(|ui| {
@@ -614,70 +702,220 @@ impl ReposPage {
                 {
                     *action = Some(ReposAction::Sync);
                 }
-            });
-        });
 
-        ui.horizontal(|ui| {
-            let hint = match self.view {
-                View::LocalClones | View::Problems => "Filter by name or folder",
-                _ => "Filter by name, description, language, topic or source",
-            };
-            if self.view != View::Import {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text(hint)
-                        .desired_width(300.0),
-                );
-            }
-            if matches!(
-                self.view,
-                View::RemoteList | View::Ignored | View::LocalClones
-            ) {
-                self.tag_filter_field(ui, cx, tag_query);
-            }
-            {
-                if self.view == View::LocalClones {
-                    let label = ui.label("Show");
-                    egui::ComboBox::from_id_salt("repos_show")
-                        .selected_text(self.show.label())
-                        .show_ui(ui, |ui| {
-                            for show in Show::ALL {
-                                ui.selectable_value(&mut self.show, show, show.label());
-                            }
-                        })
-                        .response
-                        .labelled_by(label.id);
-                    let hidden = match result {
-                        Some(Ok(scan)) => scan.clones.iter().filter(|c| self.is_ignored(c)).count(),
-                        _ => 0,
-                    };
-                    ui.checkbox(&mut self.hide_ignored_clones, "Hide ignored")
-                        .on_hover_text(format!(
-                            "Leave out clones of repos you ignored ({})",
-                            thousands(hidden as u64)
-                        ));
-                }
-            }
-
-            // Work in progress. When it's done, the log says how it went.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Work in progress. When it's done, the log says how it went.
                 if let Some((done, total)) = self.scanning {
+                    ui.spinner();
                     if total > 0 {
                         ui.label(format!("Scanning… {done} / {total}"));
                     } else {
                         ui.label("Scanning…");
                     }
-                    ui.spinner();
                 }
                 if let Some(message) = &self.syncing {
-                    if self.scanning.is_some() {
-                        ui.separator();
-                    }
-                    ui.label(format!("Syncing: {message}"));
                     ui.spinner();
+                    ui.add(egui::Label::new(format!("Syncing: {message}")).truncate());
                 }
             });
         });
+    }
+
+    /// Two rows under the tabs: the filters every view shares, then the ones only this view
+    /// has.
+    fn filters(
+        &mut self,
+        ui: &mut egui::Ui,
+        result: Option<&Result<ScanResult, String>>,
+        catalog: Option<&Catalog>,
+        (cx, tag_query): (&ReposContext<'_>, Option<&Result<Query, String>>),
+    ) {
+        let scan = match result {
+            Some(Ok(scan)) => Some(scan),
+            _ => None,
+        };
+        let ignored_clones = || {
+            scan.map_or(0, |scan| {
+                scan.clones.iter().filter(|c| self.is_ignored(c)).count()
+            })
+        };
+        let ignored_hover = match self.view {
+            View::RemoteList => Some(format!(
+                "Leave out ignored repos ({}); they're in the Ignored list",
+                thousands(catalog.map_or(0, |c| c.ignored_remote.len()) as u64)
+            )),
+            View::LocalClones | View::Problems => Some(format!(
+                "Leave out clones of repos you ignored ({})",
+                thousands(ignored_clones() as u64)
+            )),
+            View::Forks => Some("Leave out forks you ignored".to_owned()),
+            View::Ignored | View::Import => None,
+        };
+        // Wraps onto more lines in a narrow window.
+        ui.horizontal_wrapped(|ui| {
+            self.filter
+                .controls(ui, &self.languages, ignored_hover.as_deref());
+        });
+
+        egui::Frame::new()
+            .fill(ui.visuals().faint_bg_color)
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin::symmetric(6, 3))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(self.view.title()).strong())
+                        .on_hover_text("Filters only this view has");
+                    ui.separator();
+                    match self.view {
+                        View::RemoteList | View::Ignored => {
+                            combo(
+                                ui,
+                                ("Source", "repos_source"),
+                                &mut self.source,
+                                SourceFilter::ALL.map(|s| (s, s.label())),
+                            );
+                            ui.separator();
+                            keep_together(ui, 280.0);
+                            self.tag_filter_field(ui, cx, tag_query);
+                        }
+                        View::LocalClones => {
+                            combo(
+                                ui,
+                                ("Show", "repos_show"),
+                                &mut self.show,
+                                Show::ALL.map(|s| (s, s.label())),
+                            );
+                            ui.separator();
+                            keep_together(ui, 220.0);
+                            self.branch_field(ui, scan);
+                            ui.separator();
+                            keep_together(ui, 280.0);
+                            self.tag_filter_field(ui, cx, tag_query);
+                        }
+                        View::Forks => {
+                            combo(
+                                ui,
+                                ("Show", "forks_show"),
+                                &mut self.fork_show,
+                                ForkShow::ALL.map(|s| (s, s.label())),
+                            );
+                        }
+                        View::Problems => {
+                            combo(
+                                ui,
+                                ("Show", "problems_show"),
+                                &mut self.problem_show,
+                                ProblemShow::options().map(|s| (s, s.label())),
+                            );
+                        }
+                        View::Import => {}
+                    }
+
+                    if self.any_filter() {
+                        ui.separator();
+                        if ui
+                            .button("Clear filters")
+                            .on_hover_text(
+                                "Empty the search, language, branch and tag fields and show \
+                                 everything; the toggles stay as they are",
+                            )
+                            .clicked()
+                        {
+                            self.clear_filters();
+                        }
+                    }
+                });
+            });
+    }
+
+    /// Something narrows the current view, besides the toggles.
+    fn any_filter(&self) -> bool {
+        self.filter.has_text()
+            || match self.view {
+                View::RemoteList | View::Ignored => {
+                    self.source != SourceFilter::Any || !self.tag_filter.trim().is_empty()
+                }
+                View::LocalClones => {
+                    self.show != Show::All
+                        || !self.branch.trim().is_empty()
+                        || !self.tag_filter.trim().is_empty()
+                }
+                View::Forks => self.fork_show != ForkShow::All,
+                View::Problems => self.problem_show != ProblemShow::All,
+                View::Import => false,
+            }
+    }
+
+    fn clear_filters(&mut self) {
+        self.filter.clear_text();
+        self.tag_filter.clear();
+        self.source = SourceFilter::Any;
+        self.show = Show::All;
+        self.branch.clear();
+        self.fork_show = ForkShow::All;
+        self.problem_show = ProblemShow::All;
+    }
+
+    /// Local Clones: the branch field, with a menu of the branches clones are on.
+    fn branch_field(&mut self, ui: &mut egui::Ui, scan: Option<&ScanResult>) {
+        let label = ui.label("Branch");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.branch)
+                .hint_text("main, or !main")
+                .desired_width(130.0),
+        )
+        .labelled_by(label.id)
+        .on_hover_text(
+            "Part of a branch name. Separate several with commas to match any of them; \
+             start one with ! to leave out branches that have it.",
+        );
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for clone in scan.map_or(&[][..], |s| &s.clones) {
+            if let Ok(Status {
+                branch: Some(branch),
+                ..
+            }) = &clone.status
+            {
+                *counts.entry(branch).or_default() += 1;
+            }
+        }
+        let mut branches: Vec<(&str, usize)> = counts.into_iter().collect();
+        branches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        ui.menu_button("⏷", |ui| {
+            if branches.is_empty() {
+                ui.weak("No branches yet");
+            }
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    for (branch, count) in branches {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(branch)
+                                .on_hover_text(format!(
+                                    "On {branch} ({})",
+                                    plural(count as u32, "clone", "clones")
+                                ))
+                                .clicked()
+                            {
+                                self.branch = branch.to_owned();
+                                ui.close();
+                            }
+                            if ui
+                                .small_button("not")
+                                .on_hover_text(format!("On any branch but {branch}"))
+                                .clicked()
+                            {
+                                self.branch = format!("!{branch}");
+                                ui.close();
+                            }
+                            ui.weak(thousands(count as u64));
+                        });
+                    }
+                });
+        })
+        .response
+        .on_hover_text("Pick a branch");
     }
 
     /// The tag query field, with a menu of known tags.
@@ -687,7 +925,6 @@ impl ReposPage {
         cx: &ReposContext<'_>,
         parsed: Option<&Result<Query, String>>,
     ) {
-        ui.separator();
         let label = ui.label("Tags");
         ui.add(
             egui::TextEdit::singleline(&mut self.tag_filter)
@@ -761,7 +998,7 @@ impl ReposPage {
     fn clones_view(
         &mut self,
         ui: &mut egui::Ui,
-        scan: &ScanResult,
+        (scan, summaries): (&ScanResult, Option<&HashMap<i64, RepoSummary>>),
         (tags, rules, tag_query): (&TagIndex, &[Rule], Option<&Query>),
         launchers: &[LauncherInfo],
         action: &mut Option<ReposAction>,
@@ -784,14 +1021,17 @@ impl ReposPage {
             }
         }
 
-        let needle = self.filter.trim().to_lowercase();
+        let matcher = self.filter.matcher(true);
         let mut rows: Vec<&CloneInfo> = scan
             .clones
             .iter()
             .filter(|c| {
-                matches_text(&needle, &c.display_name(), &c.rel_path)
-                    && !(self.hide_ignored_clones && self.is_ignored(c))
+                matcher.matches(&clone_item(c, summaries, &self.ignored_repos))
                     && self.show.matches(c)
+                    && branch_matches(
+                        &self.branch,
+                        c.status.as_ref().ok().and_then(|s| s.branch.as_deref()),
+                    )
                     && tag_query.is_none_or(|q| q.matches(&tags.tags_of(c.id)))
             })
             .collect();
@@ -869,7 +1109,7 @@ impl ReposPage {
                 body.rows(row_height, rows.len(), |mut row| {
                     let clone = rows[row.index()];
                     row.set_selected(self.selected == Some(clone.id));
-                    let ignored = !self.hide_ignored_clones && self.is_ignored(clone);
+                    let ignored = !self.filter.hide_ignored && self.is_ignored(clone);
                     row.col(|ui| name_cell(ui, clone, ignored));
                     row.col(|ui| {
                         ui.weak(&clone.rel_path);
@@ -903,6 +1143,7 @@ impl ReposPage {
         &mut self,
         ui: &mut egui::Ui,
         scan: &ScanResult,
+        summaries: Option<&HashMap<i64, RepoSummary>>,
         action: &mut Option<ReposAction>,
     ) {
         if scan.problem_count() == 0 {
@@ -910,7 +1151,24 @@ impl ReposPage {
             ui.weak("No problems found.");
             return;
         }
-        let needle = self.filter.trim().to_lowercase();
+        let matcher = self.filter.matcher(true);
+        let show = self.problem_show;
+        // Missing folders and stray folders have no repo to describe them: they match by name
+        // and folder alone, and only while no language is picked.
+        let bare = |full_name: Option<&str>, path: &str| {
+            let folder = path.rsplit('/').next().unwrap_or(path);
+            let (owner, name) = match full_name.and_then(|n| n.split_once('/')) {
+                Some((owner, name)) => (Some(owner), name),
+                None => (None, layout::split_suffix(folder).0),
+            };
+            matcher.matches(&Item {
+                owner,
+                name,
+                folder: Some(folder),
+                ..Item::default()
+            })
+        };
+        let mut listed = 0;
 
         egui::ScrollArea::vertical()
             .auto_shrink(false)
@@ -918,8 +1176,11 @@ impl ReposPage {
                 let missing: Vec<_> = scan
                     .missing
                     .iter()
-                    .filter(|m| matches_text(&needle, m.name.as_deref().unwrap_or(""), &m.path))
+                    .filter(|m| {
+                        show.shows(ProblemShow::Missing) && bare(m.name.as_deref(), &m.path)
+                    })
                     .collect();
+                listed += missing.len();
                 problem_section(ui, "Missing folders", MISSING_HELP, missing.len(), |ui| {
                     for gone in missing {
                         ui.horizontal(|ui| {
@@ -938,10 +1199,13 @@ impl ReposPage {
                 });
 
                 for kind in ProblemKind::ALL {
+                    if !show.shows(ProblemShow::Kind(kind)) {
+                        continue;
+                    }
                     let entries: Vec<(&CloneInfo, &Problem)> = scan
                         .clones
                         .iter()
-                        .filter(|c| matches_text(&needle, &c.display_name(), &c.rel_path))
+                        .filter(|c| matcher.matches(&clone_item(c, summaries, &self.ignored_repos)))
                         .flat_map(|c| {
                             c.problems
                                 .iter()
@@ -949,6 +1213,7 @@ impl ReposPage {
                                 .map(move |p| (c, p))
                         })
                         .collect();
+                    listed += entries.len();
                     problem_section(ui, kind.title(), kind.help(), entries.len(), |ui| {
                         if kind == ProblemKind::OutOfLayout
                             && entries.len() > 1
@@ -981,8 +1246,9 @@ impl ReposPage {
                 let strays: Vec<&String> = scan
                     .strays
                     .iter()
-                    .filter(|s| matches_text(&needle, "", s))
+                    .filter(|s| show.shows(ProblemShow::Strays) && bare(None, s))
                     .collect();
+                listed += strays.len();
                 problem_section(ui, "Not git repos", STRAYS_HELP, strays.len(), |ui| {
                     for stray in strays {
                         ui.horizontal(|ui| {
@@ -1000,7 +1266,84 @@ impl ReposPage {
                         });
                     }
                 });
+                if listed == 0 {
+                    ui.add_space(8.0);
+                    ui.weak("Nothing matches the filter.");
+                }
             });
+    }
+}
+
+/// A labelled drop-down that picks one of `options`.
+fn combo<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    (label, id): (&str, &str),
+    value: &mut T,
+    options: impl IntoIterator<Item = (T, &'static str)>,
+) {
+    let options: Vec<(T, &str)> = options.into_iter().collect();
+    let selected = options
+        .iter()
+        .find(|(option, _)| option == value)
+        .map_or("", |(_, text)| text);
+    keep_together(ui, 200.0);
+    let label = ui.label(label);
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            for (option, text) in options {
+                ui.selectable_value(value, option, text);
+            }
+        })
+        .response
+        .labelled_by(label.id);
+}
+
+/// `spec` is comma-separated parts of branch names: a branch matches if it has any of them
+/// and none of the ones starting with `!`. A detached HEAD has no branch name.
+fn branch_matches(spec: &str, branch: Option<&str>) -> bool {
+    let branch = branch.unwrap_or("").to_lowercase();
+    let mut wanted = false;
+    let mut found = false;
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match part.strip_prefix('!').map(str::trim) {
+            Some("") => {}
+            Some(unwanted) => {
+                if branch.contains(&unwanted.to_lowercase()) {
+                    return false;
+                }
+            }
+            None => {
+                wanted = true;
+                found |= branch.contains(&part.to_lowercase());
+            }
+        }
+    }
+    !wanted || found
+}
+
+/// What the shared filter sees of a clone: its repo's owner and name (or its folder), and what
+/// the last sync said about that repo.
+fn clone_item<'a>(
+    clone: &'a CloneInfo,
+    summaries: Option<&'a HashMap<i64, RepoSummary>>,
+    ignored: &HashSet<i64>,
+) -> Item<'a> {
+    let summary = clone
+        .repo_id
+        .and_then(|id| summaries.and_then(|s| s.get(&id)));
+    let url = clone.repo();
+    Item {
+        owner: url.map(|u| u.owner.as_str()),
+        name: url.map_or_else(
+            || layout::split_suffix(clone.folder_name()).0,
+            |u| u.name.as_str(),
+        ),
+        folder: Some(clone.folder_name()),
+        description: summary.and_then(|s| s.description.as_deref()),
+        language: summary.and_then(|s| s.language.as_deref()),
+        ignored: clone.repo_id.is_some_and(|id| ignored.contains(&id)),
+        archived: summary.is_some_and(|s| s.is_archived),
     }
 }
 
@@ -1014,12 +1357,6 @@ fn no_clone_root(ui: &mut egui::Ui, action: &mut Option<ReposAction>) {
             *action = Some(ReposAction::OpenSettings);
         }
     });
-}
-
-fn matches_text(needle: &str, name: &str, path: &str) -> bool {
-    needle.is_empty()
-        || name.to_lowercase().contains(needle)
-        || path.to_lowercase().contains(needle)
 }
 
 fn sort_rows(rows: &mut [&CloneInfo], key: SortKey, descending: bool) {
@@ -1758,16 +2095,36 @@ mod tests {
         old_thing.ignored = true;
         let mut serde = repo_row(16, "serde-rs/serde", "Rust", "2026-11-02", &[]);
         serde.ignored = true;
+        let inbox = vec![
+            repo_row(10, "me/dotfiles", "Shell", "2026-11-20", &[Source::Owned]),
+            api,
+            website,
+            fork,
+        ];
+        let ignored = vec![old_thing.clone(), serde];
+        let summary = |row: &RepoRow| RepoSummary {
+            description: row.description.clone(),
+            language: row.language.clone(),
+            is_archived: row.is_archived,
+        };
+        let mut summaries: HashMap<i64, RepoSummary> = inbox
+            .iter()
+            .chain(&ignored)
+            .map(|r| (r.id, summary(r)))
+            .collect();
+        summaries.insert(
+            20,
+            RepoSummary {
+                description: Some("The library for web and native user interfaces".into()),
+                language: Some("JavaScript".into()),
+                is_archived: false,
+            },
+        );
         Catalog {
             last_sync: Some("2026-11-21 18:00:00".into()),
             relevant: 5,
-            inbox: vec![
-                repo_row(10, "me/dotfiles", "Shell", "2026-11-20", &[Source::Owned]),
-                api,
-                website,
-                fork,
-            ],
-            ignored: vec![old_thing.clone(), serde],
+            inbox,
+            ignored,
             ignored_remote: vec![old_thing],
             forks: vec![
                 ForkRow {
@@ -1796,6 +2153,7 @@ mod tests {
                 },
             ],
             manual_owners: vec!["rust-lang".into()],
+            summaries,
         }
     }
 
@@ -1856,13 +2214,23 @@ mod tests {
         assert!(h.query_by_label("serde-rs/serde").is_some());
         assert!(h.query_by_label("ignored").is_some());
 
+        // The toggle is shared, so the Remote List lists ignored repos now too.
         h.get_by_label("Remote List (4)").click();
+        h.run();
+        assert!(h.query_by_label("ignored").is_some());
+        h.get_by_label("Hide ignored").click();
         h.run();
         assert!(h.query_by_label("myorg/old-thing").is_none());
         assert!(h.query_by_label("ignored").is_none());
         h.get_by_label("Hide ignored").click();
         h.run();
-        assert!(h.query_by_label("ignored").is_some());
+        // Everything in Ignored is ignored, so the toggle isn't offered there.
+        h.get_by_label("Ignored (2)").click();
+        h.run();
+        assert!(h.query_by_label("Hide ignored").is_none());
+        assert!(h.query_by_label("myorg/old-thing").is_some());
+        h.get_by_label("Remote List (4)").click();
+        h.run();
         h.get_by_label("myorg/old-thing").click();
         h.run();
         h.get_by_label("Un-ignore").click();
@@ -1879,7 +2247,7 @@ mod tests {
     #[test]
     fn filter_narrows_the_list() {
         let mut h = harness(Harness::builder());
-        h.state_mut().0.filter = "serde".into();
+        h.state_mut().0.filter.text = "serde".into();
         h.run();
         assert!(h.query_by_label("serde-rs/serde").is_some());
         assert!(h.query_by_label("facebook/react").is_none());
@@ -2096,7 +2464,9 @@ mod tests {
             ["me/react", "me/dotfiles", "myorg/api", "myorg/website"]
         );
 
-        h.get_by_label("Language").click();
+        // The column title, not the filter's label.
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Language")
+            .click();
         h.run();
         assert_eq!(
             remote_list_order(&h),
@@ -2153,12 +2523,12 @@ mod tests {
     fn remote_list_filters_and_hides_archived() {
         let mut h = harness(Harness::builder());
         h.state_mut().0.view = View::RemoteList;
-        h.state_mut().0.filter = "rust".into();
+        h.state_mut().0.filter.language = "rust".into();
         h.run();
         assert!(h.query_by_label("myorg/api").is_some());
         assert!(h.query_by_label("me/dotfiles").is_none());
 
-        h.state_mut().0.filter.clear();
+        h.state_mut().0.filter.language.clear();
         h.run();
         assert!(h.query_by_label("myorg/website").is_some());
         h.get_by_label("Hide archived").click();
@@ -2241,6 +2611,17 @@ mod tests {
         )
     }
 
+    /// The ⏷ menu button right after the field labelled `label`.
+    fn menu_after<'h>(h: &'h Harness<'_, State>, label: &str) -> egui_kittest::Node<'h> {
+        let field = h
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, label)
+            .rect();
+        h.get_all_by_label("⏷")
+            .filter(|menu| menu.rect().left() >= field.right())
+            .min_by(|a, b| a.rect().left().total_cmp(&b.rect().left()))
+            .unwrap()
+    }
+
     fn shown(h: &Harness<'_, State>, names: &[&str]) -> Vec<String> {
         names
             .iter()
@@ -2293,13 +2674,13 @@ mod tests {
         let mut h = tags_harness(Harness::builder());
         h.state_mut().0.view = View::RemoteList;
         h.run();
-        h.get_by_label("⏷").click();
+        menu_after(&h, "Tags").click();
         h.run();
         // Tags from clones and from repos, alphabetically: later, work.
         h.get_all_by_label("not").next().unwrap().click();
         h.run();
         assert_eq!(h.state().0.tag_filter, "NOT later");
-        h.get_by_label("⏷").click();
+        menu_after(&h, "Tags").click();
         h.run();
         h.get_by_label("untagged").click();
         h.run();
@@ -2509,6 +2890,269 @@ mod tests {
         );
     }
 
+    const CLONES: [&str; 5] = [
+        "facebook/react",
+        "someone/react",
+        "thing",
+        "notes",
+        "serde-rs/serde",
+    ];
+
+    #[test]
+    fn local_clones_search_chosen_fields() {
+        let mut h = harness(Harness::builder());
+        // facebook/react's repo has a description from the last sync.
+        if let Some(Ok(scan)) = &mut h.state_mut().0.result {
+            scan.clones[0].repo_id = Some(20);
+        }
+        h.state_mut().0.filter.text = "react".into();
+        h.run();
+        assert_eq!(shown(&h, &CLONES), ["facebook/react", "someone/react"]);
+
+        // Owner only: "react" is nobody's name.
+        h.get_by_label("Name").click();
+        h.run();
+        assert_eq!(shown(&h, &CLONES), Vec::<String>::new());
+        assert!(h.query_by_label("Nothing matches the filter.").is_some());
+        h.state_mut().0.filter.text = "someone".into();
+        h.run();
+        assert_eq!(shown(&h, &CLONES), ["someone/react"]);
+
+        // The last field on can't be turned off.
+        h.get_by_label("Owner").click();
+        h.run();
+        assert!(h.state().0.filter.fields.owner);
+
+        // Description only.
+        h.get_by_label("Description").click();
+        h.run();
+        h.get_by_label("Owner").click();
+        h.run();
+        h.state_mut().0.filter.text = "native".into();
+        h.run();
+        assert_eq!(shown(&h, &CLONES), ["facebook/react"]);
+    }
+
+    #[test]
+    fn local_clones_filter_by_language_and_archived() {
+        let mut h = harness(Harness::builder());
+        if let Some(Ok(scan)) = &mut h.state_mut().0.result {
+            scan.clones[0].repo_id = Some(20); // facebook/react, JavaScript
+            scan.clones[4].repo_id = Some(11); // as if it were myorg/api: Rust
+        }
+        h.state_mut().0.filter.language = "javascript, Rust".into();
+        h.run();
+        assert_eq!(shown(&h, &CLONES), ["facebook/react", "serde-rs/serde"]);
+        h.state_mut().0.filter.language = "Cobol".into();
+        h.run();
+        assert!(h.query_by_label("No repo is in Cobol").is_some());
+
+        h.state_mut().0.filter.language.clear();
+        h.state_mut()
+            .0
+            .catalog
+            .as_mut()
+            .unwrap()
+            .summaries
+            .get_mut(&20)
+            .unwrap()
+            .is_archived = true;
+        h.run();
+        assert_eq!(shown(&h, &CLONES), CLONES);
+        h.get_by_label("Hide archived").click();
+        h.run();
+        assert_eq!(
+            shown(&h, &CLONES),
+            ["someone/react", "thing", "notes", "serde-rs/serde"]
+        );
+    }
+
+    #[test]
+    fn language_menu_picks_languages() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.view = View::RemoteList;
+        h.run();
+        menu_after(&h, "Language").click();
+        h.run();
+        let checkbox = |h: &Harness<'_, State>, label: &str| {
+            h.get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+                .click();
+        };
+        checkbox(&h, "Rust");
+        h.run();
+        checkbox(&h, "Shell");
+        h.run();
+        assert_eq!(h.state().0.filter.language, "Rust, Shell");
+        checkbox(&h, "Rust");
+        h.run();
+        assert_eq!(h.state().0.filter.language, "Shell");
+    }
+
+    #[test]
+    fn local_clones_filter_by_branch() {
+        let mut h = harness(Harness::builder());
+        if let Some(Ok(scan)) = &mut h.state_mut().0.result {
+            if let Ok(status) = &mut scan.clones[1].status {
+                status.branch = Some("feature/hooks".into());
+            }
+            if let Ok(status) = &mut scan.clones[2].status {
+                status.branch = None; // detached
+            }
+        }
+        for (branch, expected) in [
+            ("feat", &["someone/react"][..]),
+            ("!main", &["someone/react", "thing"][..]),
+            ("!main, !hooks", &["thing"][..]),
+            (
+                "hooks, MAIN",
+                &["facebook/react", "someone/react", "notes", "serde-rs/serde"][..],
+            ),
+        ] {
+            h.state_mut().0.branch = branch.into();
+            h.run();
+            assert_eq!(shown(&h, &CLONES), expected, "{branch}");
+        }
+
+        // The menu lists branches, most used first.
+        h.state_mut().0.branch.clear();
+        h.run();
+        menu_after(&h, "Branch").click();
+        h.run();
+        h.get_all_by_label("not").next().unwrap().click();
+        h.run();
+        assert_eq!(h.state().0.branch, "!main");
+    }
+
+    #[test]
+    fn clear_filters_empties_the_fields() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        assert!(h.query_by_label("Clear filters").is_none());
+        {
+            let page = &mut h.state_mut().0;
+            page.filter.text = "nothing like it".into();
+            page.branch = "dev".into();
+            page.show = Show::Stashes;
+            page.filter.hide_archived = true;
+        }
+        h.run();
+        assert_eq!(shown(&h, &CLONES), Vec::<String>::new());
+        h.get_by_label("Clear filters").click();
+        h.run();
+        assert_eq!(shown(&h, &CLONES), CLONES);
+        assert!(h.state().0.filter.hide_archived, "toggles stay");
+        assert!(h.query_by_label("Clear filters").is_none());
+    }
+
+    #[test]
+    fn remote_list_filters_by_source() {
+        let all = ["me/dotfiles", "myorg/api", "myorg/website", "me/react"];
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.view = View::RemoteList;
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Source")
+            .click();
+        h.run();
+        h.get_by_label("Org member").click();
+        h.run();
+        assert_eq!(shown(&h, &all), ["myorg/api", "myorg/website"]);
+        h.state_mut().0.source = SourceFilter::Contributed;
+        h.run();
+        assert_eq!(shown(&h, &all), ["myorg/website"]);
+    }
+
+    #[test]
+    fn forks_filter_by_show_and_search() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.view = View::Forks;
+        h.run();
+        assert!(h.query_by_label("me/react").is_some());
+        assert!(h.query_by_label("me/serde").is_some());
+        h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Show")
+            .click();
+        h.run();
+        h.get_by_label("Separate forks").click();
+        h.run();
+        assert!(h.query_by_label("me/react").is_none());
+        assert!(h.query_by_label("me/serde").is_some());
+
+        // The search looks at the upstream too.
+        h.state_mut().0.fork_show = ForkShow::All;
+        h.state_mut().0.filter.text = "facebook".into();
+        h.run();
+        assert!(h.query_by_label("me/react").is_some());
+        assert!(h.query_by_label("me/serde").is_none());
+
+        // Language goes by the fork (me/react is JavaScript).
+        h.state_mut().0.filter.text.clear();
+        h.state_mut().0.filter.language = "javascript".into();
+        h.run();
+        assert!(h.query_by_label("me/react").is_some());
+        assert!(h.query_by_label("me/serde").is_none());
+    }
+
+    #[test]
+    fn problems_show_one_section() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.view = View::Problems;
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Show")
+            .click();
+        h.run();
+        h.get_by_label("No remotes").click();
+        h.run();
+        assert!(h.query_by_label("No remotes (1)").is_some());
+        assert!(h.query_by_label("Missing folders (1)").is_none());
+        assert!(h.query_by_label("Not git repos (1)").is_none());
+
+        // Folders without a repo match by name.
+        h.state_mut().0.problem_show = ProblemShow::All;
+        h.state_mut().0.filter.text = "photos".into();
+        h.run();
+        assert!(h.query_by_label("Not git repos (1)").is_some());
+        assert!(h.query_by_label("No remotes (1)").is_none());
+        h.state_mut().0.filter.text = "zzz".into();
+        h.run();
+        assert!(h.query_by_label("Nothing matches the filter.").is_some());
+    }
+
+    #[test]
+    fn filters_sit_between_the_tabs_and_the_list() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        let tabs = h.get_by_label("Local Clones (5)").rect();
+        let search = h
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "Search")
+            .rect();
+        let branch = h
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "Branch")
+            .rect();
+        let header = h.get_by_label("Repository ⏶").rect();
+        assert!(tabs.bottom() < search.top());
+        assert!(
+            search.bottom() < branch.top(),
+            "view filters get a row of their own"
+        );
+        assert!(branch.bottom() < header.top());
+
+        // Import has none.
+        h.get_by_label("Import").click();
+        h.run();
+        assert!(h.query_by_label("Search").is_none());
+    }
+
+    #[test]
+    fn branch_specs() {
+        assert!(branch_matches("", None));
+        assert!(branch_matches(" , ! ", Some("main")));
+        assert!(branch_matches("Main", Some("main")));
+        assert!(!branch_matches("main", None));
+        assert!(branch_matches("!main", None));
+        assert!(branch_matches("dev, main", Some("main")));
+        assert!(!branch_matches("dev, !main", Some("main")));
+        assert!(!branch_matches("dev, !old", Some("dev-old")));
+    }
+
     /// Renders the views to PNGs for a visual check. Only runs when
     /// `DEPOSITORY_UI_SHOTS` names a folder: `DEPOSITORY_UI_SHOTS=/tmp/shots cargo test ui_shots`.
     #[test]
@@ -2522,6 +3166,17 @@ mod tests {
         h.get_by_label("someone/react").click();
         h.run();
         h.render().unwrap().save(dir.join("clones.png")).unwrap();
+        h.state_mut().0.branch = "!main".into();
+        h.state_mut().0.filter.language = "Cobol".into();
+        h.set_size(egui::vec2(700.0, 560.0));
+        h.run();
+        h.render()
+            .unwrap()
+            .save(dir.join("clones_narrow.png"))
+            .unwrap();
+        h.state_mut().0.clear_filters();
+        h.set_size(egui::vec2(1280.0, 560.0));
+        h.run();
         h.get_by_label("Problems (7)").click();
         h.run();
         h.render().unwrap().save(dir.join("problems.png")).unwrap();
