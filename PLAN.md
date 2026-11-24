@@ -39,6 +39,7 @@ A Rust + egui desktop app (Linux first) for managing the GitHub repositories I c
   - runner: shell (default `$SHELL`), how many commands run at once (default 8), timeout, line limit per repo (default 10,000)
   - launchers (editor command templates)
   - how many windows can open before the app asks first (default 10)
+  - theme: system (default), light or dark. System follows the desktop's `color-scheme` from the XDG desktop portal, live; with no answer it's dark
 - **State** lives in `~/.local/share/depository/depository.db` (SQLite in WAL mode, with versioned migrations).
 - **Workspace files** live in `~/.local/share/depository/workspaces/`.
 - **GitHub token**: the app looks in the OS keyring first (KWallet, through the Secret Service API), then `GITHUB_TOKEN`, then `gh auth token`. The token is never written to the database, the config file, or any clone URL.
@@ -317,7 +318,7 @@ Always run the `git` command rather than a git library. That way your SSH config
 - **Background work and HTTP**: `tokio`, `reqwest` (rustls)
 - **Data**: `serde`, `serde_json`, `toml`, `rusqlite` (bundled) + `rusqlite_migration`
 - **Matching**: `regex`, `nucleo-matcher`
-- **System**: `keyring`, `directories`, `trash`, `nix` (process groups and signals)
+- **System**: `keyring`, `directories`, `trash`, `nix` (process groups and signals), `zbus` (desktop portal theme)
 - **Errors and logging**: `anyhow`, `tracing`
 
 ### Modules
@@ -327,6 +328,7 @@ src/
   main.rs
   app.rs              top-level tabs, wiring between UI and backend
   config.rs           config.toml
+  system_theme.rs     desktop light/dark preference from the XDG portal
   db/                 connection, migrations, queries
   github/             GraphQL client, queries, sync, REST rename check
   git/                remote URL parsing, scan, status, clone, import

@@ -3,7 +3,7 @@
 use eframe::egui;
 
 use crate::backend::{AuthState, Backend, Command, DbInfo, FolderPurpose, LauncherInfo};
-use crate::config::{self, Config, Paths};
+use crate::config::{self, Config, Paths, ThemeChoice};
 use crate::launch::{self, LauncherSpec, WorkspaceKind};
 use crate::token::TokenSource;
 use crate::ui::thousands;
@@ -70,6 +70,11 @@ impl SettingsPage {
 
     pub fn set_account_message(&mut self, message: Result<String, String>) {
         self.account_message = Some(message);
+    }
+
+    /// The theme picked on this page, saved or not.
+    pub fn theme(&self) -> ThemeChoice {
+        self.draft.appearance.theme
     }
 
     /// Turns the draft into a config, or lists what needs fixing.
@@ -202,6 +207,7 @@ impl SettingsPage {
                 }
                 self.preferences(ui, cx.backend);
                 self.launchers(ui, &cx);
+                self.appearance(ui);
 
                 ui.add_space(20.0);
                 ui.heading("Storage");
@@ -601,6 +607,28 @@ impl SettingsPage {
             });
         }
     }
+
+    fn appearance(&mut self, ui: &mut egui::Ui) {
+        subheading(ui, "Appearance");
+        section_grid(ui, "appearance", |ui| {
+            ui.label("Theme");
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    for choice in ThemeChoice::ALL {
+                        ui.radio_value(&mut self.draft.appearance.theme, choice, choice.label());
+                    }
+                });
+                if self.draft.appearance.theme == ThemeChoice::System {
+                    ui.weak(match ui.ctx().system_theme() {
+                        Some(egui::Theme::Light) => "Your desktop prefers light.",
+                        Some(egui::Theme::Dark) => "Your desktop prefers dark.",
+                        None => "Your desktop doesn't say which it prefers, so dark is used.",
+                    });
+                }
+            });
+            ui.end_row();
+        });
+    }
 }
 
 /// An optional argument string: empty means "this app can't do that".
@@ -727,6 +755,42 @@ mod tests {
         assert_eq!(problems, ["Helix its \"each\" arguments need {path}"]);
         page.draft.launch.custom[0].each = Some("{path}".into());
         assert!(page.build().is_ok());
+    }
+
+    #[test]
+    fn theme_picker_changes_the_draft() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = Harness::new_ui_state(
+            |ui, page: &mut SettingsPage| page.appearance(ui),
+            SettingsPage::new(&Config::default()),
+        );
+        // Tests have no desktop to ask.
+        assert!(
+            harness
+                .query_by_label("Your desktop doesn't say which it prefers, so dark is used.")
+                .is_some()
+        );
+
+        harness.get_by_label("Light").click();
+        harness.run();
+        assert_eq!(harness.state().theme(), ThemeChoice::Light);
+        assert!(harness.query_by_label_contains("Your desktop").is_none());
+        assert_eq!(
+            harness.state().build().unwrap().appearance.theme,
+            ThemeChoice::Light
+        );
+
+        harness.input_mut().system_theme = Some(egui::Theme::Light);
+        harness.get_by_label("System").click();
+        harness.run();
+        assert_eq!(harness.state().theme(), ThemeChoice::System);
+        assert!(
+            harness
+                .query_by_label("Your desktop prefers light.")
+                .is_some()
+        );
     }
 
     #[test]

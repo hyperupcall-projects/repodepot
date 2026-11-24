@@ -8,6 +8,7 @@ mod github;
 mod jobs;
 mod launch;
 mod layout;
+mod system_theme;
 mod tags;
 mod token;
 mod ui;
@@ -29,6 +30,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let (config, config_error) = config::load(&paths.config_file);
+    let system_theme = system_theme::SystemTheme::watch();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("depository")
@@ -41,6 +43,7 @@ fn main() -> anyhow::Result<()> {
         "depository",
         options,
         Box::new(move |cc| {
+            system_theme.set_context(cc.egui_ctx.clone());
             let backend =
                 backend::Backend::start(cc.egui_ctx.clone(), paths.clone(), config.clone());
             Ok(Box::new(app::App::new(
@@ -48,6 +51,7 @@ fn main() -> anyhow::Result<()> {
                 config,
                 config_error,
                 backend,
+                system_theme,
             )))
         }),
     )

@@ -5,8 +5,9 @@ use eframe::egui;
 use crate::backend::{
     AuthState, Backend, Command, DbInfo, Event, FolderPurpose, LaunchRequest, LauncherInfo, Origin,
 };
-use crate::config::{Config, Paths};
+use crate::config::{Config, Paths, ThemeChoice};
 use crate::db::TagStore;
+use crate::system_theme::SystemTheme;
 use crate::tags::{self, CloneFacts, TagIndex};
 use crate::ui::repos::{ReposAction, ReposContext, ReposPage};
 use crate::ui::runner::{RunnerAction, RunnerContext, RunnerPage};
@@ -54,6 +55,7 @@ pub struct App {
     launchers: Vec<LauncherInfo>,
     auth: AuthState,
     db: Option<Result<DbInfo, String>>,
+    system_theme: SystemTheme,
 }
 
 impl App {
@@ -62,6 +64,7 @@ impl App {
         config: Config,
         config_error: Option<String>,
         backend: Backend,
+        system_theme: SystemTheme,
     ) -> Self {
         backend.send(Command::CheckAuth);
         // Nothing works without a clone root, so start on Settings until there is one.
@@ -87,6 +90,25 @@ impl App {
             config_error,
             auth: AuthState::Checking,
             db: None,
+            system_theme,
+        }
+    }
+
+    /// Uses the saved theme, or the unsaved choice while Settings is open so it can be previewed.
+    fn apply_theme(&self, ctx: &egui::Context) {
+        let choice = if self.tab == Tab::Settings {
+            self.settings.theme()
+        } else {
+            self.config.appearance.theme
+        };
+        let preference = match choice {
+            ThemeChoice::System => egui::ThemePreference::System,
+            ThemeChoice::Light => egui::ThemePreference::Light,
+            ThemeChoice::Dark => egui::ThemePreference::Dark,
+        };
+        if ctx.options(|o| o.theme_preference) != preference {
+            ctx.set_theme(preference);
+            ctx.request_repaint();
         }
     }
 
@@ -352,10 +374,17 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(theme) = self.system_theme.get() {
+            raw_input.system_theme = Some(theme);
+        }
+    }
+
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Some(event) = self.backend.try_recv() {
             self.handle_event(event);
         }
+        self.apply_theme(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -456,5 +485,7 @@ impl eframe::App for App {
                 }
             }
         });
+        // A theme picked or a tab switched this frame shows from the next one.
+        self.apply_theme(ui.ctx());
     }
 }

@@ -38,6 +38,35 @@ pub struct Config {
     pub clone: CloneDefaults,
     pub runner: Runner,
     pub launch: Launch,
+    pub appearance: Appearance,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Appearance {
+    pub theme: ThemeChoice,
+}
+
+/// Light or dark colors, or whichever the desktop prefers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeChoice {
+    pub const ALL: [ThemeChoice; 3] = [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeChoice::System => "System",
+            ThemeChoice::Light => "Light",
+            ThemeChoice::Dark => "Dark",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -285,6 +314,22 @@ mod tests {
         assert_eq!(config.remotes.default_name, "origin");
         assert_eq!(config.remotes.upstream_name, "upstream");
         assert_eq!(config.runner.parallel, 8);
+        assert_eq!(config.appearance.theme, ThemeChoice::System);
+    }
+
+    #[test]
+    fn theme_is_written_in_lowercase() {
+        let config = Config {
+            appearance: Appearance {
+                theme: ThemeChoice::Light,
+            },
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("[appearance]\ntheme = \"light\""), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.appearance.theme, ThemeChoice::Light);
+        assert!(toml::from_str::<Config>("[appearance]\ntheme = \"blue\"\n").is_err());
     }
 
     #[test]
