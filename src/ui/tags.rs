@@ -13,6 +13,7 @@ use crate::git::scan::CloneInfo;
 use crate::launch;
 use crate::tags::query::{self, Query};
 use crate::tags::{self, CloneFacts, Rule, RuleField, TagCount, TagIndex, Tagging};
+use crate::ui::plural;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum TagsAction {
@@ -952,10 +953,6 @@ pub fn tag_summary(ui: &mut egui::Ui, tagging: &Tagging) {
         ui.label(egui::RichText::new(tag).italics().weak())
             .on_hover_text("Added by a rule");
     }
-}
-
-fn plural(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 #[cfg(test)]

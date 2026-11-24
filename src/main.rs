@@ -8,8 +8,10 @@ mod github;
 mod jobs;
 mod launch;
 mod layout;
+mod log;
 mod system_theme;
 mod tags;
+mod time;
 mod token;
 mod ui;
 

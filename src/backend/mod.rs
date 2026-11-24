@@ -26,6 +26,7 @@ use crate::git::import::ImportPreview;
 use crate::git::scan::{self, ScanResult, ScanSettings};
 use crate::github::{self, RateLimit, Viewer};
 use crate::jobs::{self, OnChange, Run, RunSpec, Target};
+use crate::log;
 use crate::tags::{self, Rule};
 use crate::token::{self, TokenSource};
 
@@ -174,6 +175,8 @@ pub enum Event {
         origin: Origin,
         message: String,
     },
+    /// Something for the log that no other event covers.
+    Log(log::Entry),
 }
 
 pub struct DbInfo {
@@ -230,6 +233,11 @@ impl Emitter {
         if self.tx.send(event).is_ok() {
             self.ctx.request_repaint();
         }
+    }
+
+    /// Adds an entry to the UI's log (which also writes it to stderr).
+    fn log(&self, entry: log::Entry) {
+        self.emit(Event::Log(entry));
     }
 }
 
@@ -357,9 +365,6 @@ async fn run(
                 while sync_rx.try_recv().is_ok() {}
                 shared.emitter.emit(Event::SyncStarted);
                 let result = repos::run_sync(&shared).await.map_err(|e| format!("{e:#}"));
-                if let Err(e) = &result {
-                    tracing::warn!("sync failed: {e}");
-                }
                 shared.emitter.emit(Event::SyncFinished(result));
                 let _ = scan_tx.send(());
             }
@@ -476,7 +481,9 @@ async fn run(
                     let saved = with_db(&shared, move |db| db.save_snippet(&name, &command)).await;
                     match saved {
                         Ok(()) => load_snippets(shared).await,
-                        Err(e) => tracing::warn!("couldn't save the snippet: {e:#}"),
+                        Err(e) => shared.emitter.log(
+                            log::Entry::error("Couldn't save the snippet").detail(format!("{e:#}")),
+                        ),
                     }
                 });
             }
@@ -485,7 +492,10 @@ async fn run(
                 tokio::spawn(async move {
                     match with_db(&shared, move |db| db.delete_snippet(id)).await {
                         Ok(()) => load_snippets(shared).await,
-                        Err(e) => tracing::warn!("couldn't delete the snippet: {e:#}"),
+                        Err(e) => shared.emitter.log(
+                            log::Entry::error("Couldn't delete the snippet")
+                                .detail(format!("{e:#}")),
+                        ),
                     }
                 });
             }
@@ -583,7 +593,9 @@ async fn run(
                             shared.emitter.emit(Event::FolderPicked { purpose, path })
                         }
                         Ok(None) => {}
-                        Err(e) => tracing::warn!("the folder chooser crashed: {e}"),
+                        Err(e) => shared.emitter.log(
+                            log::Entry::error("The folder chooser crashed").detail(e.to_string()),
+                        ),
                     }
                 });
             }
@@ -674,7 +686,9 @@ async fn run(
 async fn refresh_tags(shared: &Shared) {
     match with_db(shared, |db| db.tag_store()).await {
         Ok(store) => shared.emitter.emit(Event::Tags(store)),
-        Err(e) => tracing::warn!("couldn't load tags: {e:#}"),
+        Err(e) => shared
+            .emitter
+            .log(log::Entry::error("Couldn't load tags").detail(format!("{e:#}"))),
     }
 }
 
@@ -705,7 +719,9 @@ async fn record_history(shared: &Shared, run: &Run) {
     .await;
     match recorded {
         Ok(history) => shared.emitter.emit(Event::History(history)),
-        Err(e) => tracing::warn!("couldn't record the command: {e:#}"),
+        Err(e) => shared.emitter.log(
+            log::Entry::warning("Couldn't add the command to the history").detail(format!("{e:#}")),
+        ),
     }
 }
 
@@ -754,7 +770,9 @@ async fn load_snippets(shared: Arc<Shared>) {
             shared.emitter.emit(Event::Snippets(snippets));
             shared.emitter.emit(Event::History(history));
         }
-        Err(e) => tracing::warn!("couldn't load snippets: {e:#}"),
+        Err(e) => shared
+            .emitter
+            .log(log::Entry::error("Couldn't load snippets and history").detail(format!("{e:#}"))),
     }
 }
 
@@ -812,9 +830,6 @@ async fn run_scan(shared: &Shared) {
             .map_err(|e| format!("{e:#}"))
         }
     };
-    if let Err(e) = &result {
-        tracing::warn!("scan failed: {e}");
-    }
     shared.emitter.emit(Event::Scan(result));
 }
 
@@ -842,7 +857,6 @@ async fn open_db(paths: &Paths, emitter: &Emitter) -> Result<Db, String> {
             Ok(db)
         }
         Ok(Err(e)) => {
-            tracing::error!("database: {e:#}");
             let error = format!("{e:#}");
             emitter.emit(Event::Db(Err(error.clone())));
             Err(error)

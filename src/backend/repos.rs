@@ -15,6 +15,7 @@ use crate::git;
 use crate::github::sync::{self, Lookup, RestCheck, SyncRequest};
 use crate::jobs::{RunSpec, Target, TargetStatus};
 use crate::layout;
+use crate::log;
 use crate::token;
 
 /// Clones one repo. `set -e` covers only the clone itself: failing to add the upstream remote
@@ -97,7 +98,9 @@ pub(super) async fn run_sync(shared: &Shared) -> Result<SyncReport> {
 pub(super) async fn refresh_catalog(shared: &Shared) {
     match with_db(shared, |db| db.catalog()).await {
         Ok(catalog) => shared.emitter.emit(Event::Catalog(catalog)),
-        Err(e) => tracing::warn!("couldn't build the repo lists: {e:#}"),
+        Err(e) => shared
+            .emitter
+            .log(log::Entry::error("Couldn't build the repo lists").detail(format!("{e:#}"))),
     }
 }
 
@@ -207,7 +210,13 @@ pub(super) async fn clone_repos(
             && destination.exists()
             && let Err(e) = std::fs::remove_dir_all(destination)
         {
-            tracing::warn!("couldn't remove {}: {e}", destination.display());
+            shared.emitter.log(
+                log::Entry::warning(format!(
+                    "Couldn't remove what's left of a failed clone at {}",
+                    destination.display()
+                ))
+                .detail(e.to_string()),
+            );
         }
     }
     shared.emitter.emit(Event::ClonesFinished(repo_ids));

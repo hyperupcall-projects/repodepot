@@ -1,4 +1,5 @@
 pub mod import;
+pub mod log;
 pub mod remote_list;
 pub mod repos;
 pub mod runner;
@@ -32,6 +33,31 @@ pub fn sort_header<K: PartialEq + Copy>(
             *descending = starts_descending;
         }
     }
+}
+
+/// `"42 ms"`, `"1.5 s"`, `"2m 05s"`.
+pub fn short_duration(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs_f32();
+    if secs >= 60.0 {
+        format!(
+            "{}m {:02}s",
+            duration.as_secs() / 60,
+            duration.as_secs() % 60
+        )
+    } else if secs >= 1.0 {
+        format!("{secs:.1} s")
+    } else {
+        format!("{} ms", duration.as_millis())
+    }
+}
+
+/// `"1 repo"`, `"1,203 repos"`.
+pub fn plural(n: usize, one: &str, many: &str) -> String {
+    format!(
+        "{} {}",
+        thousands(n as u64),
+        if n == 1 { one } else { many }
+    )
 }
 
 /// `12345` → `"12,345"`.

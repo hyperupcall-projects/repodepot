@@ -257,7 +257,6 @@ pub struct ReposPage {
     notice: Option<String>,
     /// `Some(latest progress message)` while a sync runs.
     syncing: Option<String>,
-    sync_report: Option<SyncReport>,
     catalog: Option<Catalog>,
     remote: ListState,
     ignored: ListState,
@@ -290,7 +289,6 @@ impl ReposPage {
             action_error: None,
             notice: None,
             syncing: None,
-            sync_report: None,
             catalog: None,
             remote: ListState::new(),
             ignored: ListState::new(),
@@ -313,11 +311,11 @@ impl ReposPage {
         self.syncing = Some(message);
     }
 
+    /// The sync's summary goes to the log; only a failure is shown here too.
     pub fn sync_finished(&mut self, result: Result<SyncReport, String>) {
         self.syncing = None;
-        match result {
-            Ok(report) => self.sync_report = Some(report),
-            Err(e) => self.action_error = Some(format!("Sync failed: {e}")),
+        if let Err(e) = result {
+            self.action_error = Some(format!("Sync failed: {e}"));
         }
     }
 
@@ -471,7 +469,7 @@ impl ReposPage {
         action
     }
 
-    /// Errors, notices and the last sync's summary.
+    /// Errors and notices.
     fn messages(&mut self, ui: &mut egui::Ui, action: &mut Option<ReposAction>) {
         if let Some(error) = &self.action_error {
             let mut dismiss = false;
@@ -494,44 +492,6 @@ impl ReposPage {
             });
             if dismiss {
                 self.notice = None;
-            }
-        }
-        if let Some(report) = &self.sync_report {
-            let mut dismiss = false;
-            ui.horizontal(|ui| {
-                let counts: Vec<String> = report
-                    .counts
-                    .iter()
-                    .map(|(source, count)| {
-                        format!("{}: {}", source.label(), thousands(*count as u64))
-                    })
-                    .collect();
-                ui.label(format!(
-                    "Synced in {}: {} repos listed",
-                    short_duration(report.took),
-                    thousands(report.relevant as u64)
-                ))
-                .on_hover_text(counts.join("\n"));
-                if report.new_forks > 0 {
-                    ui.weak(format!(
-                        "· {} new in Forks",
-                        plural(report.new_forks as u32, "fork", "forks")
-                    ));
-                }
-                if !report.warnings.is_empty() {
-                    ui.colored_label(
-                        ui.visuals().warn_fg_color,
-                        format!(
-                            "· ⚠ {}",
-                            plural(report.warnings.len() as u32, "warning", "warnings")
-                        ),
-                    )
-                    .on_hover_text(report.warnings.join("\n"));
-                }
-                dismiss = ui.small_button("Dismiss").clicked();
-            });
-            if dismiss {
-                self.sync_report = None;
             }
         }
     }
@@ -699,6 +659,7 @@ impl ReposPage {
                 }
             }
 
+            // Work in progress. When it's done, the log says how it went.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some((done, total)) = self.scanning {
                     if total > 0 {
@@ -707,19 +668,13 @@ impl ReposPage {
                         ui.label("Scanning…");
                     }
                     ui.spinner();
-                } else if let Some(Ok(scan)) = result {
-                    ui.weak(format!("Scanned in {}", short_duration(scan.took)))
-                        .on_hover_text(format!("Clone root: {}", scan.root.display()));
                 }
-                ui.separator();
                 if let Some(message) = &self.syncing {
+                    if self.scanning.is_some() {
+                        ui.separator();
+                    }
                     ui.label(format!("Syncing: {message}"));
                     ui.spinner();
-                } else if let Some(catalog) = catalog {
-                    match &catalog.last_sync {
-                        Some(when) => ui.weak(format!("Synced {when} UTC")),
-                        None => ui.weak("Never synced"),
-                    };
                 }
             });
         });
@@ -1622,14 +1577,6 @@ fn ahead_behind_text(ahead: u32, behind: u32) -> String {
         (a, 0) => format!("⬆{a}"),
         (0, b) => format!("⬇{b}"),
         (a, b) => format!("⬆{a} ⬇{b}"),
-    }
-}
-
-fn short_duration(duration: std::time::Duration) -> String {
-    if duration.as_secs() >= 1 {
-        format!("{:.1} s", duration.as_secs_f32())
-    } else {
-        format!("{} ms", duration.as_millis())
     }
 }
 

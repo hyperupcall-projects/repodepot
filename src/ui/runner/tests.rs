@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;

@@ -1,4 +1,5 @@
-//! The window: tabs along the top, status bar along the bottom.
+//! The window: tabs along the top, status bar along the bottom, and the log sidebar over the
+//! right edge when it's open.
 
 use eframe::egui;
 
@@ -7,13 +8,15 @@ use crate::backend::{
 };
 use crate::config::{Config, Paths, ThemeChoice};
 use crate::db::TagStore;
+use crate::log::Entry;
 use crate::system_theme::SystemTheme;
 use crate::tags::{self, CloneFacts, TagIndex};
+use crate::ui::log::LogView;
 use crate::ui::repos::{ReposAction, ReposContext, ReposPage};
 use crate::ui::runner::{RunnerAction, RunnerContext, RunnerPage};
 use crate::ui::settings::{SettingsContext, SettingsPage};
 use crate::ui::tags::{TagsAction, TagsContext, TagsPage};
-use crate::ui::thousands;
+use crate::ui::{plural, short_duration, thousands};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -56,6 +59,9 @@ pub struct App {
     auth: AuthState,
     db: Option<Result<DbInfo, String>>,
     system_theme: SystemTheme,
+    log: LogView,
+    /// Whether the log has said when GitHub was last synced, from the first repo lists or a sync.
+    logged_last_sync: bool,
 }
 
 impl App {
@@ -91,6 +97,8 @@ impl App {
             auth: AuthState::Checking,
             db: None,
             system_theme,
+            log: LogView::new(),
+            logged_last_sync: false,
         }
     }
 
@@ -146,7 +154,11 @@ impl App {
     }
 
     fn handle_event(&mut self, event: Event) {
+        for entry in log_entries(&event, &mut self.logged_last_sync) {
+            self.log.push(entry);
+        }
         match event {
+            Event::Log(entry) => self.log.push(entry),
             Event::Db(result) => self.db = Some(result),
             Event::Auth(state) => self.auth = state,
             Event::AccountMessage(message) => self.settings.set_account_message(message),
@@ -324,7 +336,7 @@ impl App {
         }));
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             match &self.auth {
                 AuthState::Checking => {
@@ -352,25 +364,99 @@ impl App {
                         .on_hover_text(error);
                 }
             }
-
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| match &self.db {
-                    None => {
-                        ui.weak("Opening database…");
-                    }
-                    Some(Ok(info)) => {
-                        ui.weak(format!("Database ready (schema v{})", info.schema_version))
-                            .on_hover_text(info.path.display().to_string());
-                    }
-                    Some(Err(e)) => {
-                        ui.colored_label(ui.visuals().error_fg_color, "Database error")
-                            .on_hover_text(e);
-                    }
-                },
-            );
+            ui.separator();
+            self.log.status(ui);
         });
     }
+}
+
+/// What an event means for the log, oldest first. `logged_last_sync` says whether the log has
+/// already said when GitHub was last synced.
+fn log_entries(event: &Event, logged_last_sync: &mut bool) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    let entry = match event {
+        Event::Db(Ok(info)) => {
+            Entry::info(format!("Database ready (schema v{})", info.schema_version))
+                .detail(info.path.display().to_string())
+        }
+        Event::Db(Err(e)) => Entry::error("Couldn't open the database").detail(e),
+        Event::Auth(state) => {
+            if let Some(e) = state.keyring_error() {
+                entries.push(Entry::warning("Couldn't read the system keyring").detail(e));
+            }
+            match state {
+                AuthState::Checking => return entries,
+                AuthState::NoToken { .. } => {
+                    Entry::warning("Not signed in to GitHub. Add a token in Settings.")
+                }
+                AuthState::SignedIn {
+                    viewer,
+                    rate,
+                    source,
+                    ..
+                } => {
+                    Entry::info(format!("Signed in to GitHub as {}", viewer.login)).detail(format!(
+                        "Token from {}. {} of {} API points left.",
+                        source.describe(),
+                        thousands(rate.remaining),
+                        thousands(rate.limit)
+                    ))
+                }
+                AuthState::Failed { error, .. } => {
+                    Entry::error("GitHub sign-in failed").detail(error)
+                }
+            }
+        }
+        Event::AccountMessage(Ok(message)) => Entry::info(message),
+        Event::AccountMessage(Err(message)) => Entry::error(message),
+        Event::Scan(Ok(scan)) => Entry::info(format!(
+            "Scanned {} in {}",
+            plural(scan.clones.len(), "clone", "clones"),
+            short_duration(scan.took)
+        ))
+        .detail(format!("Clone root: {}", scan.root.display())),
+        Event::Scan(Err(e)) => Entry::error("Scan failed").detail(e),
+        Event::SyncStarted => Entry::info("Syncing with GitHub…"),
+        Event::SyncFinished(Ok(report)) => {
+            *logged_last_sync = true;
+            for warning in &report.warnings {
+                entries.push(Entry::warning(format!("GitHub sync: {warning}")));
+            }
+            let mut message = format!(
+                "Synced with GitHub in {}: {} listed",
+                short_duration(report.took),
+                plural(report.relevant, "repo", "repos")
+            );
+            if report.new_forks > 0 {
+                message.push_str(&format!(
+                    ", {}",
+                    plural(report.new_forks, "new fork", "new forks")
+                ));
+            }
+            let counts: Vec<String> = report
+                .counts
+                .iter()
+                .map(|(source, count)| format!("{}: {}", source.label(), thousands(*count as u64)))
+                .collect();
+            Entry::info(message).detail(counts.join("\n"))
+        }
+        Event::SyncFinished(Err(e)) => Entry::error("Sync with GitHub failed").detail(e),
+        Event::Catalog(catalog) if !*logged_last_sync => {
+            *logged_last_sync = true;
+            match &catalog.last_sync {
+                Some(when) => Entry::info(format!("Last synced with GitHub on {when} UTC")),
+                None => Entry::info("Not synced with GitHub yet"),
+            }
+        }
+        Event::RepoNotice(message) => Entry::info(message),
+        Event::RepoActionFailed(message)
+        | Event::TagActionFailed(message)
+        | Event::LaunchFailed { message, .. } => Entry::error(message),
+        Event::ImportPreview(Err(e)) => Entry::error("Couldn't plan the import").detail(e),
+        _ => return entries,
+    };
+    entries.push(entry);
+    entries
 }
 
 impl eframe::App for App {
@@ -406,6 +492,9 @@ impl eframe::App for App {
 
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
 
+        // The log sidebar covers the right of whatever the central panel shows.
+        let content_rect = ui.available_rect_before_wrap();
+        self.log.handle_escape(ui);
         egui::CentralPanel::default_margins().show(ui, |ui| match self.tab {
             Tab::Repositories => {
                 let cx = ReposContext {
@@ -485,7 +574,133 @@ impl eframe::App for App {
                 }
             }
         });
+        self.log.sidebar(ui, content_rect);
         // A theme picked or a tab switched this frame shows from the next one.
         self.apply_theme(ui.ctx());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::backend::SyncReport;
+    use crate::db::{Catalog, Source};
+    use crate::github::{RateLimit, Viewer};
+    use crate::log::Level;
+    use crate::token::TokenSource;
+
+    fn logged(event: &Event, logged_last_sync: &mut bool) -> Vec<(Level, String)> {
+        log_entries(event, logged_last_sync)
+            .into_iter()
+            .map(|e| (e.level, e.message))
+            .collect()
+    }
+
+    #[test]
+    fn a_sync_logs_its_warnings_then_its_summary() {
+        let report = SyncReport {
+            relevant: 1203,
+            new_forks: 1,
+            counts: BTreeMap::from([(Source::Owned, 120), (Source::Contributed, 1050)]),
+            warnings: vec!["myorg: needs SSO approval".into()],
+            took: Duration::from_secs(125),
+        };
+        let mut logged_last_sync = false;
+        let entries = log_entries(&Event::SyncFinished(Ok(report)), &mut logged_last_sync);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].level, Level::Warning);
+        assert_eq!(entries[0].message, "GitHub sync: myorg: needs SSO approval");
+        assert_eq!(
+            entries[1].message,
+            "Synced with GitHub in 2m 05s: 1,203 repos listed, 1 new fork"
+        );
+        assert!(entries[1].detail.as_deref().unwrap().contains("1,050"));
+        // The sync is the latest word on when GitHub was synced.
+        assert!(logged_last_sync);
+        let catalog = Event::Catalog(Catalog::default());
+        assert!(logged(&catalog, &mut logged_last_sync).is_empty());
+    }
+
+    #[test]
+    fn the_last_sync_time_is_logged_once() {
+        let mut logged_last_sync = false;
+        let catalog = Event::Catalog(Catalog {
+            last_sync: Some("2026-11-21 18:00:00".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            logged(&catalog, &mut logged_last_sync),
+            [(
+                Level::Info,
+                "Last synced with GitHub on 2026-11-21 18:00:00 UTC".to_owned()
+            )]
+        );
+        assert!(logged(&catalog, &mut logged_last_sync).is_empty());
+
+        let mut logged_last_sync = false;
+        assert_eq!(
+            logged(&Event::Catalog(Catalog::default()), &mut logged_last_sync),
+            [(Level::Info, "Not synced with GitHub yet".to_owned())]
+        );
+    }
+
+    #[test]
+    fn finished_sign_in_checks_are_logged() {
+        let mut flag = false;
+        assert!(logged(&Event::Auth(AuthState::Checking), &mut flag).is_empty());
+        let signed_in = Event::Auth(AuthState::SignedIn {
+            viewer: Viewer {
+                login: "someone".into(),
+                name: None,
+            },
+            rate: RateLimit {
+                limit: 5000,
+                remaining: 4987,
+                reset_at: String::new(),
+            },
+            source: TokenSource::GhCli,
+            keyring_error: Some("no Secret Service".into()),
+        });
+        assert_eq!(
+            logged(&signed_in, &mut flag),
+            [
+                (
+                    Level::Warning,
+                    "Couldn't read the system keyring".to_owned()
+                ),
+                (Level::Info, "Signed in to GitHub as someone".to_owned()),
+            ]
+        );
+        let failed = Event::Auth(AuthState::Failed {
+            source: None,
+            error: "401 Bad credentials".into(),
+            keyring_error: None,
+        });
+        assert_eq!(
+            logged(&failed, &mut flag),
+            [(Level::Error, "GitHub sign-in failed".to_owned())]
+        );
+    }
+
+    #[test]
+    fn failures_and_backend_messages_are_logged() {
+        let mut flag = false;
+        assert_eq!(
+            logged(
+                &Event::RepoActionFailed("Couldn't ignore".into()),
+                &mut flag
+            ),
+            [(Level::Error, "Couldn't ignore".to_owned())]
+        );
+        assert_eq!(
+            logged(&Event::Scan(Err("no clone root".into())), &mut flag),
+            [(Level::Error, "Scan failed".to_owned())]
+        );
+        // `Event::Log` entries go straight to the log, not through here.
+        assert!(logged(&Event::Log(Entry::info("hi")), &mut flag).is_empty());
+        assert!(logged(&Event::ScanStarted, &mut flag).is_empty());
     }
 }

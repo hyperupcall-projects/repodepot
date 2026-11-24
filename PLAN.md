@@ -304,6 +304,12 @@ The exact flags get checked against each tool during the build.
 - **Backend → UI**: events come back over a channel, followed by `ctx.request_repaint()`. While output is streaming, repaints are limited to about 30 per second.
 - One SQLite connection, owned by the backend.
 
+### Log
+
+- Info, warnings and errors go to one log for the session, kept in memory (the latest 1,000). The backend sends entries as events, and the UI logs what other events mean: database opened, signed in, scan and sync results, failures. Every entry is also written to stderr through `tracing`.
+- The status bar shows the latest entry, plus how many warnings and errors came since the log was last open. Clicking it opens the log in a sidebar over the right edge of the window, newest first, with a toggle for each level. Esc or a click outside closes it.
+- Finished work is reported in the log, not next to the buttons that started it: the Repositories toolbar only shows a scan or sync while it runs.
+
 ### One job engine
 
 Clones and your own commands go through the same engine. It runs a process in N folders with a limit on how many run at once, live output, status, timeout and cancel. That way Part 1 gets the runner's output view at no extra cost. Status scans don't use it: they make quick, parsed git calls whose output nobody needs to read.
@@ -333,11 +339,13 @@ src/
   github/             GraphQL client, queries, sync, REST rename check
   git/                remote URL parsing, scan, status, clone, import
   layout.rs           letter folder + ~N path assignment
+  log.rs              log entries and levels
+  time.rs             UTC dates
   jobs/               engine, process groups, output buffers, ANSI parsing
   tags/               rules, exceptions, query parser, working set
   launchers.rs        presets, detection, workspace files
   ui/                 repos, remote list, ignored, forks, problems, import,
-                      tags, groups, runner, settings
+                      tags, groups, runner, settings, log
 ```
 
 ### Database (sketch)

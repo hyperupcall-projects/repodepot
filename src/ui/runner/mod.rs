@@ -5,7 +5,6 @@ mod text;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use eframe::egui;
 
@@ -14,6 +13,7 @@ use crate::db::{HistoryEntry, Snippet};
 use crate::git::scan::CloneInfo;
 use crate::jobs::{Run, Target};
 use crate::tags::TagIndex;
+use crate::ui::short_duration;
 use tab::{RunTab, TabAction};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -442,21 +442,6 @@ fn shorten(text: &str, max: usize) -> String {
     } else {
         let cut: String = text.chars().take(max - 1).collect();
         format!("{cut}…")
-    }
-}
-
-fn short_duration(duration: Duration) -> String {
-    let secs = duration.as_secs_f32();
-    if secs >= 60.0 {
-        format!(
-            "{}m {:02}s",
-            duration.as_secs() / 60,
-            duration.as_secs() % 60
-        )
-    } else if secs >= 1.0 {
-        format!("{secs:.1} s")
-    } else {
-        format!("{} ms", duration.as_millis())
     }
 }
 
