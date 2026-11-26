@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
     let system_theme = system_theme::SystemTheme::watch();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("depository")
+            .with_title("Repo Depot")
             .with_app_id("depository")
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([640.0, 420.0]),
