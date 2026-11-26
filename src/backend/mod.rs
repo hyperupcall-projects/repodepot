@@ -988,7 +988,7 @@ mod tests {
 
         use crate::db::{FetchedRepo, RepoMeta, Source};
 
-        let base = std::env::temp_dir().join(format!("depository-clone-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("repodepot-clone-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let sources = base.join("sources");
         let root = base.join("code");
@@ -1024,7 +1024,7 @@ mod tests {
 
         let paths = Paths {
             config_file: base.join("config.toml"),
-            db_file: base.join("data/depository.db"),
+            db_file: base.join("data/repodepot.db"),
             workspaces_dir: base.join("data/workspaces"),
         };
         {
@@ -1132,7 +1132,7 @@ mod tests {
     #[test]
     fn import_end_to_end() {
         let base =
-            std::env::temp_dir().join(format!("depository-import-e2e-{}", std::process::id()));
+            std::env::temp_dir().join(format!("repodepot-import-e2e-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let root = base.join("code");
         let old = base.join("old");
@@ -1181,7 +1181,7 @@ mod tests {
 
         let paths = Paths {
             config_file: base.join("config.toml"),
-            db_file: base.join("data/depository.db"),
+            db_file: base.join("data/repodepot.db"),
             workspaces_dir: base.join("data/workspaces"),
         };
         let config = Config {
@@ -1301,14 +1301,14 @@ mod tests {
     fn tag_commands_end_to_end() {
         use crate::tags::RuleField;
 
-        let base = std::env::temp_dir().join(format!("depository-tags-e2e-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("repodepot-tags-e2e-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let root = base.join("code");
         fs::create_dir_all(root.join("a/api")).unwrap();
         git(&root.join("a/api"), &["init", "-q"]);
         let paths = Paths {
             config_file: base.join("config.toml"),
-            db_file: base.join("data/depository.db"),
+            db_file: base.join("data/repodepot.db"),
             workspaces_dir: base.join("data/workspaces"),
         };
         let config = Config {
@@ -1395,7 +1395,7 @@ mod tests {
         use crate::launch::{LauncherSpec, WorkspaceKind};
 
         let base =
-            std::env::temp_dir().join(format!("depository-launch-e2e-{}", std::process::id()));
+            std::env::temp_dir().join(format!("repodepot-launch-e2e-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let log = base.join("calls.log");
@@ -1421,7 +1421,7 @@ mod tests {
         };
         let paths = Paths {
             config_file: base.join("config.toml"),
-            db_file: base.join("data/depository.db"),
+            db_file: base.join("data/repodepot.db"),
             workspaces_dir: base.join("data/workspaces"),
         };
         let mut config = Config::default();
@@ -1496,7 +1496,7 @@ mod tests {
     /// then starts a slow command everywhere and cancels it.
     #[test]
     fn scan_run_and_cancel_end_to_end() {
-        let base = std::env::temp_dir().join(format!("depository-backend-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("repodepot-backend-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let root = base.join("code");
         for (rel, dirty) in [("a/alpha", true), ("b/beta", false), ("g/gamma", true)] {
@@ -1504,12 +1504,12 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             git(&dir, &["init", "-q", "-b", "main"]);
             if dirty {
-                fs::write(dir.join("depository-untracked-9d1e"), "x").unwrap();
+                fs::write(dir.join("repodepot-untracked-9d1e"), "x").unwrap();
             }
         }
         let paths = Paths {
             config_file: base.join("config.toml"),
-            db_file: base.join("data/depository.db"),
+            db_file: base.join("data/repodepot.db"),
             workspaces_dir: base.join("data/workspaces"),
         };
         let config = Config {
@@ -1556,9 +1556,9 @@ mod tests {
         let outputs: Vec<Vec<String>> = (0..3)
             .map(|i| run.slot(i).output.iter().map(|l| l.text.clone()).collect())
             .collect();
-        assert_eq!(outputs[0], ["?? depository-untracked-9d1e"]);
+        assert_eq!(outputs[0], ["?? repodepot-untracked-9d1e"]);
         assert!(outputs[1].is_empty());
-        assert_eq!(outputs[2], ["?? depository-untracked-9d1e"]);
+        assert_eq!(outputs[2], ["?? repodepot-untracked-9d1e"]);
         // Finishing a run refreshes the status column and records the command (in either order).
         let (mut rescanned, mut recorded) = (false, None);
         let history = wait_for(&backend, "the rescan and the history", |event| {

@@ -21,13 +21,13 @@ use crate::token;
 /// Clones one repo. `set -e` covers only the clone itself: failing to add the upstream remote
 /// is reported but doesn't fail (and so doesn't delete) a good clone.
 const CLONE_SCRIPT: &str = r#"set -e
-git clone --progress --origin "$DEPO_REMOTE" $DEPO_CLONE_FLAGS -- "$DEPO_URL" "$DEPO_DEST"
+git clone --progress --origin "$REPODEPOT_REMOTE" $REPODEPOT_CLONE_FLAGS -- "$REPODEPOT_URL" "$REPODEPOT_DEST"
 set +e
-if [ -n "$DEPO_UPSTREAM_URL" ]; then
-  if git -C "$DEPO_DEST" remote add "$DEPO_UPSTREAM" "$DEPO_UPSTREAM_URL"; then
-    echo "Added remote $DEPO_UPSTREAM: $DEPO_UPSTREAM_URL"
+if [ -n "$REPODEPOT_UPSTREAM_URL" ]; then
+  if git -C "$REPODEPOT_DEST" remote add "$REPODEPOT_UPSTREAM" "$REPODEPOT_UPSTREAM_URL"; then
+    echo "Added remote $REPODEPOT_UPSTREAM: $REPODEPOT_UPSTREAM_URL"
   else
-    echo "Couldn't add remote $DEPO_UPSTREAM: $DEPO_UPSTREAM_URL" >&2
+    echo "Couldn't add remote $REPODEPOT_UPSTREAM: $REPODEPOT_UPSTREAM_URL" >&2
   fi
 fi
 exit 0"#;
@@ -166,15 +166,15 @@ pub(super) async fn clone_repos(
         });
         taken.insert(rel.to_lowercase());
         let env = [
-            ("DEPO_URL", item.ssh_url.clone()),
-            ("DEPO_DEST", rel.clone()),
-            ("DEPO_REMOTE", config.remotes.default_name.clone()),
-            ("DEPO_UPSTREAM", config.remotes.upstream_name.clone()),
+            ("REPODEPOT_URL", item.ssh_url.clone()),
+            ("REPODEPOT_DEST", rel.clone()),
+            ("REPODEPOT_REMOTE", config.remotes.default_name.clone()),
+            ("REPODEPOT_UPSTREAM", config.remotes.upstream_name.clone()),
             (
-                "DEPO_UPSTREAM_URL",
+                "REPODEPOT_UPSTREAM_URL",
                 item.upstream_url.clone().unwrap_or_default(),
             ),
-            ("DEPO_CLONE_FLAGS", flags.join(" ")),
+            ("REPODEPOT_CLONE_FLAGS", flags.join(" ")),
         ];
         targets.push(Target {
             name: item.full_name.clone(),

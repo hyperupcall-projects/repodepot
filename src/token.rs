@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::Result;
 
-const KEYRING_SERVICE: &str = "depository";
+const KEYRING_SERVICE: &str = "repodepot";
 const KEYRING_USER: &str = "github-token";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

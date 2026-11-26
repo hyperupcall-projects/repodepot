@@ -35,8 +35,7 @@ impl Drop for Folders {
 }
 
 fn fake_clones(test: &str, names: &[&str]) -> (Folders, Vec<CloneInfo>) {
-    let root =
-        std::env::temp_dir().join(format!("depository-runner-{test}-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("repodepot-runner-{test}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let clones = names
         .iter()
@@ -132,7 +131,7 @@ fn page_with_run<'a>(test: &str, command: &str) -> (Folders, Harness<'a, State>)
     (folders, h)
 }
 
-const MIXED: &str = r#"case "$DEPO_REPO" in
+const MIXED: &str = r#"case "$REPODEPOT_REPO" in
   beta) echo "hello from beta"; echo broke >&2; exit 4 ;;
   *) echo "Already up to date."; echo "hello there" ;;
 esac"#;
@@ -311,7 +310,7 @@ fn ticked_repos_run_in_a_new_tab() {
     h.run();
     assert_eq!(h.state().0.tabs.len(), 2);
     assert!(
-        h.query_by_label_contains("From case \"$DEPO_REPO\" in")
+        h.query_by_label_contains("From case \"$REPODEPOT_REPO\"")
             .is_some()
     );
 }
@@ -399,16 +398,16 @@ fn history_and_snippets() {
     );
 }
 
-/// Renders the Runner to PNGs when `DEPOSITORY_UI_SHOTS` names a folder.
+/// Renders the Runner to PNGs when `REPODEPOT_UI_SHOTS` names a folder.
 #[test]
 fn ui_shots() {
-    let Some(dir) = std::env::var_os("DEPOSITORY_UI_SHOTS").map(PathBuf::from) else {
+    let Some(dir) = std::env::var_os("REPODEPOT_UI_SHOTS").map(PathBuf::from) else {
         return;
     };
     fs::create_dir_all(&dir).unwrap();
     let (_folders, clones) = fake_clones("shots", &["facebook-react", "serde", "tokio", "notes"]);
     let run = finished_run(
-        r#"case "$DEPO_REPO" in
+        r#"case "$REPODEPOT_REPO" in
              serde) printf ' \033[31mM\033[0m src/de.rs\n\033[32m??\033[0m scratch.md\n' ;;
              tokio) echo 'fatal: not a git repository' >&2; exit 128 ;;
              *) echo 'Already up to date.' ;;

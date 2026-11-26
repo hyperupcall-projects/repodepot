@@ -89,7 +89,7 @@ pub(super) async fn open(shared: &Arc<Shared>, request: LaunchRequest) -> Result
     Ok(())
 }
 
-/// Starts an app in its own session with no input or output, so it outlives depository.
+/// Starts an app in its own session with no input or output, so it outlives Repo Depot.
 /// Reports a quick failure (a non-zero exit within a few seconds), and reaps the process.
 fn spawn_detached(shared: &Arc<Shared>, command: Vec<String>) -> Result<()> {
     let (program, args) = command.split_first().context("empty command")?;

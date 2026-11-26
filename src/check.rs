@@ -1,4 +1,4 @@
-//! `depository --check`: prints where things live and whether the database and GitHub
+//! `repodepot --check`: prints where things live and whether the database and GitHub
 //! sign-in work, without opening a window.
 
 use anyhow::Result;

@@ -1,4 +1,4 @@
-//! Settings stored in `~/.config/depository/config.toml`, plus the app's file locations.
+//! Settings stored in `~/.config/repodepot/config.toml`, plus the app's file locations.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -16,13 +16,13 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// XDG locations: `~/.config/depository/` and `~/.local/share/depository/`.
+    /// XDG locations: `~/.config/repodepot/` and `~/.local/share/repodepot/`.
     pub fn from_system() -> Result<Self> {
-        let dirs = directories::ProjectDirs::from("", "", "depository")
+        let dirs = directories::ProjectDirs::from("", "", "repodepot")
             .context("couldn't find the home directory")?;
         Ok(Self {
             config_file: dirs.config_dir().join("config.toml"),
-            db_file: dirs.data_dir().join("depository.db"),
+            db_file: dirs.data_dir().join("repodepot.db"),
             workspaces_dir: dirs.data_dir().join("workspaces"),
         })
     }
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn saved_config_loads_back_unchanged() {
-        let dir = std::env::temp_dir().join(format!("depository-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("repodepot-test-{}", std::process::id()));
         let path = dir.join("nested").join("config.toml");
         let config = Config {
             clone_root: Some(PathBuf::from("/srv/code")),
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn broken_file_falls_back_to_defaults_with_a_message() {
-        let dir = std::env::temp_dir().join(format!("depository-test-bad-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("repodepot-test-bad-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         fs::write(&path, "clone_root = [this is not toml").unwrap();

@@ -3891,10 +3891,10 @@ mod tests {
     }
 
     /// Renders the views to PNGs for a visual check. Only runs when
-    /// `DEPOSITORY_UI_SHOTS` names a folder: `DEPOSITORY_UI_SHOTS=/tmp/shots cargo test ui_shots`.
+    /// `REPODEPOT_UI_SHOTS` names a folder: `REPODEPOT_UI_SHOTS=/tmp/shots cargo test ui_shots`.
     #[test]
     fn ui_shots() {
-        let Some(dir) = std::env::var_os("DEPOSITORY_UI_SHOTS").map(PathBuf::from) else {
+        let Some(dir) = std::env::var_os("REPODEPOT_UI_SHOTS").map(PathBuf::from) else {
             return;
         };
         std::fs::create_dir_all(&dir).unwrap();

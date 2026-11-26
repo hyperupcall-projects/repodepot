@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("depository=info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("repodepot=info")),
         )
         .init();
 
@@ -36,13 +36,13 @@ fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Repo Depot")
-            .with_app_id("depository")
+            .with_app_id("repodepot")
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([640.0, 420.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "depository",
+        "Repo Depot",
         options,
         Box::new(move |cc| {
             system_theme.set_context(cc.egui_ctx.clone());

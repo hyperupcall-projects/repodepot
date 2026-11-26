@@ -455,7 +455,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.strong("depository");
+                ui.strong("Repo Depot");
                 ui.separator();
                 for tab in Tab::ALL {
                     let running = self.runner.running_count();

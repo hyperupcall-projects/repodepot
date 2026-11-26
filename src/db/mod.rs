@@ -1,4 +1,4 @@
-//! The SQLite database in `~/.local/share/depository/depository.db`.
+//! The SQLite database in `~/.local/share/repodepot/repodepot.db`.
 
 pub mod github;
 mod tags;
@@ -28,8 +28,8 @@ const MIGRATIONS: &[M<'static>] = &[
 ];
 
 /// Stamped into every database this app creates (SQLite's `application_id`), so a file
-/// written by some other program (even one also called depository) is never mistaken for ours.
-const APPLICATION_ID: i32 = 0x4445_504F; // "DEPO"
+/// written by some other program (even one also called Repo Depot) is never mistaken for ours.
+const APPLICATION_ID: i32 = 0x4445_504F; // "DEPO", for Depot
 
 /// Tables and columns each migration creates; a database without a stamp must have all of
 /// them (up to its version) to count as ours.
@@ -136,7 +136,7 @@ impl Db {
         // Before anything writes to the file: make sure it's ours.
         check_owner(&conn).map_err(|problem| {
             anyhow::anyhow!(
-                "{} {problem} depository hasn't changed it. Move it somewhere else (depository \
+                "{} {problem} Repo Depot hasn't changed it. Move it somewhere else (Repo Depot \
                  will start a new one), or give the other program its own folder.",
                 path.display()
             )
@@ -391,7 +391,7 @@ fn check_owner(conn: &Connection) -> std::result::Result<(), String> {
     }
     if application_id != 0 {
         return Err(
-            "belongs to a different program (its SQLite application ID isn't depository's).".into(),
+            "belongs to a different program (its SQLite application ID isn't Repo Depot's).".into(),
         );
     }
     let version = query("PRAGMA user_version")?;
@@ -401,7 +401,7 @@ fn check_owner(conn: &Connection) -> std::result::Result<(), String> {
     }
     if version > MIGRATIONS.len() as i64 {
         return Err(format!(
-            "is at schema version {version}, newer than this build of depository knows \
+            "is at schema version {version}, newer than this build of Repo Depot knows \
              (it knows up to {}).",
             MIGRATIONS.len()
         ));
@@ -421,7 +421,7 @@ fn check_owner(conn: &Connection) -> std::result::Result<(), String> {
             .map_err(|e| format!("couldn't be read: {e}."))?;
         if let Some(missing) = columns.iter().find(|c| !present.iter().any(|p| p == *c)) {
             return Err(format!(
-                "was written by a different program, maybe another app also called depository: \
+                "was written by a different program, maybe another app also called Repo Depot: \
                  its {table} table has no {missing} column, so its layout isn't this app's."
             ));
         }
@@ -524,10 +524,10 @@ mod tests {
 
     fn temp_db(test: &str) -> std::path::PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("depository-owner-{test}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("repodepot-owner-{test}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        dir.join("depository.db")
+        dir.join("repodepot.db")
     }
 
     #[test]
@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn other_programs_databases_are_refused_untouched() {
-        // Shaped like the other depository's: same version number, different columns.
+        // Shaped like the other Repo Depot's: same version number, different columns.
         let path = temp_db("foreign");
         {
             let conn = Connection::open(&path).unwrap();

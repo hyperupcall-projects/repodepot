@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Builds depository and installs it for the current user as the desktop application "Repo Depot":
-# the binary, its icon and a launcher entry. Set PREFIX to install somewhere other than ~/.local.
+# Builds Repo Depot and installs it for the current user as a desktop application: the binary,
+# its icon and a launcher entry. Set PREFIX to install somewhere other than ~/.local.
 #
 #   scripts/install.sh              build and install
 #   scripts/install.sh --uninstall  remove what an install put there
 set -euo pipefail
 
-app_id=depository # the window's app id, so the desktop matches open windows to this entry
+app_id=repodepot # the window's app id, so the desktop matches open windows to this entry
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 prefix=${PREFIX:-$HOME/.local}
 bin=$prefix/bin/$app_id

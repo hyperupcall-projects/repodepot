@@ -736,7 +736,7 @@ mod tests {
     /// Builds a real clone root with git and scans it.
     #[tokio::test]
     async fn scans_a_real_folder() {
-        let root = std::env::temp_dir().join(format!("depository-scan-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("repodepot-scan-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
 
@@ -764,7 +764,7 @@ mod tests {
         make_repo("r/react", &[("me", "git@github.com:facebook/react.git")]);
         let dirty = make_repo("n/notes", &[]);
         // An unusual name, so no global gitignore hides it.
-        fs::write(dirty.join("depository-untracked-c7f3"), "x").unwrap();
+        fs::write(dirty.join("repodepot-untracked-c7f3"), "x").unwrap();
         make_repo(
             "t/thing",
             &[

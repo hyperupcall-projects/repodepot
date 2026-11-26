@@ -916,10 +916,10 @@ mod tests {
         assert!(h.query_by_label("Tag ⏶").is_none());
     }
 
-    /// Renders the Tags view when `DEPOSITORY_UI_SHOTS` names a folder.
+    /// Renders the Tags view when `REPODEPOT_UI_SHOTS` names a folder.
     #[test]
     fn ui_shots() {
-        let Some(dir) = std::env::var_os("DEPOSITORY_UI_SHOTS").map(PathBuf::from) else {
+        let Some(dir) = std::env::var_os("REPODEPOT_UI_SHOTS").map(PathBuf::from) else {
             return;
         };
         std::fs::create_dir_all(&dir).unwrap();

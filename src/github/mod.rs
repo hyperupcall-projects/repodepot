@@ -12,7 +12,7 @@ const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 
 pub fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
-        .user_agent(concat!("depository/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("repodepot/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()
         .context("couldn't create the HTTP client")

@@ -1,4 +1,4 @@
-# depository — plan
+# Repo Depot — plan
 
 A Rust + egui desktop app (Linux first) for managing the GitHub repositories I care about: finding them, cloning them into a predictable folder layout, tagging them, and opening them or running commands across groups of them. State is kept in SQLite.
 
@@ -29,7 +29,7 @@ A Rust + egui desktop app (Linux first) for managing the GitHub repositories I c
 
 ## Settings and storage
 
-- **Settings** live in `~/.config/depository/config.toml`. You can edit them in the app's Settings tab or by hand:
+- **Settings** live in `~/.config/repodepot/config.toml`. You can edit them in the app's Settings tab or by hand:
   - clone root
   - default remote name (`me`)
   - upstream remote name (`upstream`)
@@ -40,8 +40,8 @@ A Rust + egui desktop app (Linux first) for managing the GitHub repositories I c
   - launchers (editor command templates)
   - how many windows can open before the app asks first (default 10)
   - theme: system (default), light or dark. System follows the desktop's `color-scheme` from the XDG desktop portal, live; with no answer it's dark
-- **State** lives in `~/.local/share/depository/depository.db` (SQLite in WAL mode, with versioned migrations).
-- **Workspace files** live in `~/.local/share/depository/workspaces/`.
+- **State** lives in `~/.local/share/repodepot/repodepot.db` (SQLite in WAL mode, with versioned migrations).
+- **Workspace files** live in `~/.local/share/repodepot/workspaces/`.
 - **GitHub token**: the app looks in the OS keyring first (KWallet, through the Secret Service API), then `GITHUB_TOKEN`, then `gh auth token`. The token is never written to the database, the config file, or any clone URL.
   - Use a classic token with the `repo` and `read:org` scopes, or gh's own token. Fine-grained tokens only cover one owner, so they miss contributions to other orgs.
   - Orgs that use SAML single sign-on need the token authorized for that org. Show this as a hint when an org returns an SSO error.
@@ -260,7 +260,7 @@ The app asks before opening more windows than the threshold in settings.
 
 - Presets ship for the editors below, and any other app can be added in settings.
 - Only installed launchers are shown, whether found on `PATH` or as a Flatpak.
-- Launched apps are detached (their own session, no stdin/stdout), so quitting depository doesn't close them.
+- Launched apps are detached (their own session, no stdin/stdout), so quitting Repo Depot doesn't close them.
 
 | Launcher | Open each | Open together |
 |---|---|---|
@@ -305,9 +305,9 @@ The exact flags get checked against each tool during the build.
 - **Command**: runs as `$SHELL -c '<command>'` (the shell is configurable), with the clone as the working directory. Interactive aliases aren't loaded, and the UI says so.
 - **No input**: stdin is `/dev/null` and `GIT_TERMINAL_PROMPT=0` is set, so nothing waits for input.
 - **Environment variables** for each clone:
-  - `DEPO_REPO` (`owner/name`)
-  - `DEPO_PATH`
-  - `DEPO_TAGS` (comma-separated)
+  - `REPODEPOT_REPO` (`owner/name`)
+  - `REPODEPOT_PATH`
+  - `REPODEPOT_TAGS` (comma-separated)
 - **Limits**: a cap on how many commands run at once (from settings, changeable per run) and an optional timeout.
 - **Cancel**: each process gets its own session (and so its own process group). Cancelling (one repo or all) sends SIGTERM to the group, then SIGKILL after a few seconds, so child processes die too. Having no terminal also means ssh asks for key passphrases through your desktop's askpass dialog instead of the terminal the app was started from.
 - **After a run** finishes, the status column refreshes for those clones.

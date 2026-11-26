@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn existence_ignores_case() {
-        let root = std::env::temp_dir().join(format!("depository-layout-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("repodepot-layout-{}", std::process::id()));
         std::fs::create_dir_all(root.join("r/React")).unwrap();
         assert!(exists_ignoring_case(&root, "r/react"));
         assert!(exists_ignoring_case(&root, "r/REACT"));

@@ -364,9 +364,9 @@ fn spawn(shell: &str, command: &str, target: &Target, colors: bool) -> std::io::
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("DEPO_REPO", &target.name)
-        .env("DEPO_PATH", &target.path)
-        .env("DEPO_TAGS", target.tags.join(","))
+        .env("REPODEPOT_REPO", &target.name)
+        .env("REPODEPOT_PATH", &target.path)
+        .env("REPODEPOT_TAGS", target.tags.join(","))
         .envs(target.env.iter().map(|(k, v)| (k, v)))
         .kill_on_drop(true);
     if colors {
@@ -486,7 +486,7 @@ mod tests {
     impl Folders {
         fn new(test: &str, names: &[&str]) -> Self {
             let root =
-                std::env::temp_dir().join(format!("depository-jobs-{test}-{}", std::process::id()));
+                std::env::temp_dir().join(format!("repodepot-jobs-{test}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             let targets = names
                 .iter()
@@ -497,7 +497,7 @@ mod tests {
                         name: (*name).to_owned(),
                         path,
                         tags: vec!["work".into(), "rust".into()],
-                        env: vec![("DEPO_EXTRA".into(), format!("extra-{name}"))],
+                        env: vec![("REPODEPOT_EXTRA".into(), format!("extra-{name}"))],
                     }
                 })
                 .collect();
@@ -555,7 +555,7 @@ mod tests {
     async fn exit_codes_and_streams() {
         let folders = Folders::new("exit", &["a/one", "b/two"]);
         let run = finish(spec(
-            r#"echo "out $DEPO_REPO"; echo err >&2; [ "$DEPO_REPO" = a/one ] && exit 3; true"#,
+            r#"echo "out $REPODEPOT_REPO"; echo err >&2; [ "$REPODEPOT_REPO" = a/one ] && exit 3; true"#,
             &folders.targets,
         ))
         .await;
@@ -586,7 +586,7 @@ mod tests {
     async fn environment_and_working_directory() {
         let folders = Folders::new("env", &["me/thing"]);
         let run = finish(spec(
-            r#"echo "$DEPO_PATH|$DEPO_TAGS|$GIT_TERMINAL_PROMPT|$DEPO_EXTRA"; pwd -P; printf 'no newline'"#,
+            r#"echo "$REPODEPOT_PATH|$REPODEPOT_TAGS|$GIT_TERMINAL_PROMPT|$REPODEPOT_EXTRA"; pwd -P; printf 'no newline'"#,
             &folders.targets,
         ))
         .await;

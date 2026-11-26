@@ -14,20 +14,20 @@ use crate::jobs::{RunSpec, Target};
 /// Moves one repo. `mv` renames when it can and copies across filesystems; `-n` refuses to
 /// overwrite, and the check afterwards turns a refusal into a failure.
 const MOVE_SCRIPT: &str = r#"set -e
-mkdir -p -- "$(dirname -- "$DEPO_DEST")"
-mv -n -T -- "$DEPO_SOURCE" "$DEPO_DEST"
-if [ -e "$DEPO_SOURCE" ]; then
-  echo "Not moved: something is already at $DEPO_DEST" >&2
+mkdir -p -- "$(dirname -- "$REPODEPOT_DEST")"
+mv -n -T -- "$REPODEPOT_SOURCE" "$REPODEPOT_DEST"
+if [ -e "$REPODEPOT_SOURCE" ]; then
+  echo "Not moved: something is already at $REPODEPOT_DEST" >&2
   exit 1
 fi
-echo "Moved $DEPO_SOURCE to $DEPO_DEST"
+echo "Moved $REPODEPOT_SOURCE to $REPODEPOT_DEST"
 set +e
-if [ -n "$(ls -A "$DEPO_DEST/.git/worktrees" 2>/dev/null)" ]; then
-  git -C "$DEPO_DEST" worktree repair && echo "Repaired linked worktrees"
+if [ -n "$(ls -A "$REPODEPOT_DEST/.git/worktrees" 2>/dev/null)" ]; then
+  git -C "$REPODEPOT_DEST" worktree repair && echo "Repaired linked worktrees"
 fi
-if [ -n "$DEPO_RENAME_ORIGIN" ]; then
-  git -C "$DEPO_DEST" remote rename origin "$DEPO_RENAME_ORIGIN" \
-    && echo "Renamed remote origin to $DEPO_RENAME_ORIGIN"
+if [ -n "$REPODEPOT_RENAME_ORIGIN" ]; then
+  git -C "$REPODEPOT_DEST" remote rename origin "$REPODEPOT_RENAME_ORIGIN" \
+    && echo "Renamed remote origin to $REPODEPOT_RENAME_ORIGIN"
 fi
 exit 0"#;
 
@@ -111,9 +111,12 @@ pub(super) async fn run_import(
                 path: root.clone(),
                 tags: Vec::new(),
                 env: vec![
-                    ("DEPO_SOURCE".to_owned(), m.source.display().to_string()),
-                    ("DEPO_DEST".to_owned(), m.destination.clone()),
-                    ("DEPO_RENAME_ORIGIN".to_owned(), rename),
+                    (
+                        "REPODEPOT_SOURCE".to_owned(),
+                        m.source.display().to_string(),
+                    ),
+                    ("REPODEPOT_DEST".to_owned(), m.destination.clone()),
+                    ("REPODEPOT_RENAME_ORIGIN".to_owned(), rename),
                 ],
             }
         })

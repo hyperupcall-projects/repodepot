@@ -37,7 +37,7 @@ pub struct RunnerContext<'a> {
     /// The latest scan's clones, if there is one.
     pub clones: Option<&'a [CloneInfo]>,
     pub config: &'a Config,
-    /// For each target's `DEPO_TAGS`.
+    /// For each target's `REPODEPOT_TAGS`.
     pub tags: &'a TagIndex,
 }
 
