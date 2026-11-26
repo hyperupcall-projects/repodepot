@@ -21,7 +21,9 @@ use crate::ui::import::ImportPage;
 use crate::ui::remote_list::{
     self, ForkShow, ForksContext, ForksState, ListContext, ListKind, ListState, SourceFilter,
 };
-use crate::ui::selection::{ActionBar, BarContext, Selection, Targets, selectable_row};
+use crate::ui::selection::{
+    Extras, PanelContext, Rows, Selection, SelectionPanel, Targets, selectable_row,
+};
 use crate::ui::tags::{TagsAction, TagsContext, TagsPage, tag_summary};
 use crate::ui::{sort_header, thousands};
 
@@ -325,15 +327,15 @@ pub struct ReposPage {
     languages: Vec<String>,
     sort: SortKey,
     descending: bool,
-    /// Local Clones' selection, by clone ID. With one clone selected, its details show.
+    /// Local Clones' selection, by clone ID. With one clone selected, the panel has its details.
     clones_selection: Selection,
     /// Problems' selection, by clone ID.
     problems_selection: Selection,
     /// A link chose a clone to show in Local Clones: if the view's own filters hide it, they
     /// are cleared.
     reveal: bool,
-    /// Above each list, for acting on the selection.
-    bar: ActionBar,
+    /// On the right of each list but Tags and Import, for acting on the selection.
+    panel: SelectionPanel,
     /// `Some((done, total))` while a scan runs.
     scanning: Option<(usize, usize)>,
     result: Option<Result<ScanResult, String>>,
@@ -353,8 +355,6 @@ pub struct ReposPage {
     import: ImportPage,
     /// The Tags view: the rules, their search and the rule editor.
     tags: TagsPage,
-    /// The "add tag" field in the details panel.
-    new_tag: String,
 }
 
 impl ReposPage {
@@ -374,7 +374,7 @@ impl ReposPage {
             clones_selection: Selection::new(),
             problems_selection: Selection::new(),
             reveal: false,
-            bar: ActionBar::new(),
+            panel: SelectionPanel::new(),
             scanning: None,
             result: None,
             action_error: None,
@@ -389,7 +389,6 @@ impl ReposPage {
             upstream_name: "upstream".to_owned(),
             import: ImportPage::new(),
             tags: TagsPage::new(),
-            new_tag: String::new(),
         }
     }
 
@@ -499,6 +498,11 @@ impl ReposPage {
         };
         // A query that's still being typed (or is wrong) doesn't filter; the toolbar says why.
         let valid_query = tag_query.as_ref().and_then(|q| q.as_ref().ok());
+        // Before any text field can take Ctrl+A or Escape for itself.
+        if self.selection().is_some() {
+            self.panel.read_keys(ui);
+        }
+        let selected_before = self.selection().map(Selection::len);
 
         self.tabs(ui, result.as_ref(), catalog.as_ref(), &mut action);
         ui.separator();
@@ -517,12 +521,12 @@ impl ReposPage {
 
         let summaries = catalog.as_ref().map(|c| &c.summaries);
         let tag_group = self.tag_group(valid_query.is_some());
-        let bar_cx = BarContext {
+        let panel_cx = PanelContext {
             launchers: cx.launchers,
             confirm_over: cx.confirm_over,
             rows: match self.view {
-                View::LocalClones | View::Problems => "clones",
-                _ => "repos",
+                View::LocalClones | View::Problems => Rows::Clones,
+                _ => Rows::Repos,
             },
             tag_group: tag_group.as_deref(),
             view: self.view.title(),
@@ -550,7 +554,7 @@ impl ReposPage {
                     ui,
                     (catalog.as_ref(), clones),
                     (cx.repo_tags, valid_query),
-                    &bar_cx,
+                    &panel_cx,
                     &mut action,
                 );
             }
@@ -570,13 +574,13 @@ impl ReposPage {
                 }
                 Some(Ok(scan)) => match self.view {
                     View::Problems => {
-                        self.problems_view(ui, (scan, summaries), &bar_cx, &mut action);
+                        self.problems_view(ui, (scan, summaries), &panel_cx, &mut action);
                     }
                     _ => self.clones_view(
                         ui,
                         (scan, summaries),
                         (cx.tags, cx.rules, valid_query),
-                        (cx.launchers, &bar_cx),
+                        &panel_cx,
                         &mut action,
                     ),
                 },
@@ -585,6 +589,11 @@ impl ReposPage {
 
         self.result = result;
         self.catalog = catalog;
+        // The Selection button above the list was drawn with the count from before.
+        if self.selection().map(Selection::len) != selected_before {
+            ui.ctx().request_repaint();
+        }
+        self.panel.end_frame(ui);
         match &action {
             Some(ReposAction::PreviewImport { folder, .. }) => {
                 self.view = View::Import;
@@ -638,6 +647,18 @@ impl ReposPage {
         }
     }
 
+    /// The current view's selection, if its rows can be selected.
+    fn selection(&self) -> Option<&Selection> {
+        match self.view {
+            View::RemoteList => Some(&self.remote.selection),
+            View::Ignored => Some(&self.ignored.selection),
+            View::Forks => Some(&self.forks.selection),
+            View::LocalClones => Some(&self.clones_selection),
+            View::Problems => Some(&self.problems_selection),
+            View::Tags | View::Import => None,
+        }
+    }
+
     /// The tag query, when it's the only filter narrowing the view (the toggles aside).
     fn tag_group(&self, query_valid: bool) -> Option<String> {
         let tag = self.tag_filter.trim();
@@ -655,7 +676,7 @@ impl ReposPage {
         ui: &mut egui::Ui,
         (catalog, clones): (Option<&Catalog>, &[CloneInfo]),
         (tags, tag_query): (&TagIndex, Option<&Query>),
-        bar_cx: &BarContext<'_>,
+        panel_cx: &PanelContext<'_>,
         action: &mut Option<ReposAction>,
     ) {
         let Some(catalog) = catalog else {
@@ -689,28 +710,26 @@ impl ReposPage {
             tags,
             cloning: &self.cloning,
             clones,
+            owners: &catalog.manual_owners,
         };
-        let bar = (&mut self.bar, bar_cx);
+        let panel = (&mut self.panel, panel_cx);
         match self.view {
-            View::RemoteList => {
-                remote_list::manual_owners(ui, &catalog.manual_owners, action);
-                remote_list::repo_list(
-                    ui,
-                    ListKind::Remote,
-                    (&catalog.inbox, &catalog.ignored_remote),
-                    &mut self.remote,
-                    &list,
-                    bar,
-                    action,
-                );
-            }
+            View::RemoteList => remote_list::repo_list(
+                ui,
+                ListKind::Remote,
+                (&catalog.inbox, &catalog.ignored_remote),
+                &mut self.remote,
+                &list,
+                panel,
+                action,
+            ),
             View::Ignored => remote_list::repo_list(
                 ui,
                 ListKind::Ignored,
                 (&catalog.ignored, &[]),
                 &mut self.ignored,
                 &list,
-                bar,
+                panel,
                 action,
             ),
             _ => {
@@ -720,7 +739,7 @@ impl ReposPage {
                     ignored: &self.ignored_repos,
                     clones,
                 };
-                remote_list::forks_view(ui, catalog, &forks, &mut self.forks, bar, action);
+                remote_list::forks_view(ui, catalog, &forks, &mut self.forks, panel, action);
             }
         }
     }
@@ -839,82 +858,104 @@ impl ReposPage {
             });
         }
 
+        let selected = self.selection().map(Selection::len);
         egui::Frame::new()
             .fill(ui.visuals().faint_bg_color)
             .corner_radius(4.0)
             .inner_margin(egui::Margin::symmetric(6, 3))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new(self.view.title()).strong())
-                        .on_hover_text("Filters only this view has");
-                    ui.separator();
-                    match self.view {
-                        View::RemoteList | View::Ignored => {
-                            combo(
-                                ui,
-                                ("Source", "repos_source"),
-                                &mut self.source,
-                                SourceFilter::ALL.map(|s| (s, s.label())),
-                            );
+                // The panel's button on the right, over the panel; the filters wrap to its left.
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(count) = selected {
+                            self.panel.toggle(ui, count);
                             ui.separator();
-                            keep_together(ui, 280.0);
-                            self.tag_filter_field(ui, cx, (scan, catalog), tag_query);
                         }
-                        View::LocalClones => {
-                            combo(
-                                ui,
-                                ("Show", "repos_show"),
-                                &mut self.show,
-                                Show::ALL.map(|s| (s, s.label())),
-                            );
-                            ui.separator();
-                            keep_together(ui, 220.0);
-                            self.branch_field(ui, scan);
-                            ui.separator();
-                            keep_together(ui, 280.0);
-                            self.tag_filter_field(ui, cx, (scan, catalog), tag_query);
-                        }
-                        View::Forks => {
-                            combo(
-                                ui,
-                                ("Show", "forks_show"),
-                                &mut self.fork_show,
-                                ForkShow::ALL.map(|s| (s, s.label())),
-                            );
-                        }
-                        View::Problems => {
-                            combo(
-                                ui,
-                                ("Show", "problems_show"),
-                                &mut self.problem_show,
-                                ProblemShow::options().map(|s| (s, s.label())),
-                            );
-                        }
-                        View::Tags => {
-                            keep_together(ui, 280.0);
-                            self.tags.search_field(ui);
-                        }
-                        View::Import => {}
-                    }
-
-                    if self.any_filter() {
-                        ui.separator();
-                        if ui
-                            .button("Clear filters")
-                            .on_hover_text(if self.view == View::Tags {
-                                "Empty the search and show every rule"
-                            } else {
-                                "Empty the search, language, branch and tag fields and show \
-                                 everything; the toggles stay as they are"
-                            })
-                            .clicked()
-                        {
-                            self.clear_filters();
-                        }
-                    }
+                        let wrapped =
+                            egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true);
+                        ui.with_layout(wrapped, |ui| {
+                            self.view_filters(ui, (cx, tag_query), (scan, catalog))
+                        });
+                    });
                 });
             });
+    }
+
+    /// The filters only the current view has, then Clear filters.
+    fn view_filters(
+        &mut self,
+        ui: &mut egui::Ui,
+        (cx, tag_query): (&ReposContext<'_>, Option<&Result<Query, String>>),
+        (scan, catalog): (Option<&ScanResult>, Option<&Catalog>),
+    ) {
+        ui.label(egui::RichText::new(self.view.title()).strong())
+            .on_hover_text("Filters only this view has");
+        ui.separator();
+        match self.view {
+            View::RemoteList | View::Ignored => {
+                combo(
+                    ui,
+                    ("Source", "repos_source"),
+                    &mut self.source,
+                    SourceFilter::ALL.map(|s| (s, s.label())),
+                );
+                ui.separator();
+                keep_together(ui, 280.0);
+                self.tag_filter_field(ui, cx, (scan, catalog), tag_query);
+            }
+            View::LocalClones => {
+                combo(
+                    ui,
+                    ("Show", "repos_show"),
+                    &mut self.show,
+                    Show::ALL.map(|s| (s, s.label())),
+                );
+                ui.separator();
+                keep_together(ui, 220.0);
+                self.branch_field(ui, scan);
+                ui.separator();
+                keep_together(ui, 280.0);
+                self.tag_filter_field(ui, cx, (scan, catalog), tag_query);
+            }
+            View::Forks => {
+                combo(
+                    ui,
+                    ("Show", "forks_show"),
+                    &mut self.fork_show,
+                    ForkShow::ALL.map(|s| (s, s.label())),
+                );
+            }
+            View::Problems => {
+                combo(
+                    ui,
+                    ("Show", "problems_show"),
+                    &mut self.problem_show,
+                    ProblemShow::options().map(|s| (s, s.label())),
+                );
+            }
+            View::Tags => {
+                keep_together(ui, 280.0);
+                self.tags.search_field(ui);
+            }
+            View::Import => {}
+        }
+
+        if self.any_filter() {
+            ui.separator();
+            if ui
+                .button("Clear filters")
+                .on_hover_text(if self.view == View::Tags {
+                    "Empty the search and show every rule"
+                } else {
+                    "Empty the search, language, branch and tag fields and show \
+                     everything; the toggles stay as they are"
+                })
+                .clicked()
+            {
+                self.clear_filters();
+            }
+        }
     }
 
     /// Something narrows the current view, besides the toggles.
@@ -1187,7 +1228,7 @@ impl ReposPage {
         ui: &mut egui::Ui,
         (scan, summaries): (&ScanResult, Option<&HashMap<i64, RepoSummary>>),
         (tags, rules, tag_query): (&TagIndex, &[Rule], Option<&Query>),
-        (launchers, bar_cx): (&[LauncherInfo], &BarContext<'_>),
+        panel_cx: &PanelContext<'_>,
         action: &mut Option<ReposAction>,
     ) {
         let mut rows = self.clone_rows((scan, summaries), tags, tag_query);
@@ -1202,35 +1243,31 @@ impl ReposPage {
             rows = self.clone_rows((scan, summaries), tags, None);
         }
         let order: Vec<i64> = rows.iter().map(|c| c.id).collect();
-        self.clones_selection.retain(&order);
+        self.panel.update(&mut self.clones_selection, &order);
         let targets = Targets::clones(self.clones_selection.in_order(&order));
-        self.bar.show(
+        // With one clone selected, the panel shows its tags and details too.
+        let single = self
+            .clones_selection
+            .single()
+            .and_then(|id| scan.clones.iter().find(|c| c.id == id));
+        let extras = match single {
+            Some(clone) => Extras {
+                tags: Some(Box::new(move |ui, action| {
+                    clone_tags(ui, clone.id, tags, rules, action);
+                })),
+                details: Some(Box::new(move |ui, action| details(ui, clone, action))),
+                ..Extras::default()
+            },
+            None => Extras::default(),
+        };
+        self.panel.show(
             ui,
             (&mut self.clones_selection, &order),
             &targets,
-            bar_cx,
-            |_| None,
+            panel_cx,
+            extras,
             action,
         );
-        ui.add_space(4.0);
-
-        if let Some(id) = self.clones_selection.single()
-            && let Some(clone) = scan.clones.iter().find(|c| c.id == id)
-        {
-            let mut close = false;
-            egui::Panel::right("clone_details")
-                .resizable(true)
-                .default_size(400.0)
-                .min_size(280.0)
-                .show(ui, |ui| {
-                    close = details(ui, clone, launchers, action);
-                    ui.add_space(10.0);
-                    tags_section(ui, clone.id, tags, rules, &mut self.new_tag, action);
-                });
-            if close {
-                self.clones_selection.clear();
-            }
-        }
 
         if rows.is_empty() {
             ui.add_space(8.0);
@@ -1244,7 +1281,7 @@ impl ReposPage {
 
         // Selectable labels would swallow clicks meant for selecting the row.
         ui.style_mut().interaction.selectable_labels = false;
-        // When the details panel leaves too little room, scroll sideways instead of overlapping it.
+        // When the panel leaves too little room, scroll sideways instead of overlapping it.
         egui::ScrollArea::horizontal()
             .auto_shrink(false)
             .show(ui, |ui| self.clones_table(ui, (&rows, &order), tags));
@@ -1338,7 +1375,7 @@ impl ReposPage {
         &mut self,
         ui: &mut egui::Ui,
         (scan, summaries): (&ScanResult, Option<&HashMap<i64, RepoSummary>>),
-        bar_cx: &BarContext<'_>,
+        panel_cx: &PanelContext<'_>,
         action: &mut Option<ReposAction>,
     ) {
         if scan.problem_count() == 0 {
@@ -1398,17 +1435,16 @@ impl ReposPage {
             .iter()
             .flat_map(|(_, entries)| entries.iter().map(|(c, _)| c.id))
             .collect();
-        self.problems_selection.retain(&order);
+        self.panel.update(&mut self.problems_selection, &order);
         let targets = Targets::clones(self.problems_selection.in_order(&order));
-        self.bar.show(
+        self.panel.show(
             ui,
             (&mut self.problems_selection, &order),
             &targets,
-            bar_cx,
-            |_| None,
+            panel_cx,
+            Extras::default(),
             action,
         );
-        ui.add_space(4.0);
 
         let listed =
             missing.len() + strays.len() + sections.iter().map(|(_, e)| e.len()).sum::<usize>();
@@ -1466,6 +1502,7 @@ impl ReposPage {
                                 self.clones_selection.select_only(clone.id);
                                 self.reveal = true;
                                 self.view = View::LocalClones;
+                                self.panel.open = true;
                             }
                         }
                     });
@@ -1720,17 +1757,15 @@ fn problems_cell(ui: &mut egui::Ui, clone: &CloneInfo) {
     response.on_hover_text(long.join("\n"));
 }
 
-/// The side panel for the selected clone. Returns true when it should close.
-/// Tags of the selected clone: manual ones can be removed, automatic ones excepted.
-fn tags_section(
+/// Tags of the one clone selected: manual ones can be removed, automatic ones excepted. The
+/// panel's Tag field adds more.
+fn clone_tags(
     ui: &mut egui::Ui,
     clone_id: i64,
     index: &TagIndex,
     rules: &[Rule],
-    new_tag: &mut String,
     action: &mut Option<ReposAction>,
 ) {
-    ui.strong("Tags");
     let tagging = index.by_clone.get(&clone_id).cloned().unwrap_or_default();
     if tagging.manual.is_empty() && tagging.auto.is_empty() {
         ui.weak("None yet");
@@ -1778,157 +1813,98 @@ fn tags_section(
             }
         });
     }
-    ui.horizontal(|ui| {
-        let label = ui.label("Add tag");
-        let field = ui
-            .add(
-                egui::TextEdit::singleline(new_tag)
-                    .hint_text("work, lang:rust, …")
-                    .desired_width(160.0),
-            )
-            .labelled_by(label.id);
-        let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let valid = crate::tags::normalize_tag(new_tag);
-        let clicked = ui
-            .add_enabled(valid.is_ok(), egui::Button::new("Add"))
-            .on_disabled_hover_text(valid.as_ref().err().cloned().unwrap_or_default())
-            .clicked();
-        if (clicked || entered) && valid.is_ok() {
-            *action = Some(ReposAction::Tags(TagsAction::AddTag {
-                clone_ids: vec![clone_id],
-                repo_ids: Vec::new(),
-                tag: std::mem::take(new_tag),
-            }));
-        }
-    });
 }
 
-fn details(
-    ui: &mut egui::Ui,
-    clone: &CloneInfo,
-    launchers: &[LauncherInfo],
-    action: &mut Option<ReposAction>,
-) -> bool {
-    let mut close = false;
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.heading(clone.display_name());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            close = ui.button("Close").clicked();
-            let apps: Vec<&LauncherInfo> = launchers.iter().filter(|l| l.each).collect();
-            ui.add_enabled_ui(!apps.is_empty(), |ui| {
-                ui.menu_button("Open in", |ui| {
-                    for app in apps {
-                        if ui.button(&app.name).clicked() {
-                            *action = Some(ReposAction::Open {
-                                launcher: app.name.clone(),
-                                together: false,
-                                clone_ids: vec![clone.id],
-                                workspace_name: String::new(),
-                            });
-                            ui.close();
-                        }
-                    }
-                });
-            });
-        });
-    });
+/// The one clone selected: where it is, its remotes, status and problems.
+fn details(ui: &mut egui::Ui, clone: &CloneInfo, action: &mut Option<ReposAction>) {
+    ui.heading(clone.display_name());
     ui.weak(clone.abs_path.display().to_string());
-    ui.separator();
-
-    egui::ScrollArea::vertical()
-        .id_salt(("details", clone.id))
-        .max_height(ui.available_height() * 0.6)
-        .show(ui, |ui| {
-            ui.strong("Remotes");
-            if clone.remotes.is_empty() {
-                ui.weak("None");
-            } else {
-                let main_index = match clone.main {
-                    MainRemote::Chosen { index, .. } => Some(index),
-                    _ => None,
-                };
-                egui::Grid::new(("remotes", clone.id))
-                    .num_columns(2)
-                    .spacing([12.0, 4.0])
-                    .show(ui, |ui| {
-                        for (index, remote) in clone.remotes.iter().enumerate() {
-                            if Some(index) == main_index {
-                                ui.strong(&remote.name).on_hover_text("Main remote");
-                            } else {
-                                ui.label(&remote.name);
-                            }
-                            ui.vertical(|ui| {
-                                ui.label(&remote.url);
-                                match &remote.parsed {
-                                    Some(repo) => {
-                                        ui.weak(format!("{} · {}", repo.host, repo.full_name()))
-                                    }
-                                    None => ui.weak("Not a hosted repo URL"),
-                                };
-                            });
-                            ui.end_row();
-                        }
+    ui.add_space(6.0);
+    ui.strong("Remotes");
+    if clone.remotes.is_empty() {
+        ui.weak("None");
+    } else {
+        let main_index = match clone.main {
+            MainRemote::Chosen { index, .. } => Some(index),
+            _ => None,
+        };
+        egui::Grid::new(("remotes", clone.id))
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                for (index, remote) in clone.remotes.iter().enumerate() {
+                    if Some(index) == main_index {
+                        ui.strong(&remote.name).on_hover_text("Main remote");
+                    } else {
+                        ui.label(&remote.name);
+                    }
+                    ui.vertical(|ui| {
+                        ui.label(&remote.url);
+                        match &remote.parsed {
+                            Some(repo) => ui.weak(format!("{} · {}", repo.host, repo.full_name())),
+                            None => ui.weak("Not a hosted repo URL"),
+                        };
                     });
-                if clone.remotes.len() > 1 {
-                    ui.add_space(4.0);
-                    main_remote_picker(ui, clone, action);
+                    ui.end_row();
                 }
-            }
+            });
+        if clone.remotes.len() > 1 {
+            ui.add_space(4.0);
+            main_remote_picker(ui, clone, action);
+        }
+    }
 
-            ui.add_space(10.0);
-            ui.strong("Status");
-            match &clone.status {
-                Err(error) => {
-                    ui.colored_label(ui.visuals().error_fg_color, error);
-                }
-                Ok(status) => {
-                    egui::Grid::new(("status", clone.id))
-                        .num_columns(2)
-                        .spacing([12.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label("Branch");
-                            ui.label(status.branch.as_deref().unwrap_or("(detached HEAD)"));
-                            ui.end_row();
+    ui.add_space(10.0);
+    ui.strong("Status");
+    match &clone.status {
+        Err(error) => {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        Ok(status) => {
+            egui::Grid::new(("status", clone.id))
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Branch");
+                    ui.label(status.branch.as_deref().unwrap_or("(detached HEAD)"));
+                    ui.end_row();
 
-                            ui.label("Commit");
-                            ui.label(match &status.head {
-                                Some(head) => head.chars().take(12).collect(),
-                                None => "no commits yet".to_owned(),
-                            });
-                            ui.end_row();
+                    ui.label("Commit");
+                    ui.label(match &status.head {
+                        Some(head) => head.chars().take(12).collect(),
+                        None => "no commits yet".to_owned(),
+                    });
+                    ui.end_row();
 
-                            ui.label("Upstream");
-                            ui.label(match (&status.upstream, status.ahead_behind) {
-                                (None, _) => "none".to_owned(),
-                                (Some(up), None) => format!("{up} (gone)"),
-                                (Some(up), Some((0, 0))) => format!("{up}, in sync"),
-                                (Some(up), Some((a, b))) => format!("{up}, {a} ahead, {b} behind"),
-                            });
-                            ui.end_row();
+                    ui.label("Upstream");
+                    ui.label(match (&status.upstream, status.ahead_behind) {
+                        (None, _) => "none".to_owned(),
+                        (Some(up), None) => format!("{up} (gone)"),
+                        (Some(up), Some((0, 0))) => format!("{up}, in sync"),
+                        (Some(up), Some((a, b))) => format!("{up}, {a} ahead, {b} behind"),
+                    });
+                    ui.end_row();
 
-                            ui.label("Changes");
-                            ui.label(describe_changes(status));
-                            ui.end_row();
+                    ui.label("Changes");
+                    ui.label(describe_changes(status));
+                    ui.end_row();
 
-                            ui.label("Stashes");
-                            ui.label(status.stashes.to_string());
-                            ui.end_row();
-                        });
-                    ui.weak("Ahead/behind counts are as of the last fetch.");
-                }
-            }
+                    ui.label("Stashes");
+                    ui.label(status.stashes.to_string());
+                    ui.end_row();
+                });
+            ui.weak("Ahead/behind counts are as of the last fetch.");
+        }
+    }
 
-            ui.add_space(10.0);
-            ui.strong("Problems");
-            if clone.problems.is_empty() {
-                ui.weak("None");
-            }
-            for problem in &clone.problems {
-                ui.label(format!("• {}", describe_problem(problem)));
-            }
-        });
-    close
+    ui.add_space(10.0);
+    ui.strong("Problems");
+    if clone.problems.is_empty() {
+        ui.weak("None");
+    }
+    for problem in &clone.problems {
+        ui.label(format!("• {}", describe_problem(problem)));
+    }
 }
 
 fn main_remote_picker(ui: &mut egui::Ui, clone: &CloneInfo, action: &mut Option<ReposAction>) {
@@ -2423,18 +2399,150 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_row_opens_and_closes_details() {
+    fn one_clone_selected_shows_its_details_in_the_panel() {
         let mut h = harness(Harness::builder());
         h.run();
+        assert!(h.query_by_label("Nothing selected").is_some());
         assert!(h.query_by_label("Remotes").is_none());
         h.get_by_label("facebook/react").click();
         h.run();
+        assert!(h.query_by_label("1 clone selected").is_some());
         assert!(h.query_by_label("Remotes").is_some());
         assert_eq!(h.state().0.clones_selection.single(), Some(1));
-        h.get_by_label("Close").click();
+        h.get_by_label("Deselect").click();
         h.run();
         assert_eq!(h.state().0.clones_selection.single(), None);
         assert!(h.query_by_label("Remotes").is_none());
+        assert!(
+            h.query_by_label("Nothing selected").is_some(),
+            "the panel stays"
+        );
+    }
+
+    #[test]
+    fn hiding_the_panel_keeps_the_selection() {
+        let mut h = harness(Harness::builder());
+        h.run();
+        h.get_by_label("facebook/react").click();
+        h.run();
+        h.get_by_label("Hide").click();
+        h.run();
+        assert!(h.query_by_label("Remotes").is_none());
+        assert!(h.query_by_label("Run command…").is_none());
+        assert_eq!(h.state().0.clones_selection.single(), Some(1));
+
+        // Selecting rows while it's hidden doesn't bring it back.
+        h.get_by_label("serde-rs/serde")
+            .click_modifiers(egui::Modifiers::COMMAND);
+        h.run();
+        assert!(h.query_by_label("Run command…").is_none());
+        assert_eq!(selected_clones(&h), [1, 5]);
+
+        // The toggle above the list counts the selection and shows the panel again.
+        h.get_by_label("Selection (2)").click();
+        h.run();
+        assert!(h.query_by_label("2 clones selected").is_some());
+        h.get_by_label("Selection (2)").click();
+        h.run();
+        assert!(h.query_by_label("2 clones selected").is_none());
+        assert_eq!(selected_clones(&h), [1, 5]);
+
+        // Hidden in every view; each keeps its own selection.
+        h.get_by_label("Remote List (4)").click();
+        h.run();
+        assert!(h.query_by_label("Selection (0)").is_some());
+        assert!(h.query_by_label("Clone").is_none());
+    }
+
+    #[test]
+    fn ctrl_a_selects_every_row_shown_and_escape_deselects() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.filter.text = "react".into();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.run();
+        assert_eq!(selected_clones(&h), [1, 2], "only the rows shown");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(selected_clones(&h).is_empty());
+
+        // Typing in a field, the keys are the field's.
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Search")
+            .focus();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.run();
+        assert!(selected_clones(&h).is_empty());
+        h.get_by_label("facebook/react").click();
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Search")
+            .focus();
+        h.run();
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert_eq!(selected_clones(&h), [1], "Escape leaves the field");
+
+        // An open menu closes first.
+        h.get_by_label("Open each").click();
+        h.run();
+        assert!(h.query_by_label("Kate").is_some());
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.query_by_label("Kate").is_none());
+        assert_eq!(selected_clones(&h), [1]);
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(selected_clones(&h).is_empty());
+
+        // Works with the panel hidden too, and in every view.
+        h.get_by_label("Hide").click();
+        h.get_by_label("Remote List (4)").click();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.run();
+        assert_eq!(h.state().0.remote.selection.len(), 1, "react's search");
+        assert!(h.query_by_label("Selection (1)").is_some());
+    }
+
+    #[test]
+    fn the_panel_holds_the_actions_right_of_the_list() {
+        let mut h = harness(Harness::builder());
+        h.state_mut().0.view = View::RemoteList;
+        h.run();
+        h.get_by_label("me/dotfiles").click();
+        h.run();
+        let tags_field = h
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, "Tags")
+            .rect();
+        let list = h.get_by_label("Repository ⏶").rect();
+        let toggle = h.get_by_label("Selection (1)").rect();
+        assert!(
+            toggle.left() > tags_field.right(),
+            "the toggle ends the filter row"
+        );
+        assert!(toggle.bottom() < list.top());
+        // Nothing between the filters and the list: it all sits in the panel, right of it.
+        for label in [
+            "1 repo selected",
+            "Select all shown (4)",
+            "Deselect",
+            "Clone",
+            "Ignore",
+            "Open each",
+            "Run command…",
+            "Add tag",
+        ] {
+            let rect = h.get_by_label(label).rect();
+            assert!(rect.left() > list.right(), "{label} is in the panel");
+            assert!(rect.top() > toggle.bottom(), "{label} is under the filters");
+        }
+        assert!(h.get_by_label("Select all shown (4)").rect().top() > tags_field.bottom());
+        let actions = h.get_by_label("Actions").rect();
+        let clone = h.get_by_label("Clone").rect();
+        let open = h.get_by_label("Open each").rect();
+        let tags = h.get_by_label("Add tag").rect();
+        assert!(actions.bottom() <= clone.top() && clone.top() <= open.top());
+        assert!(open.bottom() < tags.top());
     }
 
     /// Local Clones, top to bottom.
@@ -2464,7 +2572,7 @@ mod tests {
             .click_modifiers(egui::Modifiers::SHIFT);
         h.run();
         assert_eq!(selected_clones(&h), [1, 4, 5, 2]);
-        assert!(h.query_by_label("4 selected").is_some());
+        assert!(h.query_by_label("4 clones selected").is_some());
         assert!(h.query_by_label("Remotes").is_none(), "several: no details");
 
         h.get_by_label("notes")
@@ -2482,7 +2590,7 @@ mod tests {
         h.get_by_label("Select all shown (5)").click();
         h.run();
         assert_eq!(selected_clones(&h), CLONE_ORDER);
-        h.get_by_label("Clear selection").click();
+        h.get_by_label("Deselect").click();
         h.run();
         assert!(selected_clones(&h).is_empty());
     }
@@ -2495,14 +2603,15 @@ mod tests {
         h.run();
         h.state_mut().0.filter.text = "react".into();
         h.run();
-        assert!(h.query_by_label("2 selected").is_some());
+        assert!(h.query_by_label("2 clones selected").is_some());
+        assert!(h.query_by_label("Selection (2)").is_some());
         h.state_mut().0.filter.text.clear();
         h.run();
         assert_eq!(selected_clones(&h), [1, 2], "hidden rows don't come back");
     }
 
     #[test]
-    fn the_bar_opens_and_runs_the_selected_clones() {
+    fn the_panel_opens_and_runs_the_selected_clones() {
         let mut h = harness(Harness::builder());
         h.run();
         h.get_by_label("facebook/react").click();
@@ -2565,7 +2674,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_tags_the_selected_clones() {
+    fn the_panel_tags_the_selected_clones() {
         let mut h = harness(Harness::builder());
         h.run();
         h.get_by_label("Select all shown (5)").click();
@@ -2577,7 +2686,7 @@ mod tests {
         h.get_by_label("Add tag").click();
         h.run();
         assert!(
-            h.query_by_label("5 selected").is_some(),
+            h.query_by_label("5 clones selected").is_some(),
             "tagging keeps the selection"
         );
         assert_eq!(
@@ -2711,7 +2820,7 @@ mod tests {
         h.get_by_label("me/serde")
             .click_modifiers(egui::Modifiers::SHIFT);
         h.run();
-        assert!(h.query_by_label("2 selected").is_some());
+        assert!(h.query_by_label("2 repos selected").is_some());
         h.get_by_label("Run command…").click();
         h.run();
         assert_eq!(
@@ -2888,7 +2997,7 @@ mod tests {
         h.run();
         h.get_by_label("facebook/react").click();
         h.run();
-        h.get_by_label("Open in").click();
+        h.get_by_label("Open each").click();
         h.run();
         h.get_by_label("VS Code").click();
         h.run();
@@ -2918,9 +3027,11 @@ mod tests {
         h.run();
         h.get_by_label("Add exception").click();
         h.run();
-        h.state_mut().0.new_tag = "Later".into();
+        h.get_by_label("Tag").focus();
         h.run();
-        h.get_by_label("Add").click();
+        h.get_by_label("Tag").type_text("Later");
+        h.run();
+        h.get_by_label("Add tag").click();
         h.run();
         assert_eq!(
             h.state().1,
@@ -2942,7 +3053,7 @@ mod tests {
                 }),
             ]
         );
-        assert!(h.state().0.new_tag.is_empty());
+        assert!(h.state().0.panel.tag_name.is_empty());
     }
 
     #[test]
@@ -3021,7 +3132,7 @@ mod tests {
         h.get_by_label("myorg/api")
             .click_modifiers(egui::Modifiers::COMMAND);
         h.run();
-        assert!(h.query_by_label("2 selected").is_some());
+        assert!(h.query_by_label("2 repos selected").is_some());
         h.get_by_label("Clone").click();
         h.run_steps(3); // the cloning spinner never settles
         let Some(ReposAction::Clone(ids)) = h.state_mut().1.pop() else {
@@ -3045,7 +3156,7 @@ mod tests {
                 ignored: true
             })
         );
-        assert!(h.query_by_label("0 selected").is_some());
+        assert!(h.query_by_label("Nothing selected").is_some());
     }
 
     #[test]
@@ -3294,7 +3405,7 @@ mod tests {
         h.get_by_label("Add tag").click();
         h.run();
         assert!(
-            h.query_by_label("2 selected").is_some(),
+            h.query_by_label("2 repos selected").is_some(),
             "tagging keeps the selection"
         );
         h.get_by_label("Tag").focus();
@@ -3799,6 +3910,14 @@ mod tests {
             .unwrap()
             .save(dir.join("clones_selected.png"))
             .unwrap();
+        h.get_by_label("Hide").click();
+        h.run();
+        h.render()
+            .unwrap()
+            .save(dir.join("clones_panel_hidden.png"))
+            .unwrap();
+        h.get_by_label("Selection (4)").click();
+        h.run();
         h.state_mut().0.branch = "!main".into();
         h.state_mut().0.filter.language = "Cobol".into();
         h.set_size(egui::vec2(700.0, 560.0));

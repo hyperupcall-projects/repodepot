@@ -13,7 +13,7 @@ use crate::tags::TagIndex;
 use crate::tags::query::Query;
 use crate::ui::filter::{Item, Matcher};
 use crate::ui::repos::ReposAction;
-use crate::ui::selection::{ActionBar, BarContext, Selection, Targets};
+use crate::ui::selection::{Extras, PanelContext, Selection, SelectionPanel, Targets};
 use crate::ui::tags::tag_summary;
 use crate::ui::thousands;
 use crate::ui::{cmp_text, present_first, sort_header};
@@ -214,18 +214,20 @@ pub struct ListContext<'a> {
     pub cloning: &'a HashSet<i64>,
     /// The scanned clones, to open or run on the clones of the selected repos.
     pub clones: &'a [CloneInfo],
+    /// Owners added by hand, listed above the Remote List.
+    pub owners: &'a [String],
 }
 
 /// The Remote List or Ignored list: select rows, then Clone / Ignore / Un-ignore, open, run on
-/// or tag them. `ignored_rows` are the ignored repos the Remote List shows when "Hide ignored"
-/// is off.
+/// or tag them from the panel. `ignored_rows` are the ignored repos the Remote List shows when
+/// "Hide ignored" is off.
 pub fn repo_list(
     ui: &mut egui::Ui,
     kind: ListKind,
     (rows, ignored_rows): (&[RepoRow], &[RepoRow]),
     state: &mut ListState,
     cx: &ListContext<'_>,
-    (bar, bar_cx): (&mut ActionBar, &BarContext<'_>),
+    (panel, panel_cx): (&mut SelectionPanel, &PanelContext<'_>),
     action: &mut Option<ReposAction>,
 ) {
     let show_ignored = kind == ListKind::Remote && cx.show_ignored;
@@ -242,20 +244,28 @@ pub fn repo_list(
         .collect();
     sort_rows(&mut shown, state.sort, state.descending, cx.tags);
     let order: Vec<i64> = shown.iter().map(|r| r.id).collect();
-    state.selection.retain(&order);
+    panel.update(&mut state.selection, &order);
 
     let ids = state.selection.in_order(&order);
     let targets = Targets::repos(ids.clone(), cx.clones);
     let any_ignored = ignored_rows.iter().any(|r| state.selection.contains(r.id));
-    bar.show(
+    let extras = Extras {
+        buttons: Some(Box::new(|ui, action| {
+            *action = list_buttons(ui, kind, &ids, (show_ignored, any_ignored));
+        })),
+        ..Extras::default()
+    };
+    panel.show(
         ui,
         (&mut state.selection, &order),
         &targets,
-        bar_cx,
-        |ui| list_buttons(ui, kind, &ids, (show_ignored, any_ignored)),
+        panel_cx,
+        extras,
         action,
     );
-    ui.add_space(4.0);
+    if kind == ListKind::Remote {
+        manual_owners(ui, cx.owners, action);
+    }
 
     if shown.is_empty() {
         ui.weak(match (kind, rows.is_empty()) {
@@ -445,7 +455,7 @@ fn name_cell(ui: &mut egui::Ui, repo: &RepoRow, cloning: bool, mark_ignored: boo
 
 /// The owners added by hand, each with a button to stop listing their repos. Shows nothing
 /// when there are none.
-pub fn manual_owners(ui: &mut egui::Ui, owners: &[String], action: &mut Option<ReposAction>) {
+fn manual_owners(ui: &mut egui::Ui, owners: &[String], action: &mut Option<ReposAction>) {
     if owners.is_empty() {
         return;
     }
@@ -672,13 +682,13 @@ fn sort_forks(rows: &mut [(&ForkRow, String)], key: ForkSort, descending: bool) 
 }
 
 /// Every fork with its upstream, and whether the two are linked. Selecting rows selects the
-/// forks, to open, run on or tag their clones.
+/// forks, to open, run on or tag their clones from the panel.
 pub fn forks_view(
     ui: &mut egui::Ui,
     catalog: &Catalog,
     cx: &ForksContext<'_>,
     state: &mut ForksState,
-    (bar, bar_cx): (&mut ActionBar, &BarContext<'_>),
+    (panel, panel_cx): (&mut SelectionPanel, &PanelContext<'_>),
     action: &mut Option<ReposAction>,
 ) {
     let mut shown: Vec<(&ForkRow, String)> = catalog
@@ -694,17 +704,16 @@ pub fn forks_view(
         .collect();
     sort_forks(&mut shown, state.sort, state.descending);
     let order: Vec<i64> = shown.iter().map(|(f, _)| f.fork_id).collect();
-    state.selection.retain(&order);
+    panel.update(&mut state.selection, &order);
     let targets = Targets::repos(state.selection.in_order(&order), cx.clones);
-    bar.show(
+    panel.show(
         ui,
         (&mut state.selection, &order),
         &targets,
-        bar_cx,
-        |_| None,
+        panel_cx,
+        Extras::default(),
         action,
     );
-    ui.add_space(4.0);
 
     ui.weak(
         "Linked: a fork you contribute from. Its clone gets the upstream as a remote, and the \

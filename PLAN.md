@@ -183,18 +183,19 @@ Every view of the Repositories tab except Import has rows to select: repos in th
 
 - **Click** selects just that row, even if others were selected. **Ctrl-click** (Cmd-click on macOS) adds a row or takes it out. **Shift-click** selects every row from the last one clicked to this one; with Ctrl (Cmd) held too, it adds that range to the selection.
 - Only rows on screen stay selected. A row the filters hide drops out of the selection, so an action never reaches rows you can't see.
-- Local Clones shows the details panel while exactly one clone is selected. Its **Close** clears the selection.
-- In Problems, a clone with two problems is listed, and selected, twice. Missing folders and folders that aren't git repos can't be selected. **Details** on a row shows the clone in Local Clones, clearing that view's own filters (Show, branch, tags) if they would hide it.
+- **Ctrl+A** (Cmd+A on macOS) selects every row shown; **Esc** deselects them all. While a text field has the keyboard, both keys are the field's, and Esc closes an open menu first.
+- In Problems, a clone with two problems is listed, and selected, twice. Missing folders and folders that aren't git repos can't be selected. **Details** on a row shows the clone in Local Clones, clearing that view's own filters (Show, branch, tags) if they would hide it, and shows the panel if it was hidden.
 - Buttons inside a row (Linked / Separate, Use the new URL, …) work without selecting it.
 
-A bar between the filters and the list acts on the selection. It wraps in a narrow window.
+A panel on the right of the list, under the filters, acts on the selection; nothing sits between the filters and the list. **Hide** in the panel, or the **Selection (n)** button at the end of the view's filter row, hides it and shows it again. Hiding it leaves the selection as it is, and it stays hidden in every view until shown again. Its width can be dragged.
 
 | Part | What it does |
 |---|---|
-| **Select all shown**, **Clear selection**, and the count | |
-| The view's own actions | Remote List: **Clone**, **Ignore**, and **Un-ignore** while Hide ignored is off. Ignored: **Un-ignore**. These clear the selection, since the rows leave the list. |
-| **Open each**, **Open together**, **Run command…** | On the selected clones, or the clones of the selected repos (2.5). Repos that aren't cloned are left out, and the bar says how many; with none cloned, the buttons are off and say why. |
-| **Tag** field, **Add tag**, **Remove tag** | On the selected rows (2.1). Tagging keeps the selection, so several tags can go on the same rows. |
+| The count, **Hide**, **Select all shown**, **Deselect** | With nothing selected, how to select rows. |
+| **Actions**: the view's own | Remote List: **Clone**, **Ignore**, and **Un-ignore** while Hide ignored is off. Ignored: **Un-ignore**. These clear the selection, since the rows leave the list. |
+| **Actions**: **Open each**, **Open together**, **Run command…** | On the selected clones, or the clones of the selected repos (2.5). Repos that aren't cloned are left out, and the panel says how many; with none cloned, the buttons are off and say why. |
+| **Tags**: **Tag** field, **Add tag**, **Remove tag** | On the selected rows (2.1). Tagging keeps the selection, so several tags can go on the same rows. In Local Clones, with one clone selected, its tags are listed above the field: a manual tag can be removed, a rule's tag excepted. |
+| Details | Local Clones, with one clone selected: its folder, remotes (and the main remote picker), status and problems. |
 
 ## Part 2 — Tags, groups and actions
 
@@ -205,7 +206,7 @@ Clones can be tagged, and so can repos in the Remote List that aren't cloned yet
 
 ### 2.1 Manual tags
 
-Add and remove tags from a clone's details panel, or for the selected rows of any Repositories view (1.10). Tagging a repo tags its clones too. Any name works, and `:` can be used for namespaces (`org:myorg`, `lang:rust`). Names are lowercased and spaces become `-`; `and`, `or`, `not`, `untagged`, `*` and parentheses are kept for queries.
+Add and remove tags for the selected rows of any Repositories view, from the panel on the right (1.10). Tagging a repo tags its clones too. Any name works, and `:` can be used for namespaces (`org:myorg`, `lang:rust`). Names are lowercased and spaces become `-`; `and`, `or`, `not`, `untagged`, `*` and parentheses are kept for queries.
 
 ### 2.2 Rules (automatic tags)
 
@@ -247,7 +248,7 @@ A group is a tag query in the Repositories tab; there's no separate view for it.
 
 ### 2.5 Actions on the selection
 
-From the bar above each list (1.10):
+From the panel on the right of each list (1.10):
 
 - **Open each**: one window per clone. Lists every launcher that has a per-repo command.
 - **Open together**: one window for all of them. Lists only launchers that support workspaces.
@@ -389,7 +390,7 @@ src/
   tags/               rules, exceptions, query parser
   launchers.rs        presets, detection, workspace files
   ui/                 repos, remote list, ignored, forks, problems, import,
-                      selection and its action bar, tags (rules), runner,
+                      selection and its panel, tags (rules), runner,
                       settings, log
 ```
 

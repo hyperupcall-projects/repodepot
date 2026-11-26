@@ -1,9 +1,10 @@
-//! Selecting rows in the Repositories views, and the bar above each list for acting on the
+//! Selecting rows in the Repositories views, and the panel on the right for acting on the
 //! selection.
 //!
 //! A click selects just the row clicked. Ctrl-click (Cmd-click on macOS) adds a row to the
 //! selection or takes it out, and Shift-click selects every row from the one last clicked to
-//! this one; with Ctrl (Cmd) held too, it adds that range to what's already selected.
+//! this one; with Ctrl (Cmd) held too, it adds that range to what's already selected. Ctrl+A
+//! selects every row shown, and Escape deselects them all.
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,10 +14,9 @@ use crate::backend::LauncherInfo;
 use crate::git::scan::CloneInfo;
 use crate::launch;
 use crate::tags;
-use crate::ui::filter::keep_together;
-use crate::ui::plural;
 use crate::ui::repos::ReposAction;
 use crate::ui::tags::TagsAction;
+use crate::ui::{plural, thousands};
 
 /// The selected rows of one view, by ID (a clone's or a repo's, depending on the view).
 #[derive(Debug, Default)]
@@ -237,13 +237,36 @@ impl Targets {
     }
 }
 
-/// What the bar needs to know besides the selection.
-pub struct BarContext<'a> {
+/// What a view's rows are.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rows {
+    Clones,
+    Repos,
+}
+
+impl Rows {
+    /// `"1 clone"`, `"3 repos"`.
+    fn count(self, n: usize) -> String {
+        match self {
+            Rows::Clones => plural(n, "clone", "clones"),
+            Rows::Repos => plural(n, "repo", "repos"),
+        }
+    }
+
+    fn many(self) -> &'static str {
+        match self {
+            Rows::Clones => "clones",
+            Rows::Repos => "repos",
+        }
+    }
+}
+
+/// What the panel needs to know besides the selection.
+pub struct PanelContext<'a> {
     pub launchers: &'a [LauncherInfo],
     /// Ask before opening more windows than this.
     pub confirm_over: usize,
-    /// What the rows are: "clones" or "repos".
-    pub rows: &'static str,
+    pub rows: Rows,
     /// The tag query, when it's the only filter narrowing the view. If every row shown is
     /// selected, the selection is that tag group: runs and workspace files are named after it.
     pub tag_group: Option<&'a str>,
@@ -251,94 +274,233 @@ pub struct BarContext<'a> {
     pub view: &'a str,
 }
 
-/// The bar above each list: select all or none, the view's own buttons, then opening,
-/// running a command in, and tagging whatever is selected.
-pub struct ActionBar {
+/// Fills one part of the panel, and sets the action when one of its buttons is used.
+pub type Part<'a> = Box<dyn FnOnce(&mut egui::Ui, &mut Option<ReposAction>) + 'a>;
+
+/// What a view adds to the panel besides opening, running and tagging.
+#[derive(Default)]
+pub struct Extras<'a> {
+    /// The view's own buttons (Clone, Ignore, …), first under Actions. Using one clears the
+    /// selection, since those rows leave the list.
+    pub buttons: Option<Part<'a>>,
+    /// Under Tags, above the Tag field: the tags of the one row selected.
+    pub tags: Option<Part<'a>>,
+    /// At the bottom: more about the one row selected.
+    pub details: Option<Part<'a>>,
+}
+
+/// A key that changes the whole selection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SelectionKey {
+    /// Ctrl+A (Cmd+A on macOS): every row shown.
+    All,
+    /// Escape: none.
+    None,
+}
+
+const SELECT_ALL: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::A);
+const DESELECT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Escape);
+
+/// The panel on the right of a Repositories view: what's selected, and everything that can be
+/// done with it. It can be hidden and shown again without touching the selection.
+pub struct SelectionPanel {
+    /// Shown on the right of the view.
+    pub open: bool,
     /// The "Tag" field.
     pub tag_name: String,
     /// "Open each" over the limit, waiting for a yes: (launcher, clone IDs).
     pending_open: Option<(String, Vec<i64>)>,
+    /// Read by `read_keys` at the start of the frame, applied by `update`.
+    key: Option<SelectionKey>,
+    /// The text field that had the keyboard when the page was last drawn.
+    typing_in: Option<egui::Id>,
 }
 
-impl ActionBar {
+impl SelectionPanel {
     pub fn new() -> Self {
         Self {
+            open: true,
             tag_name: String::new(),
             pending_open: None,
+            key: None,
+            typing_in: None,
         }
     }
 
-    /// `shown` is the IDs of the rows shown, top to bottom; `view_buttons` adds the view's own
-    /// buttons (Clone, Ignore, …), and the selection is cleared when one of them is used,
-    /// since those rows leave the list.
+    /// Reads Ctrl+A and Escape for `update` to apply. Call it before anything else is drawn,
+    /// so that a text field that had the keyboard keeps them (Ctrl+A selects its text, Escape
+    /// leaves it), and an open menu keeps Escape to close itself.
+    pub fn read_keys(&mut self, ui: &egui::Ui) {
+        let ctx = ui.ctx();
+        self.key = None;
+        // egui takes the keyboard away from a field on Escape before anything is drawn, so
+        // the field is found by what had it at the end of the last frame.
+        let typing = ctx.text_edit_focused()
+            || self
+                .typing_in
+                .is_some_and(|id| ctx.memory(|m| m.had_focus_last_frame(id)));
+        if typing {
+            return;
+        }
+        let popup_open = egui::Popup::is_any_open(ctx);
+        self.key = ui.input_mut(|i| {
+            if i.consume_shortcut(&SELECT_ALL) {
+                Some(SelectionKey::All)
+            } else if !popup_open && i.consume_shortcut(&DESELECT) {
+                Some(SelectionKey::None)
+            } else {
+                None
+            }
+        });
+    }
+
+    /// Call at the end of the frame: notes which text field has the keyboard, for `read_keys`.
+    pub fn end_frame(&mut self, ui: &egui::Ui) {
+        let ctx = ui.ctx();
+        self.typing_in = ctx
+            .memory(|m| m.focused())
+            .filter(|_| ctx.text_edit_focused());
+    }
+
+    /// Keeps only the rows shown (`shown`, top to bottom), then applies Ctrl+A or Escape.
+    pub fn update(&mut self, selection: &mut Selection, shown: &[i64]) {
+        selection.retain(shown);
+        match self.key.take() {
+            Some(SelectionKey::All) => selection.select_all(shown),
+            Some(SelectionKey::None) => selection.clear(),
+            None => {}
+        }
+    }
+
+    /// The button that shows or hides the panel, with how many rows are selected.
+    pub fn toggle(&mut self, ui: &mut egui::Ui, count: usize) {
+        ui.toggle_value(
+            &mut self.open,
+            format!("Selection ({})", thousands(count as u64)),
+        )
+        .on_hover_text(if self.open {
+            "Hide the panel with the selection and its actions. The selection stays."
+        } else {
+            "Show the panel with the selection and its actions"
+        });
+    }
+
+    /// The panel, on the right of `ui`, when it's open. Call it before drawing the list, which
+    /// gets the rest of the width. `shown` is the IDs of the rows shown, top to bottom.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         (selection, shown): (&mut Selection, &[i64]),
         targets: &Targets,
-        cx: &BarContext<'_>,
-        view_buttons: impl FnOnce(&mut egui::Ui) -> Option<ReposAction>,
+        cx: &PanelContext<'_>,
+        extras: Extras<'_>,
         action: &mut Option<ReposAction>,
     ) {
+        let mut open = self.open;
+        let mut hide = false;
+        egui::Panel::right("selection_panel")
+            .resizable(true)
+            .default_size(340.0)
+            .min_size(260.0)
+            .show_collapsible(ui, &mut open, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("selection_panel_scroll")
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        hide = self.contents(ui, (selection, shown), targets, cx, extras, action);
+                    });
+            });
+        // Dragging the edge past the narrowest width hides it too.
+        self.open = open && !hide;
+    }
+
+    /// Returns true when Hide was clicked.
+    fn contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        (selection, shown): (&mut Selection, &[i64]),
+        targets: &Targets,
+        cx: &PanelContext<'_>,
+        extras: Extras<'_>,
+        action: &mut Option<ReposAction>,
+    ) -> bool {
         let count = selection.len();
         let unique = shown.iter().copied().collect::<HashSet<i64>>().len();
         let group = cx.tag_group.filter(|_| count > 0 && count == unique);
+        let shortcut = |shortcut| ui.ctx().format_shortcut(&shortcut);
+        let (select_all_key, deselect_key) = (shortcut(SELECT_ALL), shortcut(DESELECT));
+
+        let mut hide = false;
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.heading(match count {
+                0 => "Nothing selected".to_owned(),
+                n => format!("{} selected", cx.rows.count(n)),
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                hide = ui
+                    .button("Hide")
+                    .on_hover_text(
+                        "Hide this panel; the selection stays. The Selection button above the \
+                         list shows it again.",
+                    )
+                    .clicked();
+            });
+        });
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     count < unique,
-                    egui::Button::new(format!("Select all shown ({unique})")),
+                    egui::Button::new(format!("Select all shown ({})", thousands(unique as u64))),
                 )
-                .on_hover_text(
-                    "Click a row to select it alone, Ctrl-click to add or remove one, \
-                     Shift-click to select a range",
-                )
+                .on_hover_text(&select_all_key)
                 .clicked()
             {
                 selection.select_all(shown);
             }
             if ui
-                .add_enabled(count > 0, egui::Button::new("Clear selection"))
+                .add_enabled(count > 0, egui::Button::new("Deselect"))
+                .on_hover_text(&deselect_key)
                 .clicked()
             {
                 selection.clear();
             }
-            ui.separator();
-            ui.label(format!("{count} selected"));
+        });
+        if count == 0 {
+            ui.weak(format!(
+                "Click a row to select it, Ctrl-click to add or remove one, Shift-click to \
+                 select a range. {select_all_key} selects every row shown, {deselect_key} \
+                 deselects."
+            ));
+        }
 
-            if let Some(view_action) = view_buttons(ui) {
+        section(ui, "Actions");
+        if let Some(buttons) = extras.buttons {
+            let mut view_action = None;
+            ui.horizontal_wrapped(|ui| buttons(ui, &mut view_action));
+            if let Some(view_action) = view_action {
                 *action = Some(view_action);
                 selection.clear();
             }
-
-            ui.separator();
-            keep_together(ui, 330.0);
-            self.open_and_run(ui, targets, (count, group), cx, action);
-
-            ui.separator();
-            keep_together(ui, 340.0);
-            self.tag(ui, targets, count, cx.rows, action);
-        });
-        if let Some((launcher, ids)) = self.pending_open.clone() {
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    format!("Open {} windows in {launcher}?", ids.len()),
-                );
-                if ui.button("Open them").clicked() {
-                    *action = Some(ReposAction::Open {
-                        launcher,
-                        together: false,
-                        clone_ids: ids,
-                        workspace_name: String::new(),
-                    });
-                    self.pending_open = None;
-                }
-                if ui.button("Cancel").clicked() {
-                    self.pending_open = None;
-                }
-            });
         }
+        ui.horizontal_wrapped(|ui| self.open_and_run(ui, targets, (count, group), cx, action));
+        self.confirm_open(ui, action);
+
+        section(ui, "Tags");
+        if let Some(tags) = extras.tags {
+            tags(ui, action);
+            ui.add_space(4.0);
+        }
+        ui.horizontal_wrapped(|ui| self.tag(ui, targets, count, cx.rows, action));
+
+        if let Some(details) = extras.details {
+            ui.add_space(8.0);
+            ui.separator();
+            details(ui, action);
+        }
+        hide
     }
 
     /// Open each, Open together and Run command, for the selected clones.
@@ -347,11 +509,11 @@ impl ActionBar {
         ui: &mut egui::Ui,
         targets: &Targets,
         (count, group): (usize, Option<&str>),
-        cx: &BarContext<'_>,
+        cx: &PanelContext<'_>,
         action: &mut Option<ReposAction>,
     ) {
         let clones = &targets.clone_ids;
-        let many = cx.rows;
+        let many = cx.rows.many();
         // Why nothing can be opened or run, if so.
         let blocked = if count == 0 {
             Some(format!("Select {many} first"))
@@ -446,28 +608,53 @@ impl ActionBar {
         }
     }
 
+    /// "Open each" over the limit asks first.
+    fn confirm_open(&mut self, ui: &mut egui::Ui, action: &mut Option<ReposAction>) {
+        let Some((launcher, ids)) = self.pending_open.clone() else {
+            return;
+        };
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!("Open {} windows in {launcher}?", ids.len()),
+        );
+        ui.horizontal(|ui| {
+            if ui.button("Open them").clicked() {
+                *action = Some(ReposAction::Open {
+                    launcher,
+                    together: false,
+                    clone_ids: ids,
+                    workspace_name: String::new(),
+                });
+                self.pending_open = None;
+            }
+            if ui.button("Cancel").clicked() {
+                self.pending_open = None;
+            }
+        });
+    }
+
     /// The tag field, with Add tag and Remove tag for the selected rows.
     fn tag(
         &mut self,
         ui: &mut egui::Ui,
         targets: &Targets,
         count: usize,
-        many: &str,
+        rows: Rows,
         action: &mut Option<ReposAction>,
     ) {
         let label = ui.label("Tag");
         let field = ui
             .add(
                 egui::TextEdit::singleline(&mut self.tag_name)
-                    .hint_text("tag name")
-                    .desired_width(120.0),
+                    .hint_text("work, lang:rust, …")
+                    .desired_width(130.0),
             )
             .labelled_by(label.id);
         let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let valid = tags::normalize_tag(&self.tag_name);
         let enabled = count > 0 && valid.is_ok();
         let why_not = match &valid {
-            _ if count == 0 => format!("Select {many} first"),
+            _ if count == 0 => format!("Select {} first", rows.many()),
             Err(e) => e.clone(),
             Ok(_) => String::new(),
         };
@@ -508,6 +695,13 @@ impl ActionBar {
             }));
         }
     }
+}
+
+/// A part of the panel, under a rule.
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(6.0);
+    ui.separator();
+    ui.strong(title);
 }
 
 #[cfg(test)]
